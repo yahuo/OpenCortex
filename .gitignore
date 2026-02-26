@@ -1,0 +1,14 @@
+.DS_Store
+
+# Python cache and virtualenv
+__pycache__/
+*.py[cod]
+venv/
+
+# Local exports and runtime artifacts
+wechat_export/
+wechat_data_mnt/
+
+# Secrets
+wechat_db_key.txt
+
