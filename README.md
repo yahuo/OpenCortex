@@ -8,7 +8,7 @@
 
 ## 🛠 工作原理解析与完整使用指南
 
-提取并无损解密你本地长达几年的数十GB微信聊天记录包含三个关键步骤：
+提取并无损解密你本地长达几年的数十GB微信聊天记录包含两个关键步骤：
 
 ### 🔑 步骤 1：拦截并获取底层微信 SQLCipher 数据库绝密密码
 
@@ -58,32 +58,7 @@
 
 *(切记将该拼好的密钥妥善保存，例如存在 `wechat_db_key.txt`)*
 
----
-
-### 🔓 步骤 2：使用密码无损解压并暴露本地隐藏的全部数据库
-
-有了刚才拦截到的 64位十六进制神器密码，就可以直接强行打开加密的微信本体原始数据库。
-
-你的所有本地数据存放于：
-`/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<乱码>/msg/` 和 `contact/` 里。
-
-我们使用工程内编写的 `chatlog` (由于基于 Go 的超高性能解包) 直接把加密的源头拖出来。
-
-```bash
-# 进入 chatlog 驱动子目录
-cd chatlog
-
-# 编译或执行已经存好的 chatlog_bin 工具进行脱壳解码
-# -k 后的双引号填入你刚才费煞苦心抓出来的 64位密码
-# -d 传入你个人微信号的具体加密本地路径
-./chatlog_bin decrypt -k "a639...你的密码...08342" -p darwin -v 4 -d "/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/moushayiciyahuo_f02f" -o /tmp/wechat_export_test
-```
-
-恭喜！在 `/tmp/wechat_export_test/db_storage/` 下，你会看到完全一览无余的解密后真实 `.db` 文件，你可以随时用任意 SQlite 管理软件浏览明文的 `message_0.db` 乃至 `contact.db`！
-
----
-
-### 📥 步骤 3：(首选) 使用现代化的 Web 可视化面板进行批量提取
+### 📥 步骤 2（首选）：使用现代化的 Web 可视化面板一站式解密 + 批量提取
 
 为了避免枯燥的纯命令行敲击，本项目为你提供了一个绝佳的 Web 大盘交互界面（基于 Streamlit）。
 
@@ -97,6 +72,9 @@ source venv/bin/activate
 
 # 3. 安装依赖包 (Streamlit UI, Pandas 处理引擎等)
 pip install -r requirements.txt
+
+# 若网络受限（如报 streamlit 找不到），可使用镜像源
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
 **一键启动交互大盘：**
@@ -104,6 +82,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 *执行后，浏览器会自动弹出一个包含你所有系统已解码**花名册**的神奇控制面板！*
+- 页面顶部已内置解密表单，可直接填入 `key + data_dir + output_dir` 执行解密。
 - 🔍 你可以在左侧栏无极**搜索过滤**对象名。
 - ☑️ 在列表中自由**勾选**一个或成百上千个聊天对象。
 - 🚀 点击一键提取，附带全动态交互进度条，自动压出 Markdown 私人语料池。
@@ -114,6 +93,7 @@ streamlit run app.py
 
 *(如果你更偏向纯极客风格的命令行操作，不想要 UI，也依然可以直接调用 Python：)*
 ```bash
+python3 decrypt_wechat_db.py decrypt -k "a639...你的密码...08342" -p darwin -v 4 -d "/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/moushayiciyahuo_f02f" -o /tmp/wechat_export_test
 python3 export_group.py "公共技术部"
 ```
 
@@ -125,7 +105,7 @@ python3 export_group.py "公共技术部"
 # 微信原始缓存根目录（用于回溯图片缓存）
 export WECHATLLM_ROOT_BASE="/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/你的目录"
 
-# chatlog 解密输出目录（应包含 db_storage/message 与 db_storage/contact）
+# 解密输出目录（应包含 db_storage/message 与 db_storage/contact）
 export WECHATLLM_DB_DIR="/tmp/wechat_export_test/db_storage"
 
 # Markdown 导出目录（默认是当前工作目录下 wechat_export）
@@ -135,7 +115,7 @@ export WECHATLLM_OUT_DIR="/Users/你的用户名/Documents/wechat_export"
 ### 🧯 常见失败排查
 
 1. **无法检测到联系人库 (`contact.db`)**
-   - 确认你已经执行过 `chatlog_bin decrypt`。
+   - 确认你已经在页面顶部执行过解密，或手动运行过 `python3 decrypt_wechat_db.py decrypt`。
    - 检查 `WECHATLLM_DB_DIR` 是否指向包含 `contact/contact.db` 的 `db_storage` 目录。
 
 2. **导出时报 `查无数据库表: Msg_<md5>`**

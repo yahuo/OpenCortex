@@ -18,8 +18,35 @@ if not logging.getLogger().handlers:
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT_BASE = "/Users/jinxin/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/moushayiciyahuo_f02f"
-DEFAULT_DB_DIR = "/tmp/wechat_export_test/db_storage"
+WECHAT_XFILES_BASE = os.path.expanduser(
+    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+)
+
+
+def detect_wechat_account_dirs() -> list[tuple[str, str]]:
+    """
+    扫描微信账号数据目录，返回所有已找到的账号目录。
+    格式：[(显示名称, 完整路径), ...]
+    一个有效的账号目录应该包含 db_storage/ 或 msg/ 子目录。
+    """
+    results = []
+    if not os.path.isdir(WECHAT_XFILES_BASE):
+        return results
+    for entry in os.scandir(WECHAT_XFILES_BASE):
+        if not entry.is_dir():
+            continue
+        # 判断是否是一个有效的账号目录
+        has_db_storage = os.path.isdir(os.path.join(entry.path, "db_storage"))
+        has_msg = os.path.isdir(os.path.join(entry.path, "msg"))
+        if has_db_storage or has_msg:
+            results.append((entry.name, entry.path))
+    results.sort(key=lambda x: x[0])
+    return results
+
+
+_detected_dirs = detect_wechat_account_dirs()
+DEFAULT_ROOT_BASE = _detected_dirs[0][1] if _detected_dirs else WECHAT_XFILES_BASE
+DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~/wechat_db_backup"))
 DEFAULT_OUT_DIR = os.path.join(os.getcwd(), "wechat_export")
 
 
@@ -38,15 +65,29 @@ def get_runtime_config():
     }
 
 
-_runtime_config = get_runtime_config()
+def refresh_runtime_config(root_base=None, db_dir=None, out_dir=None):
+    """按需更新环境变量并刷新模块级路径常量。"""
+    if root_base is not None:
+        os.environ["WECHATLLM_ROOT_BASE"] = root_base
+    if db_dir is not None:
+        os.environ["WECHATLLM_DB_DIR"] = db_dir
+    if out_dir is not None:
+        os.environ["WECHATLLM_OUT_DIR"] = out_dir
 
-# 对外保留模块级常量，避免其他模块导入断裂
-ROOT_BASE = _runtime_config["ROOT_BASE"]
-DB_DIR = _runtime_config["DB_DIR"]
-MSG_DIR = _runtime_config["MSG_DIR"]
-CONTACT_DB = _runtime_config["CONTACT_DB"]
-OUT_DIR = _runtime_config["OUT_DIR"]
-IMG_OUT_DIR = _runtime_config["IMG_OUT_DIR"]
+    runtime_config = get_runtime_config()
+
+    global ROOT_BASE, DB_DIR, MSG_DIR, CONTACT_DB, OUT_DIR, IMG_OUT_DIR
+    ROOT_BASE = runtime_config["ROOT_BASE"]
+    DB_DIR = runtime_config["DB_DIR"]
+    MSG_DIR = runtime_config["MSG_DIR"]
+    CONTACT_DB = runtime_config["CONTACT_DB"]
+    OUT_DIR = runtime_config["OUT_DIR"]
+    IMG_OUT_DIR = runtime_config["IMG_OUT_DIR"]
+
+    return runtime_config
+
+
+_runtime_config = refresh_runtime_config()
 
 # MacOS 微信图片缓存格式(dat)的魔法文件头对应其本身的扩展名
 MAGIC_MAP = {
