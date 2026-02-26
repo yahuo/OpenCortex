@@ -1,129 +1,155 @@
-# WechatLLM - Mac 版微信本地知识库提取工具箱 🚀
+# WechatLLM — Mac 微信本地知识库提取工具箱 🚀
 
-本项目旨在帮助 Mac 用户从本地电脑原生的微信缓存库中完美解压、提取并结构化所有的微信群组或个人聊天记录。提取后的 Markdown 文件非常适合直接投喂给 GPT / Claude 大语言模型进行个人知识库微调 (Fine-Tuning) 学习和本地私有模型 RAG 召回。
+从本地微信数据库中完整导出聊天记录，生成结构化 Markdown 文件，可直接用于 GPT / Claude 知识库微调或本地 RAG 问答。
 
-**支持环境**: macOS 微信 v4.x (新款原生版微信)
+**支持环境**：macOS 微信 v4.x（原生新款）｜ Python 3.11+
 
 ---
 
-## 🛠 工作原理解析与完整使用指南
+## 🖥️ 快速开始（可视化界面）
 
-提取并无损解密你本地长达几年的数十GB微信聊天记录包含两个关键步骤：
+### 1. 环境准备
 
-### 🔑 步骤 1：拦截并获取底层微信 SQLCipher 数据库绝密密码
+```bash
+# 克隆项目并进入目录
+git clone <repo_url> && cd WechatLLM
 
-最新版的 Mac 微信启用了极高强度的本地 SQLite (SQLCipher 4) 数据库加密机制，并在你彻底启动、扫码登录时动态生成解密使用的 64 位 16进制密码 （其实是内部衍生推导的秘钥 PBKDF2 结果）。
+# 创建虚拟环境并安装依赖
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. 配置 API Key（用于 RAG 问答）
+
+```bash
+cp .env.example .env
+# 用编辑器打开 .env，填入以下内容：
+#   EMBED_API_KEY   — 硅基流动 Embedding Key（sf-xxx）
+#   LLM_API_KEY     — 你的 LLM API Key（Gemini / Kimi / GLM 等）
+#   LLM_BASE_URL    — 对应 LLM 的 base_url
+#   LLM_MODEL       — 模型名称（默认 gemini-2.0-flash）
+```
+
+### 3. 启动可视化控制台
+
+```bash
+source venv/bin/activate
+streamlit run app.py
+```
+
+浏览器会自动打开 `http://localhost:8501`，页面功能说明：
+
+| 左侧边栏 | 右侧主区域 |
+|---|---|
+| 🔓 **解密数据库**：填密钥 + 账号目录，一键解密 | 📋 **联系人列表**：自动加载，支持搜索 |
+| 📁 **导出目录**：配置 Markdown 输出路径 | ☑️ 勾选会话后批量导出，带进度条 |
+| 🧠 **RAG 问答配置**：填入 Embedding 和 LLM Key | 💬 **知识库问答**：语义检索 + 带引用回答 |
+
+> **已有解密数据？** 若 `~/wechat_db_backup/db_storage` 下已有数据，启动后联系人列表**自动展示**，无需重复解密。
+
+---
+
+## 🔑 步骤 0：获取微信数据库密钥
 
 > [!WARNING]
-> **重要前置条件：必须关闭 macOS 的 SIP (系统完整性保护)**
-> 
-> 由于苹果的安全机制与微信执行文件的硬性加固，如果在 SIP 开启状态下直接挂载微信内存，终端会提示 `attach failed` 被系统强行阻拦。
-> 
-> **检查你的 SIP 状态：** 在终端运行 `csrutil status`，如果输出是 `System Integrity Protection status: disabled.` 则代表你已满足条件，可直接进入下一步！
-> 
-> **如果显示 enabled，则需要暂时关闭它：**
-> 1. 完全关机。
-> 2. 长按电源键不放（Intel Mac 则按住 `Command + R` 开机），直到屏幕出现“正在载入启动选项”后松开。
-> 3. 点击“选项”，输入管理员密码进入恢复模式 (Recovery Mode)。
-> 4. 在顶部系统菜单栏找到 `实用工具` -> `终端`。
-> 5. 输入 `csrutil disable` 并回车，输入 `y` 以及管理员密码确认。
-> 6. 再次输入 `reboot` 重启电脑。
-> *（注：导出完成后，你可以用同样的方法进入恢复模式输入 `csrutil enable` 重新开启它以保证最强安全性）*
+> **必须提前关闭 macOS SIP（系统完整性保护）**
+>
+> 运行 `csrutil status` 确认是否已关闭。若未关闭：
+> 1. 完全关机 → 长按电源键进入恢复模式（Intel Mac：`Command+R`）
+> 2. 打开终端，执行 `csrutil disable` → 重启
+> 3. *(导出完成后可重新执行 `csrutil enable` 恢复保护)*
 
-**获取密码步骤 (纯控制台零依赖)：**
+**密钥提取步骤：**
 
-
-1. **彻底退出你的微信**进程 (关闭后状态栏也不能看到微信图标)。
-2. 打开你的系统终端 (Terminal / iTerm2)，直接运行以下指令：
+1. 彻底退出微信（状态栏也不能有微信图标）
+2. 打开终端，执行：
    ```bash
    sudo lldb -n WeChat -w
    ```
-   *（输入开机密码授权后台最高调试拦截权限。命令回车后它会“卡住”并显示等待 WeChat 进程唤醒。）*
-3. **立刻点击打开微信应用程序**。此时由于 lldb 截获，微信客户端的界面多半还没来得及渲染，“卡”在终端里了，并输出 `Process XXXXX stopped`，出现 `(lldb)` 提示符。
-4. 现在给负责密码衍生加密的核心内置函数 `CCKeyDerivationPBKDF` 下断点，在 `(lldb)` 提示符处执行：
+3. **立刻点击打开微信**，等待终端出现 `(lldb)` 提示符
+4. 执行以下命令打断点并继续：
    ```text
    br set -n CCKeyDerivationPBKDF
-   ```
-   看到成功反馈 `Breakpoint 1: where = ...` 后，继续输入 `c` (表示 continue 继续运行)：
-   ```text
    c
    ```
-5. **在微信上用手机扫码正常登录**。由于你在进行认证，登录瞬间系统一定会调用那个加密函数被再次卡死。
-6. 回到终端，它应该又落在了 `(lldb)` 的拦截中。最后，读取存储在核心 `x1` 通用寄存器中的长度为 32 字节的解密私钥：
+5. **在手机上扫码登录微信**，微信会再次被断点捕获
+6. 在 `(lldb)` 中读取密钥：
    ```text
    memory read --size 1 --format x --count 32 $x1
    ```
-   **你的密码出现了！** 终端打印出的 `0x?? 0x?? 0x??` 共 32 个两位的 16 进制字符，只要去掉开头的 `0x` 全部拼在一起组成非常长的一串无空格字母，即是**你神圣的数据库解码密匙**！
-7. 然后在终端中依次输入 `detach` 然后 `quit` 将微信完全释放，使其照常运行。
+   将输出的 32 个 `0x??` 去掉 `0x` 拼接成 64 位 hex 字符串，即为密钥
+7. 执行 `detach` → `quit` 释放微信
 
-*(切记将该拼好的密钥妥善保存，例如存在 `wechat_db_key.txt`)*
+将密钥保存至 `wechat_db_key.txt` 备用。
 
-### 📥 步骤 2（首选）：使用现代化的 Web 可视化面板一站式解密 + 批量提取
+---
 
-为了避免枯燥的纯命令行敲击，本项目为你提供了一个绝佳的 Web 大盘交互界面（基于 Streamlit）。
+## 🔓 解密数据库
 
-**环境准备 (推荐使用虚拟环境)：**
+在可视化界面左侧"🔓 解密数据库"区域填入：
+- **数据库密钥**（64 位 hex）
+- **微信账号目录**（自动识别，下拉选择）
+- **解密输出目录**（默认 `~/wechat_db_backup`）
+
+点击"🔑 开始解密"即可。解密完成后右侧联系人列表自动刷新。
+
+---
+
+## 🧠 知识库问答（RAG）
+
+1. 先在右侧勾选会话 → 点"🚀 导出选定"导出为 Markdown
+2. 展开左侧"🧠 RAG 问答配置"，确认 Key 已填入（从 `.env` 自动读取）
+3. 右侧底部点"🔧 构建 / 更新索引"（使用 FAISS + bge-m3 向量化）
+4. 索引完成后直接在聊天框提问，回答附带原文引用时间段
+
+**支持切换 LLM 模型**（仅改 `.env` 三行即可）：
+
+| 模型 | LLM_BASE_URL |
+|---|---|
+| Gemini（默认）| `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| Kimi | `https://api.moonshot.cn/v1` |
+| GLM | `https://open.bigmodel.cn/api/paas/v4/` |
+| DeepSeek | `https://api.deepseek.com/v1` |
+
+---
+
+## ⌨️ 极客模式（仅命令行）
+
+如果不想启动 Web UI，可直接调用 Python 脚本：
+
+**解密数据库：**
 ```bash
-# 1. 在项目根目录创建纯净的 Python 虚拟环境
-python3 -m venv venv
-
-# 2. 激活虚拟环境 (每次运行本工具前需执行)
 source venv/bin/activate
-
-# 3. 安装依赖包 (Streamlit UI, Pandas 处理引擎等)
-pip install -r requirements.txt
-
-# 若网络受限（如报 streamlit 找不到），可使用镜像源
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+python3 decrypt_wechat_db.py decrypt \
+  -k "你的64位密钥" \
+  -p darwin -v 4 \
+  -d "/Users/用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<账号目录>" \
+  -o ~/wechat_db_backup
 ```
 
-**一键启动交互大盘：**
+**导出指定会话：**
 ```bash
-streamlit run app.py
-```
-*执行后，浏览器会自动弹出一个包含你所有系统已解码**花名册**的神奇控制面板！*
-- 页面顶部已内置解密表单，可直接填入 `key + data_dir + output_dir` 执行解密。
-- 🔍 你可以在左侧栏无极**搜索过滤**对象名。
-- ☑️ 在列表中自由**勾选**一个或成百上千个聊天对象。
-- 🚀 点击一键提取，附带全动态交互进度条，自动压出 Markdown 私人语料池。
-
-所有图片 (除了 V2端到端高强度防泄密不可逆 AES 封锁图片以外) 均会按照时间戳恢复解码插入。
-
-<br>
-
-*(如果你更偏向纯极客风格的命令行操作，不想要 UI，也依然可以直接调用 Python：)*
-```bash
-python3 decrypt_wechat_db.py decrypt -k "a639...你的密码...08342" -p darwin -v 4 -d "/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/moushayiciyahuo_f02f" -o /tmp/wechat_export_test
 python3 export_group.py "公共技术部"
 ```
 
-### ⚙️ 可选环境变量配置
-
-如果你的解密目录或微信缓存目录不是默认路径，可以在运行前设置以下环境变量（不设置则保持当前默认行为）：
-
+**可选环境变量：**
 ```bash
-# 微信原始缓存根目录（用于回溯图片缓存）
-export WECHATLLM_ROOT_BASE="/Users/你的用户名/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/你的目录"
-
-# 解密输出目录（应包含 db_storage/message 与 db_storage/contact）
-export WECHATLLM_DB_DIR="/tmp/wechat_export_test/db_storage"
-
-# Markdown 导出目录（默认是当前工作目录下 wechat_export）
-export WECHATLLM_OUT_DIR="/Users/你的用户名/Documents/wechat_export"
+export WECHATLLM_DB_DIR=~/wechat_db_backup/db_storage
+export WECHATLLM_OUT_DIR=~/wechat_export
 ```
 
-### 🧯 常见失败排查
+---
 
-1. **无法检测到联系人库 (`contact.db`)**
-   - 确认你已经在页面顶部执行过解密，或手动运行过 `python3 decrypt_wechat_db.py decrypt`。
-   - 检查 `WECHATLLM_DB_DIR` 是否指向包含 `contact/contact.db` 的 `db_storage` 目录。
+## 🧯 常见问题
 
-2. **导出时报 `查无数据库表: Msg_<md5>`**
-   - 该会话可能没有本地消息、被清理，或当前目录并非该账号对应解密结果。
-   - 重新确认 `WECHATLLM_DB_DIR` 后重试。
+| 问题 | 排查方法 |
+|---|---|
+| 未检测到联系人库 | 确认 `~/wechat_db_backup/db_storage/contact/contact.db` 存在 |
+| `查无数据库表: Msg_<md5>` | 该会话无本地消息或已清理，可跳过 |
+| 图片提取失败但文本正常 | 部分图片为 V2 加密格式，不影响文本导出 |
+| ChromaDB 报 Pydantic 错误 | 已替换为 FAISS，重装依赖 `pip install -r requirements.txt` |
 
-3. **图片提取失败但文本可导出**
-   - 部分图片可能为微信 V2 加密图片，或本地缓存已丢失。
-   - 此时 Markdown 会保留占位说明，文本消息仍会正常导出。
+---
 
-尽情享用属于你自己的本地超级语料库进行 AI 对话微调与测试！🤖✨
+尽情享用属于你自己的本地知识库进行 AI 对话与微调！🤖✨

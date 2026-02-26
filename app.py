@@ -1,11 +1,16 @@
 import os
 import sqlite3
+from pathlib import Path
 
+from dotenv import load_dotenv
 import pandas as pd
 import streamlit as st
 
 import export_group as eg
 from decrypt_wechat_db import batch_decrypt
+
+# 加载 .env 配置
+load_dotenv()
 
 st.set_page_config(page_title="WechatLLM 微信知识库导出工具", page_icon="💬", layout="wide")
 
@@ -164,67 +169,103 @@ with st.sidebar:
     st.markdown('<div class="hero-sub">微信知识库导出控制台</div>', unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── 解密配置区 ──
-    st.markdown('<div class="sidebar-section-title">🔓 解密数据库</div>', unsafe_allow_html=True)
+    # ── 解密配置区（可折叠）──
+    with st.expander("🔓 解密数据库", expanded=True):
+        decrypt_key = st.text_input(
+            "数据库密钥 (64 hex)",
+            value=st.session_state.decrypt_key,
+            type="password",
+            placeholder="a639...08342",
+        ).strip()
 
-    decrypt_key = st.text_input(
-        "数据库密钥 (64 hex)",
-        value=st.session_state.decrypt_key,
-        type="password",
-        placeholder="a639...08342",
-    ).strip()
+        detected = eg.detect_wechat_account_dirs()
+        if detected:
+            dropdown_options = {name: path for name, path in detected}
+            selected_account = st.selectbox(
+                "微信账号目录",
+                options=list(dropdown_options.keys()),
+                format_func=lambda x: f"📱 {x}",
+                help="自动扫描得到的有效账号目录",
+            )
+            if selected_account:
+                auto_path = dropdown_options[selected_account]
+                if st.session_state.decrypt_data_dir != auto_path:
+                    st.session_state.decrypt_data_dir = auto_path
+        else:
+            st.caption("⚠️ 未自动检测到微信账号目录，请手动填写。")
 
-    # 自动探测微信账号目录
-    detected = eg.detect_wechat_account_dirs()
-    if detected:
-        dropdown_options = {name: path for name, path in detected}
-        selected_account = st.selectbox(
-            "微信账号目录",
-            options=list(dropdown_options.keys()),
-            format_func=lambda x: f"📱 {x}",
-            help="自动扫描得到的有效账号目录，选择后会填入下方输入框"
-        )
-        if selected_account:
-            auto_path = dropdown_options[selected_account]
-            if st.session_state.decrypt_data_dir != auto_path:
-                st.session_state.decrypt_data_dir = auto_path
-    else:
-        st.caption("⚠️ 未自动检测到微信账号目录，请手动填写。")
+        decrypt_data_dir = st.text_input(
+            "微信账号数据目录",
+            value=st.session_state.decrypt_data_dir,
+            placeholder="/Users/.../xwechat_files/<账号目录>",
+        ).strip()
 
-    decrypt_data_dir = st.text_input(
-        "微信账号数据目录",
-        value=st.session_state.decrypt_data_dir,
-        placeholder="/Users/.../xwechat_files/<账号目录>",
-    ).strip()
+        decrypt_work_dir = st.text_input(
+            "解密输出目录",
+            value=st.session_state.decrypt_work_dir,
+            placeholder="/Users/.../wechat_export_test",
+        ).strip()
 
-    decrypt_work_dir = st.text_input(
-        "解密输出目录",
-        value=st.session_state.decrypt_work_dir,
-        placeholder="/Users/.../wechat_export_test",
-    ).strip()
+        st.session_state.decrypt_key = decrypt_key
+        st.session_state.decrypt_data_dir = decrypt_data_dir
+        st.session_state.decrypt_work_dir = decrypt_work_dir
 
-    st.session_state.decrypt_key = decrypt_key
-    st.session_state.decrypt_data_dir = decrypt_data_dir
-    st.session_state.decrypt_work_dir = decrypt_work_dir
+        run_decrypt = st.button("🔑 开始解密", type="primary", use_container_width=True)
 
-    run_decrypt = st.button("🔑 开始解密", type="primary", use_container_width=True)
+    # ── 导出目录配置（可折叠）──
+    with st.expander("📁 导出目录", expanded=False):
+        markdown_out_dir = st.text_input(
+            "Markdown 输出目录",
+            value=st.session_state.markdown_out_dir,
+            placeholder="/Users/.../wechat_export",
+            label_visibility="collapsed",
+        ).strip()
 
-    st.markdown("---")
+        apply_out_dir = st.button("✅ 应用目录", use_container_width=True)
 
-    # ── 导出目录配置 ──
-    st.markdown('<div class="sidebar-section-title">📁 导出目录</div>', unsafe_allow_html=True)
+        if markdown_out_dir:
+            st.session_state.markdown_out_dir = markdown_out_dir
 
-    markdown_out_dir = st.text_input(
-        "Markdown 输出目录",
-        value=st.session_state.markdown_out_dir,
-        placeholder="/Users/.../wechat_export",
-        label_visibility="collapsed",
-    ).strip()
+    # ── RAG 知识库配置（可折叠）──
+    with st.expander("🧠 RAG 问答配置", expanded=False):
+        st.caption("Embedding 模型")
+        embed_api_key = st.text_input(
+            "Embedding API Key",
+            value=os.getenv("EMBED_API_KEY", ""),
+            type="password",
+            placeholder="sf-xxx",
+        ).strip()
+        embed_base_url = st.text_input(
+            "Embedding Base URL",
+            value=os.getenv("EMBED_BASE_URL", "https://api.siliconflow.cn/v1"),
+            placeholder="https://api.siliconflow.cn/v1",
+        ).strip()
+        embed_model = st.text_input(
+            "Embedding 模型名称",
+            value=os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
+            placeholder="BAAI/bge-m3",
+        ).strip()
 
-    apply_out_dir = st.button("✅ 应用目录", use_container_width=True)
+        st.caption("LLM 模型")
+        llm_api_key = st.text_input(
+            "LLM API Key",
+            value=os.getenv("LLM_API_KEY", ""),
+            type="password",
+            placeholder="AIza-xxx 或 sk-xxx",
+        ).strip()
+        llm_base_url = st.text_input(
+            "LLM Base URL",
+            value=os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+            placeholder="https://api.moonshot.cn/v1",
+        ).strip()
+        llm_model = st.text_input(
+            "LLM 模型名称",
+            value=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
+            placeholder="gemini-2.0-flash / moonshot-v1-32k",
+        ).strip()
 
-    if markdown_out_dir:
-        st.session_state.markdown_out_dir = markdown_out_dir
+        chroma_dir = str(Path(os.getenv("CHROMA_PERSIST_DIR", "~/wechat_rag_db")).expanduser())
+        st.caption(f"📦 ChromaDB: `{chroma_dir}`")
 
     # ── 状态栏 ──
     st.markdown(f"""
@@ -233,6 +274,7 @@ with st.sidebar:
   OUT: <span>{eg.OUT_DIR}</span>
 </div>
 """, unsafe_allow_html=True)
+
 
 
 # ═══════════════════════════════════════════════════
@@ -364,3 +406,105 @@ else:
             st.balloons()
         else:
             status_text.warning(f"完成。成功 {success_count}，失败 {len(selected_rows) - success_count}。")
+
+
+# ═══════════════════════════════════════════════════
+# 🧠 RAG 知识库问答
+# ═══════════════════════════════════════════════════
+st.markdown("---")
+st.markdown('<div class="sidebar-section-title" style="font-size:1rem;margin-bottom:0.8rem">🧠 知识库问答</div>', unsafe_allow_html=True)
+
+if not embed_api_key or not llm_api_key:
+    st.info("🔑 请先展开左侧『RAG 问答配置』填写 Embedding Key 和 LLM Key。")
+else:
+    from ragbot import build_vectorstore, load_vectorstore, ask as rag_ask
+
+    col_idx_btn, col_idx_status = st.columns([2, 5])
+    with col_idx_btn:
+        build_btn = st.button("🔧 构建 / 更新索引", use_container_width=True)
+    with col_idx_status:
+        md_out = eg.OUT_DIR
+        st.caption(f"建索目录：`{md_out}` → ChromaDB：`{chroma_dir}`")
+
+    if build_btn:
+        with st.status("正在构建向量索引...", expanded=True) as build_status:
+            def idx_progress(cur, total, msg):
+                st.write(f"{msg}")
+            try:
+                build_vectorstore(
+                    md_dir=md_out,
+                    embed_api_key=embed_api_key,
+                    embed_base_url=embed_base_url,
+                    embed_model=embed_model,
+                    persist_dir=chroma_dir,
+                    progress_callback=idx_progress,
+                )
+                build_status.update(label="✅ 索引构建完成！", state="complete")
+                st.session_state["vectorstore_ready"] = True
+            except Exception as exc:
+                build_status.update(label=f"❌ 构建失败: {exc}", state="error")
+
+    # 加载或检测已有索引
+    vectorstore = None
+    if st.session_state.get("vectorstore_ready") or Path(chroma_dir).exists():
+        try:
+            vectorstore = load_vectorstore(
+                embed_api_key=embed_api_key,
+                embed_base_url=embed_base_url,
+                embed_model=embed_model,
+                persist_dir=chroma_dir,
+            )
+            if vectorstore:
+                st.session_state["vectorstore_ready"] = True
+        except Exception:
+            pass
+
+    if vectorstore is None:
+        st.info("📦 未检测到向量索引，请先导出 MD 文件后点击“构建 / 更新索引”。")
+    else:
+        # 聊天历史
+        if "rag_messages" not in st.session_state:
+            st.session_state.rag_messages = []
+
+        for msg in st.session_state.rag_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("sources"):
+                    with st.expander("📎 查看引用来源"):
+                        for src in msg["sources"]:
+                            st.markdown(f"**📄 {src['source']}** `{src['time_range']}`")
+                            st.caption(src["snippet"])
+
+        if question := st.chat_input("输入问题，例如：上次技术讨论了什么？"):
+            st.session_state.rag_messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("💭 正在检索记忆中..."):
+                    try:
+                        result = rag_ask(
+                            question=question,
+                            vectorstore=vectorstore,
+                            llm_api_key=llm_api_key,
+                            llm_model=llm_model,
+                            llm_base_url=llm_base_url,
+                        )
+                        answer = result["answer"]
+                        sources = result["sources"]
+                    except Exception as exc:
+                        answer = f"❌ 问答失败: {exc}"
+                        sources = []
+
+                st.markdown(answer)
+                if sources:
+                    with st.expander("📎 查看引用来源"):
+                        for src in sources:
+                            st.markdown(f"**📄 {src['source']}** `{src['time_range']}`")
+                            st.caption(src["snippet"])
+
+            st.session_state.rag_messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sources": sources,
+            })

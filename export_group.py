@@ -46,8 +46,24 @@ def detect_wechat_account_dirs() -> list[tuple[str, str]]:
 
 _detected_dirs = detect_wechat_account_dirs()
 DEFAULT_ROOT_BASE = _detected_dirs[0][1] if _detected_dirs else WECHAT_XFILES_BASE
-DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~/wechat_db_backup"))
+
+
+def _auto_detect_db_dir() -> str:
+    """自动探测已解密的数据库目录，优先查找 db_storage 子目录"""
+    base = os.path.expanduser("~/wechat_db_backup")
+    db_storage = os.path.join(base, "db_storage")
+    contact_in_storage = os.path.join(db_storage, "contact", "contact.db")
+    contact_in_base = os.path.join(base, "contact", "contact.db")
+    if os.path.exists(contact_in_storage):
+        return db_storage
+    if os.path.exists(contact_in_base):
+        return base
+    return db_storage  # 默认值，即使不存在也以此为准
+
+
+DEFAULT_DB_DIR = _auto_detect_db_dir()
 DEFAULT_OUT_DIR = os.path.join(os.getcwd(), "wechat_export")
+
 
 
 def get_runtime_config():
