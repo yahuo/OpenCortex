@@ -25,10 +25,12 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 用编辑器打开 .env，填入以下内容：
-#   EMBED_API_KEY   — 硅基流动 Embedding Key（sf-xxx）
-#   LLM_API_KEY     — 你的 LLM API Key（Gemini / Kimi / GLM 等）
-#   LLM_BASE_URL    — 对应 LLM 的 base_url
-#   LLM_MODEL       — 模型名称（默认 gemini-2.0-flash）
+#   EMBED_API_KEY    — Embedding 服务的 API Key
+#   EMBED_BASE_URL   — Embedding 服务地址（默认硅基流动，可换其他兼容 OpenAI 的服务）
+#   EMBED_MODEL      — Embedding 模型名称（默认 BAAI/bge-m3）
+#   LLM_API_KEY      — LLM 的 API Key（Gemini / Kimi / GLM 等）
+#   LLM_BASE_URL     — LLM 的 base_url
+#   LLM_MODEL        — LLM 模型名称（默认 gemini-2.0-flash）
 ```
 
 ### 3. 启动可视化控制台

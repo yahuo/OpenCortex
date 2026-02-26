@@ -11,3 +11,4 @@ wechat_data_mnt/
 
 # Secrets
 wechat_db_key.txt
+.env
