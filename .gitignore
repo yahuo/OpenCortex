@@ -8,7 +8,7 @@ venv/
 # Local exports and runtime artifacts
 wechat_export/
 wechat_data_mnt/
+chatlog/
 
 # Secrets
 wechat_db_key.txt
-
