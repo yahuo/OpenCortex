@@ -144,12 +144,13 @@ def load_contacts():
     conn.close()
     return mapping
 
-def find_table_db(table_name):
-    """自动扫描 message_*.db 并找到包含目标表的库文件。"""
+def find_all_table_dbs(table_name):
+    """自动扫描所有 message_*.db 分片，返回包含目标表的所有库文件列表。
+    同一群聊的历史消息可能分布在多个分片中，必须全部合并才能导出完整记录。"""
     db_files = glob.glob(os.path.join(MSG_DIR, "message_*.db"))
     if not db_files:
         logger.warning("未发现消息分片数据库: %s", MSG_DIR)
-        return None
+        return []
 
     def sort_key(path):
         base = os.path.basename(path)
@@ -158,6 +159,7 @@ def find_table_db(table_name):
             return (0, int(m.group(1)))
         return (1, base)
 
+    matched = []
     for db_file in sorted(db_files, key=sort_key):
         try:
             with sqlite3.connect(db_file) as conn:
@@ -167,10 +169,16 @@ def find_table_db(table_name):
                     (table_name,),
                 )
                 if c.fetchone()[0] > 0:
-                    return db_file
+                    matched.append(db_file)
         except sqlite3.Error as err:
             logger.warning("扫描消息数据库失败: %s (%s)", os.path.basename(db_file), err)
-    return None
+    return matched
+
+
+# 兄弟函数，保留下来内部兼容
+def find_table_db(table_name):
+    results = find_all_table_dbs(table_name)
+    return results[0] if results else None
 
 def find_image_file(md5_id, hash_str):
     """在系统的原始缓存路径递归寻找带给定 hash 的所有源图片文件"""
@@ -194,36 +202,54 @@ def export_by_username(username, display_group_name, progress_callback=None):
     md5_hash = hashlib.md5(username.encode()).hexdigest()
     table_name = f"Msg_{md5_hash}"
     
-    db_file = find_table_db(table_name)
+    db_file = find_table_db(table_name)  # 先搞清楚是否根本有记录
     if not db_file:
         return False, f"查无数据库表，聊天记录可能已被清理或未生成: {table_name}"
-        
+
+    # 收集全部包含该群聊的分片（可能有多个）
+    all_dbs = find_all_table_dbs(table_name)
+    logger.info("群聊 %s 分布在 %d 个分片: %s",
+                display_group_name, len(all_dbs),
+                [os.path.basename(d) for d in all_dbs])
+
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(IMG_OUT_DIR, exist_ok=True)
     out_md_file = os.path.join(OUT_DIR, f"聊天记录_{safe_group_name}.md")
-    
+
     contacts = load_contacts()
-    
-    conn = sqlite3.connect(db_file)
-    c = conn.cursor()
-    
-    # 建立发送方内部 ID 到 wxid 的映射
+
+    # 建立发送方 ID 映射（从第一个分片读取，各分片共用）
     id2name = {}
     try:
-        c.execute("SELECT rowid, user_name FROM Name2Id")
-        for rowid, uname in c:
-            id2name[rowid] = uname
+        with sqlite3.connect(db_file) as conn:
+            for rowid, uname in conn.execute("SELECT rowid, user_name FROM Name2Id"):
+                id2name[rowid] = uname
     except Exception as err:
-        logger.warning("读取 Name2Id 映射失败，将继续导出但发信人名称可能不完整: %s", err)
-        
-    try:
-        c.execute(f"SELECT create_time, local_type, real_sender_id, message_content, packed_info_data FROM {table_name} ORDER BY create_time ASC")
-        messages = c.fetchall()
-    except Exception as e:
-        conn.close()
-        return False, f"提取消息时由于底层数据库错误被中断: {e}"
-    conn.close()
-    
+        logger.warning("读取 Name2Id 映射失败，发信人名称可能不完整: %s", err)
+
+    # 收集所有分片的消息，合并后按时间排序
+    messages = []
+    for shard_db in all_dbs:
+        try:
+            with sqlite3.connect(shard_db) as conn:
+                c = conn.cursor()
+                # 各分片也读取 Name2Id（不同分片可能有各自的映射）
+                try:
+                    for rowid, uname in c.execute("SELECT rowid, user_name FROM Name2Id"):
+                        id2name.setdefault(rowid, uname)
+                except Exception:
+                    pass
+                c.execute(
+                    f"SELECT create_time, local_type, real_sender_id, message_content, "
+                    f"packed_info_data FROM {table_name} ORDER BY create_time ASC"
+                )
+                messages.extend(c.fetchall())
+        except Exception as e:
+            logger.warning("读取分片 %s 失败: %s", os.path.basename(shard_db), e)
+
+    # 全局按时间排序（不同分片可能时间交叉）
+    messages.sort(key=lambda r: r[0])
+
     total_messages = len(messages)
     if progress_callback:
         progress_callback(0, total_messages, f"载入 {display_group_name} 的 {total_messages} 条记录...")
@@ -322,12 +348,23 @@ def export_by_username(username, display_group_name, progress_callback=None):
             # 表情包类型
             elif msg_type == 47: md_content = "😀 `[表情包/动画表情]`"
             
-            # 小程序/文件/系统外接卡片
             elif msg_type == 49:
                 md_content = "📎 `[文件/链接/小程序]`"
-                if content and isinstance(content, str):
-                    m = re.search(r'<title>(.*?)</title>', content)
-                    if m: md_content += f" - **{m.group(1)}**"
+                raw = content
+                if isinstance(raw, bytes):
+                    try:
+                        raw = raw.decode('utf-8', errors='ignore')
+                    except Exception:
+                        raw = ''
+                if raw and isinstance(raw, str):
+                    # 提取 title
+                    m = re.search(r'<title>([^<]+)</title>', raw)
+                    if m:
+                        md_content += f" - **{m.group(1).strip()}**"
+                    # 引用/回复消息：提取被引用文本
+                    q = re.search(r'<content>([^<]{1,200})</content>', raw)
+                    if q:
+                        md_content += f"\n> 引用: {q.group(1).strip()}"
                     
             # 内部服务提示 (包括撤回、入群出群提醒等)
             elif msg_type == 10000:
