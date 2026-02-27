@@ -27,12 +27,20 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
-    font-size: 1.9rem;
+    font-size: 3rem;
     font-weight: 700;
     line-height: 1.2;
-    margin-bottom: 0.15rem;
+    margin-bottom: 0.35rem;
 }
-.hero-sub { color: #64748b; font-size: 0.85rem; margin-bottom: 0; }
+.hero-sub { color: #64748b; font-size: 0.95rem; margin-bottom: 0; }
+
+.brand-card {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 0;
+    margin: 0 0 1.2rem;
+}
 
 .block-container { padding-top: 1.6rem; padding-bottom: 2rem; }
 
@@ -62,6 +70,9 @@ header {visibility: hidden;}
 [data-testid="stDeployButton"] {display: none !important;}
 [data-testid="stStatusWidget"] {display: none !important;}
 [data-testid="stDecoration"] {display: none !important;}
+[data-testid="stSidebar"] {display: none !important;}
+[data-testid="stSidebarNav"] {display: none !important;}
+[data-testid="collapsedControl"] {display: none !important;}
 </style>
 """,
         unsafe_allow_html=True,
@@ -112,25 +123,15 @@ init_session_state()
 cfg = read_runtime_config()
 inject_global_css()
 
-st.title("💬 OpenCortex")
-
-with st.sidebar:
-    st.markdown('<div class="hero-title">💬 OpenCortex</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-sub">本地知识库问答工具</div>', unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 运行信息")
-    st.code(
-        (
-            f"源目录: {cfg['source_dir']}\n"
-            f"索引目录: {cfg['persist_dir']}\n"
-            f"Embedding: {cfg['embed_model']}\n"
-            f"LLM: {cfg['llm_model']}"
-        ),
-        language="text",
-    )
-    if st.button("🧹 清空对话", use_container_width=True):
-        st.session_state.rag_messages = []
-        st.rerun()
+st.markdown(
+    """
+<div class="brand-card">
+    <div class="hero-title">💬 OpenCortex</div>
+    <div class="hero-sub">本地知识库问答工具</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 missing_env = []
 if not cfg["embed_api_key"]:
