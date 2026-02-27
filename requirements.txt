@@ -1,9 +1,4 @@
 streamlit>=1.45,<2
-pandas>=2.2,<3
-zstandard>=0.22,<1
-pycryptodome>=3.21,<4
 python-dotenv>=1.0,<2
-langchain>=0.3,<1
 langchain-community>=0.3,<1
 langchain-openai>=0.2,<1
-chromadb>=0.6,<1
