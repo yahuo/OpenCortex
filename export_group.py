@@ -112,6 +112,63 @@ MAGIC_MAP = {
     b'GIF8': '.gif'
 }
 
+def _parse_sysmsg_xml(raw_text):
+    """解析微信 type=10000 系统消息的 XML，提取可读文本。
+
+    微信系统消息格式示例：
+    <sysmsg><sysmsgtemplate>
+      <template>"$username$"邀请你和"$names$"加入了群聊</template>
+      <link_list>
+        <link name="username"><memberlist><member>
+          <username>wxid_xxx</username><nickname>昵称</nickname>
+        </member></memberlist></link>
+        <link name="names"><memberlist><member>...</member>
+          <separator>、</separator></memberlist></link>
+      </link_list>
+    </sysmsgtemplate></sysmsg>
+    """
+    # 如果不包含 XML 标签，直接返回纯文本
+    if '<sysmsg' not in raw_text:
+        return raw_text
+
+    # 提取 <plain> 纯文本（部分系统消息直接提供）
+    m_plain = re.search(r'<plain>\s*<!\[CDATA\[(.+?)\]\]>\s*</plain>', raw_text, re.DOTALL)
+    if m_plain:
+        plain = m_plain.group(1).strip()
+        if plain:
+            return plain
+
+    # 提取模板和变量，做替换
+    m_tpl = re.search(r'<template>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</template>', raw_text, re.DOTALL)
+    if not m_tpl:
+        # 兜底：去掉所有 XML 标签，返回纯文本
+        return re.sub(r'<[^>]+>', '', raw_text).strip() or raw_text
+
+    template = m_tpl.group(1).strip()
+
+    # 解析 <link name="xxx"> 块，提取各变量对应的昵称列表
+    link_pattern = re.compile(
+        r'<link\s+name="(\w+)"[^>]*>(.+?)</link>', re.DOTALL
+    )
+    for link_match in link_pattern.finditer(raw_text):
+        var_name = link_match.group(1)        # 例如 "username", "names"
+        link_body = link_match.group(2)
+
+        # 提取所有 <nickname> 或 <username> 中的 CDATA 值
+        nicknames = re.findall(r'<nickname>\s*<!\[CDATA\[(.+?)\]\]>\s*</nickname>', link_body)
+        if not nicknames:
+            nicknames = re.findall(r'<username>\s*<!\[CDATA\[(.+?)\]\]>\s*</username>', link_body)
+
+        # 提取分隔符（默认顿号）
+        sep_m = re.search(r'<separator>\s*<!\[CDATA\[(.+?)\]\]>\s*</separator>', link_body)
+        sep = sep_m.group(1) if sep_m else '、'
+
+        replacement = sep.join(nicknames) if nicknames else var_name
+        template = template.replace(f'${var_name}$', replacement)
+
+    return template
+
+
 def decompress_zstd(data):
     """尝试将 zstd 压缩的微信长消息解压为真实文本"""
     if zstd is None:
@@ -218,32 +275,29 @@ def export_by_username(username, display_group_name, progress_callback=None):
 
     contacts = load_contacts()
 
-    # 建立发送方 ID 映射（从第一个分片读取，各分片共用）
-    id2name = {}
-    try:
-        with sqlite3.connect(db_file) as conn:
-            for rowid, uname in conn.execute("SELECT rowid, user_name FROM Name2Id"):
-                id2name[rowid] = uname
-    except Exception as err:
-        logger.warning("读取 Name2Id 映射失败，发信人名称可能不完整: %s", err)
+    # 每个分片独立维护 Name2Id 映射（不同分片的 rowid 可能指向不同用户）
+    shard_id2name = {}  # {分片路径: {rowid: user_name}}
 
-    # 收集所有分片的消息，合并后按时间排序
-    messages = []
+    # 收集所有分片的消息，同时记录每条消息来源的分片
+    messages = []  # [(create_time, msg_type, sender_id, content, packed_info, shard_db)]
     for shard_db in all_dbs:
         try:
             with sqlite3.connect(shard_db) as conn:
                 c = conn.cursor()
-                # 各分片也读取 Name2Id（不同分片可能有各自的映射）
+                # 读取本分片的 Name2Id 映射
+                local_map = {}
                 try:
                     for rowid, uname in c.execute("SELECT rowid, user_name FROM Name2Id"):
-                        id2name.setdefault(rowid, uname)
+                        local_map[rowid] = uname
                 except Exception:
                     pass
+                shard_id2name[shard_db] = local_map
                 c.execute(
                     f"SELECT create_time, local_type, real_sender_id, message_content, "
                     f"packed_info_data FROM {table_name} ORDER BY create_time ASC"
                 )
-                messages.extend(c.fetchall())
+                for row in c:
+                    messages.append((*row, shard_db))
         except Exception as e:
             logger.warning("读取分片 %s 失败: %s", os.path.basename(shard_db), e)
 
@@ -263,10 +317,11 @@ def export_by_username(username, display_group_name, progress_callback=None):
             if progress_callback and idx % 20 == 0:
                 progress_callback(idx, total_messages, f"处理中: {idx}/{total_messages}...")
             
-            create_time, msg_type, sender_id, content, packed_info = msg
+            create_time, msg_type, sender_id, content, packed_info, msg_shard = msg
             dt = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S')
-            
-            real_username = id2name.get(sender_id, None)
+
+            # 使用消息所属分片的 Name2Id 映射查找发送者
+            real_username = shard_id2name.get(msg_shard, {}).get(sender_id, None)
             md_content = ""
             
             if msg_type == 1:
@@ -370,15 +425,15 @@ def export_by_username(username, display_group_name, progress_callback=None):
             elif msg_type == 10000:
                 # 也有可能是 zstd 压缩提醒
                 if type(content) is bytes and content.startswith(b'\x28\xb5\x2f\xfd'):
-                    md_content = f"<i>{decompress_zstd(content)}</i>"
+                    c_str = decompress_zstd(content)
                 elif type(packed_info) is bytes and packed_info.startswith(b'\x28\xb5\x2f\xfd'):
-                    md_content = f"<i>{decompress_zstd(packed_info)}</i>"
+                    c_str = decompress_zstd(packed_info)
                 else:
                     try:
                         c_str = content.decode('utf-8') if type(content) is bytes else str(content)
                     except Exception:
                         c_str = str(content)
-                    md_content = f"<i>{c_str}</i>"
+                md_content = f"*{_parse_sysmsg_xml(c_str)}*"
                     
             # 其他极边缘的消息流
             else: md_content = f"📦 `[未知格式内建消息: 类型代码 {msg_type}]`"
