@@ -13,6 +13,61 @@ load_dotenv()
 st.set_page_config(page_title="OpenCortex", page_icon="💬", layout="wide")
 
 
+def inject_global_css() -> None:
+    """注入接近 master 分支的全局样式，并隐藏顶部工具栏"""
+    st.markdown(
+        """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+.hero-title {
+    background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-size: 1.9rem;
+    font-weight: 700;
+    line-height: 1.2;
+    margin-bottom: 0.15rem;
+}
+.hero-sub { color: #64748b; font-size: 0.85rem; margin-bottom: 0; }
+
+.block-container { padding-top: 1.6rem; padding-bottom: 2rem; }
+
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #4ade80, #22d3ee);
+    color: #0f172a;
+    border: none;
+    font-weight: 600;
+    border-radius: 10px;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 12px rgba(74,222,128,0.3);
+}
+.stButton > button[kind="primary"]:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(74,222,128,0.45);
+}
+.stButton > button[kind="primary"]:disabled {
+    opacity: 0.35;
+    transform: none;
+    box-shadow: none;
+}
+
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+[data-testid="stToolbar"] {display: none !important;}
+[data-testid="stDeployButton"] {display: none !important;}
+[data-testid="stStatusWidget"] {display: none !important;}
+[data-testid="stDecoration"] {display: none !important;}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def get_vectorstore(
     embed_api_key: str,
@@ -92,10 +147,14 @@ def auto_rebuild_index(cfg: dict[str, str]) -> bool:
 
 init_session_state()
 cfg = read_runtime_config()
+inject_global_css()
 
 st.title("💬 OpenCortex")
 
 with st.sidebar:
+    st.markdown('<div class="hero-title">💬 OpenCortex</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-sub">本地知识库问答工具</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 运行信息")
     st.code(
         (
