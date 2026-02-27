@@ -182,6 +182,8 @@ if question := st.chat_input("输入问题..."):
         st.markdown(question)
 
     with st.chat_message("assistant"):
+        status_placeholder = st.empty()
+        status_placeholder.info("🔎 正在检索相关内容...")
         try:
             result = rag_ask_stream(
                 question=question,
@@ -191,10 +193,22 @@ if question := st.chat_input("输入问题..."):
                 llm_base_url=cfg["llm_base_url"],
             )
             sources = result["sources"]
-            answer = st.write_stream(result["answer_stream"])
+            base_stream = result["answer_stream"]
+
+            def stream_with_status():
+                first_chunk = True
+                for chunk in base_stream:
+                    if first_chunk:
+                        status_placeholder.empty()
+                        first_chunk = False
+                    yield chunk
+
+            answer = st.write_stream(stream_with_status())
+            status_placeholder.empty()
         except Exception as exc:
             answer = f"问答失败：{exc}"
             sources = []
+            status_placeholder.empty()
             st.markdown(answer)
 
         if sources:
