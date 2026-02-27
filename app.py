@@ -1,4 +1,4 @@
-"""OpenCortex — 单页自动索引 + 对话"""
+"""OpenCortex — 单页对话界面。"""
 import os
 from pathlib import Path
 
@@ -6,7 +6,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from ragbot import ask_stream as rag_ask_stream
-from ragbot import build_vectorstore, load_vectorstore
+from ragbot import load_vectorstore
 
 load_dotenv()
 
@@ -106,43 +106,6 @@ def read_runtime_config() -> dict[str, str]:
 
 def init_session_state() -> None:
     st.session_state.setdefault("rag_messages", [])
-    st.session_state.setdefault("index_ready", False)
-    st.session_state.setdefault("index_error", "")
-
-
-def auto_rebuild_index(cfg: dict[str, str]) -> bool:
-    progress = st.progress(0.0, text="正在准备索引任务...")
-    status = st.empty()
-
-    def on_progress(current: int, total: int, message: str) -> None:
-        ratio = 0.0 if total <= 0 else min(current / total, 1.0)
-        progress.progress(ratio, text=message)
-        status.caption(message)
-
-    try:
-        build_vectorstore(
-            md_dir=cfg["source_dir"],
-            embed_api_key=cfg["embed_api_key"],
-            embed_base_url=cfg["embed_base_url"],
-            embed_model=cfg["embed_model"],
-            persist_dir=cfg["persist_dir"],
-            progress_callback=on_progress,
-        )
-    except Exception as exc:
-        st.session_state.index_ready = False
-        st.session_state.index_error = str(exc)
-        progress.empty()
-        status.empty()
-        st.error(f"自动创建向量索引失败：{exc}")
-        return False
-
-    get_vectorstore.clear()
-    st.session_state.index_ready = True
-    st.session_state.index_error = ""
-    progress.empty()
-    status.empty()
-    st.balloons()
-    return True
 
 
 init_session_state()
@@ -165,9 +128,6 @@ with st.sidebar:
         ),
         language="text",
     )
-    if st.button("🔁 重新创建索引", use_container_width=True):
-        st.session_state.index_ready = False
-        st.rerun()
     if st.button("🧹 清空对话", use_container_width=True):
         st.session_state.rag_messages = []
         st.rerun()
@@ -189,12 +149,12 @@ if not source_path.is_dir():
     st.info("请设置 .env 中的 LOCAL_DOCS_DIR。")
     st.stop()
 
-index_notice = st.empty()
-if not st.session_state.index_ready:
-    index_notice.info("正在根据目录文件自动重建向量索引，请稍候...")
-    if not auto_rebuild_index(cfg):
-        st.stop()
-    index_notice.empty()
+index_file = Path(cfg["persist_dir"]) / "index.faiss"
+if not index_file.exists():
+    st.error("未检测到向量索引。")
+    st.code("python3 start.py", language="bash")
+    st.info("请在终端运行上面的命令：先重建索引，再启动页面。")
+    st.stop()
 
 vectorstore = get_vectorstore(
     embed_api_key=cfg["embed_api_key"],
@@ -204,7 +164,7 @@ vectorstore = get_vectorstore(
 )
 
 if vectorstore is None:
-    st.error("索引加载失败，请点击侧边栏“重新创建索引”。")
+    st.error("索引加载失败，请重启应用后重试。")
     st.stop()
 
 for msg in st.session_state.rag_messages:
