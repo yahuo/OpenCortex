@@ -16,6 +16,7 @@ ragbot.py — 微信聊天记录 RAG 问答核心模块
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime, timedelta
@@ -248,6 +249,29 @@ def build_vectorstore(
     persist_path = Path(persist_dir)
     persist_path.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(persist_path))  # type: ignore[union-attr]
+
+    # 写入索引文件清单，供 UI 展示"当前索引了哪些文件"
+    manifest = {
+        "build_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "embed_model": embed_model,
+        "total_chunks": total,
+        "files": [],
+    }
+    for md_path in sorted(Path(md_dir).glob("*.md")):
+        stat = md_path.stat()
+        chunks = sum(
+            1 for d in documents if d.metadata.get("source") == md_path.name
+        )
+        manifest["files"].append({
+            "name": md_path.name,
+            "size_kb": round(stat.st_size / 1024, 1),
+            "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "chunks": chunks,
+        })
+    (persist_path / "index_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     _cb(3, 3, f"✅ 索引构建完成，已保存到 {persist_dir}")
 
     return vectorstore  # type: ignore[return-value]
