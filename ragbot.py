@@ -450,3 +450,79 @@ def ask(
             })
 
     return {"answer": answer, "sources": sources}
+
+
+def _chunk_to_text(chunk) -> str:
+    """将 LangChain 流式 chunk 统一转换为字符串"""
+    content = getattr(chunk, "content", chunk)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
+def ask_stream(
+    question: str,
+    vectorstore: FAISS,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> dict:
+    """
+    检索 + 流式生成，返回：
+      {
+        "answer_stream": Iterator[str],
+        "sources": [{"source": str, "time_range": str, "snippet": str}, ...]
+      }
+    """
+    # 1. 检索
+    results = vectorstore.similarity_search(question, k=top_k)
+
+    # 2. 构造上下文
+    context_parts = []
+    for i, doc in enumerate(results):
+        meta = doc.metadata
+        source = meta.get("source", "")
+        time_range = meta.get("time_range", "")
+        header = f"[片段{i+1}] 来自《{source}》"
+        if time_range:
+            header += f" {time_range}"
+        context_parts.append(f"{header}\n{doc.page_content}")
+    context = "\n\n".join(context_parts)
+
+    # 3. 整理引用列表（可在流式结束后展示）
+    sources = []
+    seen: set[tuple] = set()
+    for doc in results:
+        meta = doc.metadata
+        key = (meta.get("source", ""), meta.get("time_range", ""))
+        if key not in seen:
+            seen.add(key)
+            snippet = doc.page_content
+            sources.append({
+                "source": meta.get("source", ""),
+                "time_range": meta.get("time_range", ""),
+                "snippet": snippet[:150] + "..." if len(snippet) > 150 else snippet,
+            })
+
+    # 4. LLM 流式输出
+    llm = make_llm(api_key=llm_api_key, model=llm_model, base_url=llm_base_url)
+    prompt = _PROMPT_TEMPLATE.format(context=context, question=question)
+
+    def answer_stream():
+        for chunk in llm.stream(prompt):
+            text = _chunk_to_text(chunk)
+            if text:
+                yield text
+
+    return {"answer_stream": answer_stream(), "sources": sources}

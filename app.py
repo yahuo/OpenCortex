@@ -5,7 +5,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from ragbot import ask as rag_ask
+from ragbot import ask_stream as rag_ask_stream
 from ragbot import build_vectorstore, load_vectorstore
 
 load_dotenv()
@@ -163,22 +163,21 @@ if question := st.chat_input("输入问题..."):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("正在检索并生成回答..."):
-            try:
-                result = rag_ask(
-                    question=question,
-                    vectorstore=vectorstore,
-                    llm_api_key=cfg["llm_api_key"],
-                    llm_model=cfg["llm_model"],
-                    llm_base_url=cfg["llm_base_url"],
-                )
-                answer = result["answer"]
-                sources = result["sources"]
-            except Exception as exc:
-                answer = f"问答失败：{exc}"
-                sources = []
+        try:
+            result = rag_ask_stream(
+                question=question,
+                vectorstore=vectorstore,
+                llm_api_key=cfg["llm_api_key"],
+                llm_model=cfg["llm_model"],
+                llm_base_url=cfg["llm_base_url"],
+            )
+            sources = result["sources"]
+            answer = st.write_stream(result["answer_stream"])
+        except Exception as exc:
+            answer = f"问答失败：{exc}"
+            sources = []
+            st.markdown(answer)
 
-        st.markdown(answer)
         if sources:
             with st.expander("查看引用"):
                 for src in sources:
