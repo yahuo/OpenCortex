@@ -176,6 +176,65 @@ export WECHATLLM_OUT_DIR=~/wechat_export
 
 ---
 
+## 💻 系统要求
+
+> 计算密集的 Embedding 和 LLM 推理均外包给云端 API，本地只需运行 Streamlit + FAISS 检索，对硬件要求极低。
+
+| 项目 | 最低要求 | 说明 |
+|---|---|---|
+| **操作系统** | macOS（当前） | 解密逻辑依赖 macOS 路径；导出/RAG 部分跨平台 |
+| **CPU** | 任意现代 CPU | FAISS 是纯 CPU 内存运算，无需 GPU |
+| **内存** | ≥ 2 GB 可用 | FAISS 索引加载进内存，约 50~200 MB |
+| **磁盘** | ≥ 500 MB 空余 | Markdown + FAISS 索引 + Python 虚拟环境 |
+| **GPU** | ❌ 不需要 | 所有推理均走云端 API |
+| **网络** | 能访问 API 端点 | 仅向量化与 LLM 生成时出网；FAISS 检索完全离线 |
+
+---
+
+## 🦙 完全离线模式（本地 Ollama）
+
+如需在无网络或隐私敏感场景下运行，可将 Embedding 和 LLM 全部替换为本地 Ollama，**代码无需任何修改**，只改 `.env` 即可。
+
+### 1. 安装 Ollama 并拉取模型
+
+```bash
+# 安装 Ollama（官网：https://ollama.com）
+brew install ollama
+
+# 拉取 Embedding 模型（支持中文，约 274 MB）
+ollama pull nomic-embed-text
+
+# 拉取 LLM 模型（任选其一）
+ollama pull qwen2.5:7b      # 阿里通义千问，中文友好，约 4.7 GB
+ollama pull deepseek-r1:8b  # DeepSeek，推理能力强，约 4.9 GB
+ollama pull llama3.2:3b     # Meta Llama，轻量，约 2 GB
+```
+
+### 2. 修改 `.env` 指向本地 Ollama
+
+```bash
+# Embedding（Ollama 兼容 OpenAI Embedding 接口）
+EMBED_API_KEY=ollama
+EMBED_BASE_URL=http://localhost:11434/v1
+EMBED_MODEL=nomic-embed-text
+
+# LLM
+LLM_API_KEY=ollama
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5:7b
+```
+
+### 3. 启动 Ollama 服务后正常使用
+
+```bash
+ollama serve   # 保持终端窗口开着（或设置为后台服务）
+streamlit run app.py
+```
+
+> **离线模式硬件建议**：运行 7B 参数模型推荐 ≥ 16 GB 内存（Apple Silicon M 系列效果最佳）；3B 模型在 8 GB 内存下也可流畅运行。
+
+---
+
 ## 🧯 常见问题
 
 | 问题 | 排查方法 |
@@ -184,6 +243,7 @@ export WECHATLLM_OUT_DIR=~/wechat_export
 | `查无数据库表: Msg_<md5>` | 该会话无本地消息或已清理，可跳过 |
 | 图片提取失败但文本正常 | 部分图片为 V2 加密格式，不影响文本导出 |
 | ChromaDB 报 Pydantic 错误 | 已替换为 FAISS，重装依赖 `pip install -r requirements.txt` |
+| Ollama 连接失败 | 确认 `ollama serve` 正在运行，默认端口 11434 |
 
 ---
 
