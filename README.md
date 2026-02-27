@@ -100,6 +100,38 @@ streamlit run app.py
 
 ## 🧠 知识库问答（RAG）
 
+### 架构原理
+
+> 无需部署任何本地服务。Embedding 和 LLM 均调用在线 API；向量存储使用 FAISS 纯 Python 库，索引以文件形式保存在本地磁盘，无需守护进程。
+
+```mermaid
+flowchart TD
+    A[/"Markdown 聊天记录"/]
+    A --> B["按 30 分钟时间窗口切分对话"]
+    B --> C["对话片段 chunk × N"]
+    C --> D{"Embedding API - 云端向量化"}
+    D --> E[("FAISS 索引 - 本地文件，无需服务进程")]
+
+    F(["用户提问"])
+    F --> G{"Embedding API - 云端向量化"}
+    G --> H["问题向量"]
+    H -->|"余弦相似度搜索 - 纯本地 < 1ms"| E
+    E --> I["Top-K 相关对话片段"]
+    I --> J{"LLM API - Gemini / Kimi / GLM"}
+    J --> K[/"带引用的最终回答"/]
+```
+
+**两处云 API 调用（需网络）：**
+- `Embedding API`：把文字转成向量（构建索引时 + 用户提问时）
+- `LLM API`：根据检索到的片段生成最终回答
+
+**完全本地（无网络、无服务进程）：**
+- `FAISS` 向量相似度搜索 —— 读取本地 `.faiss` 文件做内存计算
+
+---
+
+### 操作步骤
+
 1. 先在右侧勾选会话 → 点"🚀 导出选定"导出为 Markdown
 2. 展开左侧"🧠 RAG 问答配置"，确认 Key 已填入（从 `.env` 自动读取）
 3. 右侧底部点"🔧 构建 / 更新索引"（使用 FAISS + bge-m3 向量化）
@@ -113,6 +145,7 @@ streamlit run app.py
 | Kimi | `https://api.moonshot.cn/v1` |
 | GLM | `https://open.bigmodel.cn/api/paas/v4/` |
 | DeepSeek | `https://api.deepseek.com/v1` |
+
 
 ---
 
