@@ -44,25 +44,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 .block-container { padding-top: 1.6rem; padding-bottom: 2rem; }
 
-.stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #4ade80, #22d3ee);
-    color: #0f172a;
-    border: none;
-    font-weight: 600;
-    border-radius: 10px;
-    transition: all 0.2s ease;
-    box-shadow: 0 2px 12px rgba(74,222,128,0.3);
-}
-.stButton > button[kind="primary"]:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 20px rgba(74,222,128,0.45);
-}
-.stButton > button[kind="primary"]:disabled {
-    opacity: 0.35;
-    transform: none;
-    box-shadow: none;
-}
-
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
@@ -95,9 +76,7 @@ def get_vectorstore(
 
 
 def read_runtime_config() -> dict[str, str]:
-    source_dir = os.getenv("LOCAL_DOCS_DIR", "").strip() or "./docs"
     return {
-        "source_dir": str(Path(source_dir).expanduser()),
         "persist_dir": str(
             Path(os.getenv("CHROMA_PERSIST_DIR", "~/wechat_rag_db")).expanduser()
         ),
@@ -142,12 +121,6 @@ if not cfg["llm_api_key"]:
 if missing_env:
     st.error(f"缺少环境变量：{', '.join(missing_env)}")
     st.info("请在 .env 中配置后重新打开页面。")
-    st.stop()
-
-source_path = Path(cfg["source_dir"])
-if not source_path.is_dir():
-    st.error(f"源目录不存在：{source_path}")
-    st.info("请设置 .env 中的 LOCAL_DOCS_DIR。")
     st.stop()
 
 index_file = Path(cfg["persist_dir"]) / "index.faiss"

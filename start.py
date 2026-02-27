@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 from ragbot import build_vectorstore
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 
 def read_runtime_config() -> dict[str, str]:
     source_dir = os.getenv("LOCAL_DOCS_DIR", "").strip() or "./docs"
@@ -38,6 +40,9 @@ def validate_runtime(cfg: dict[str, str]) -> None:
         raise ValueError(f"源目录不存在: {cfg['source_dir']}")
     if not cfg["port"].isdigit():
         raise ValueError(f"APP_PORT 非法: {cfg['port']}")
+    port = int(cfg["port"])
+    if not (1 <= port <= 65535):
+        raise ValueError(f"APP_PORT 超出范围: {cfg['port']}")
 
 
 def rebuild_index(cfg: dict[str, str]) -> None:
@@ -62,12 +67,13 @@ def launch_streamlit(cfg: dict[str, str]) -> int:
     print(f"[OpenCortex] 索引重建完成。请访问: {url}", flush=True)
     print("[OpenCortex] 正在启动 Web 服务（不会自动打开浏览器）...", flush=True)
 
+    app_path = PROJECT_ROOT / "app.py"
     cmd = [
         sys.executable,
         "-m",
         "streamlit",
         "run",
-        "app.py",
+        str(app_path),
         "--server.headless",
         "true",
         "--server.address",
@@ -78,12 +84,12 @@ def launch_streamlit(cfg: dict[str, str]) -> int:
     env = os.environ.copy()
     env["BROWSER"] = "none"
 
-    proc = subprocess.run(cmd, env=env)
+    proc = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT))
     return proc.returncode
 
 
 def main() -> int:
-    load_dotenv()
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
     cfg = read_runtime_config()
 
     try:
