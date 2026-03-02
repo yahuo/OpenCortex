@@ -5,14 +5,14 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-COPY requirements.txt .
+RUN adduser --disabled-password --gecos "" appuser
+
+COPY --chown=appuser:appuser requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY --chown=appuser:appuser . .
 
 # 注意：--rebuild-only 写入 /data/index 需宿主机目录对容器用户可写
-RUN adduser --disabled-password --gecos "" appuser && \
-    chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8501
