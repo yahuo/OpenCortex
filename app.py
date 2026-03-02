@@ -54,6 +54,132 @@ header {visibility: hidden;}
 [data-testid="stSidebar"] {display: none !important;}
 [data-testid="stSidebarNav"] {display: none !important;}
 [data-testid="collapsedControl"] {display: none !important;}
+
+/* ── 空状态居中容器 ── */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 60vh;
+    text-align: center;
+    gap: 2rem;
+}
+.empty-hero-title {
+    background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-size: 2.8rem;
+    font-weight: 700;
+    line-height: 1.2;
+    margin: 0;
+}
+.empty-hero-sub {
+    color: #64748b;
+    font-size: 1rem;
+    margin-top: -1rem;
+}
+
+/* ── 能力卡片 ── */
+.capability-cards {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    width: 100%;
+    max-width: 680px;
+}
+.capability-card {
+    flex: 1;
+    min-width: 180px;
+    max-width: 210px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 1.2rem 1rem;
+    transition: transform 0.18s ease, border-color 0.18s ease;
+    cursor: default;
+}
+.capability-card:hover {
+    transform: translateY(-3px);
+    border-color: rgba(74,222,128,0.35);
+}
+.capability-card .cap-icon { font-size: 1.6rem; margin-bottom: 0.5rem; }
+.capability-card .cap-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 0.3rem;
+}
+.capability-card .cap-desc {
+    font-size: 0.78rem;
+    color: #64748b;
+    line-height: 1.5;
+}
+
+/* ── 输入框 focus 光效 ── */
+[data-testid="stChatInput"] textarea:focus,
+[data-testid="stChatInputContainer"]:focus-within {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(74,222,128,0.4), 0 0 18px rgba(34,211,238,0.15);
+    border-color: rgba(74,222,128,0.5) !important;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+/* ── 模型信息小字 ── */
+.model-hint {
+    text-align: center;
+    font-size: 0.72rem;
+    color: #334155;
+    margin-bottom: 0.4rem;
+    letter-spacing: 0.02em;
+}
+
+/* ── 用户消息气泡右对齐 ── */
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+    flex-direction: row-reverse;
+}
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) > div:last-child {
+    background: rgba(74,222,128,0.08);
+    border: 1px solid rgba(74,222,128,0.15);
+    border-radius: 14px;
+    padding: 0.6rem 1rem;
+    max-width: 80%;
+}
+
+/* ── 引用来源卡片 ── */
+.source-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.5rem;
+}
+.source-card .src-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.3rem;
+}
+.source-badge {
+    background: rgba(74,222,128,0.12);
+    color: #4ade80;
+    border-radius: 5px;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: monospace;
+}
+.source-time {
+    color: #475569;
+    font-size: 0.75rem;
+}
+.source-snippet {
+    color: #94a3b8;
+    font-size: 0.8rem;
+    line-height: 1.55;
+}
 </style>
 """,
         unsafe_allow_html=True,
