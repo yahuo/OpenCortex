@@ -151,6 +151,12 @@ def get_vectorstore(
     )
 
 
+@st.cache_resource
+def _get_mtime_tracker() -> dict:
+    """进程级单例，跨所有会话共享索引 mtime 追踪状态"""
+    return {"last_mtime": 0.0}
+
+
 def read_runtime_config() -> dict[str, str]:
     return {
         "persist_dir": str(
@@ -202,19 +208,26 @@ if missing_env:
 index_file = Path(cfg["persist_dir"]) / "index.faiss"
 if not index_file.exists():
     st.error("未检测到向量索引。")
-    st.code("python3 start.py", language="bash")
+    if Path("/.dockerenv").exists():
+        st.code(
+            "docker compose run --rm app python start.py --rebuild-only",
+            language="bash",
+        )
+    else:
+        st.code("python3 start.py", language="bash")
     st.info("请在终端运行上面的命令：先重建索引，再启动页面。")
     st.stop()
 
-# 热加载：索引文件 mtime 变化时清除全局缓存，本次渲染的 get_vectorstore() 调用将重新加载
+# 热加载：索引文件 mtime 变化时清除全局缓存（进程级哨兵，跨所有会话生效）
 try:
     current_mtime = index_file.stat().st_mtime
 except FileNotFoundError:
     st.error("索引文件已被移除，请重新运行 start.py 重建索引。")
     st.stop()
-if current_mtime != st.session_state.get("_index_mtime", 0.0):
+_mtime_tracker = _get_mtime_tracker()
+if current_mtime != _mtime_tracker["last_mtime"]:
     get_vectorstore.clear()
-    st.session_state["_index_mtime"] = current_mtime
+    _mtime_tracker["last_mtime"] = current_mtime
 
 vectorstore = get_vectorstore(
     embed_api_key=cfg["embed_api_key"],
