@@ -1,0 +1,10 @@
+venv/
+.env
+wechat_export/
+.worktrees/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+data/
+docs/plans/
