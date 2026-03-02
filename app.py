@@ -270,6 +270,8 @@ if st.session_state.rag_messages:
 """,
         unsafe_allow_html=True,
     )
+else:
+    render_empty_state()
 
 missing_env = []
 if not cfg["embed_api_key"]:
@@ -299,9 +301,6 @@ vectorstore = get_vectorstore(
 if vectorstore is None:
     st.error("索引加载失败，请重启应用后重试。")
     st.stop()
-
-if not st.session_state.rag_messages:
-    render_empty_state()
 
 for msg in st.session_state.rag_messages:
     with st.chat_message(msg["role"]):
