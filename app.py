@@ -186,6 +186,38 @@ header {visibility: hidden;}
     )
 
 
+def render_empty_state() -> None:
+    """渲染无消息时的居中欢迎区与能力卡片。"""
+    st.markdown(
+        """
+<div class="empty-state">
+    <div>
+        <div class="empty-hero-title">💬 OpenCortex</div>
+        <div class="empty-hero-sub">连接你的知识库，直接提问</div>
+    </div>
+    <div class="capability-cards">
+        <div class="capability-card">
+            <div class="cap-icon">📝</div>
+            <div class="cap-title">内容摘要</div>
+            <div class="cap-desc">总结某个话题或时间段的内容</div>
+        </div>
+        <div class="capability-card">
+            <div class="cap-icon">🔍</div>
+            <div class="cap-title">精准检索</div>
+            <div class="cap-desc">描述你想找的信息，定位原文</div>
+        </div>
+        <div class="capability-card">
+            <div class="cap-icon">💡</div>
+            <div class="cap-title">深度解读</div>
+            <div class="cap-desc">针对文档内容提问，获取详细分析</div>
+        </div>
+    </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def get_vectorstore(
     embed_api_key: str,
