@@ -23,17 +23,16 @@ def inject_global_css() -> None:
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-/* 共享渐变文字样式 */
+/* 渐变文字样式 */
 .hero-title {
-    background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    display: inline-block;
+    background: linear-gradient(90deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    background-clip: text !important;
+    font-size: 3rem;
     font-weight: 700;
     line-height: 1.2;
-}
-.hero-title {
-    font-size: 3rem;
     margin-bottom: 0.35rem;
 }
 .hero-sub { color: #64748b; font-size: 0.95rem; margin-bottom: 0; }
