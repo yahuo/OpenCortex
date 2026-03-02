@@ -24,8 +24,7 @@ def inject_global_css() -> None:
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
 /* 共享渐变文字样式 */
-.hero-title,
-.empty-hero-title {
+.hero-title {
     background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -60,63 +59,6 @@ header {visibility: hidden;}
 [data-testid="stSidebarNav"] {display: none !important;}
 [data-testid="collapsedControl"] {display: none !important;}
 
-/* ── 空状态居中容器 ── */
-.empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    min-height: 60vh;
-    text-align: center;
-    gap: 2rem;
-}
-.empty-hero-title {
-    font-size: 2.8rem;
-    margin: 0;
-}
-.empty-hero-sub {
-    color: #64748b;
-    font-size: 1rem;
-    margin-top: -1rem;
-}
-
-/* ── 能力卡片 ── */
-.capability-cards {
-    display: flex;
-    gap: 1rem;
-    justify-content: center;
-    flex-wrap: wrap;
-    width: 100%;
-    max-width: 680px;
-}
-.capability-card {
-    flex: 1;
-    min-width: 180px;
-    max-width: 210px;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 14px;
-    padding: 1.2rem 1rem;
-    transition: transform 0.18s ease, border-color 0.18s ease;
-    cursor: default;
-}
-.capability-card:hover {
-    transform: translateY(-3px);
-    border-color: rgba(74,222,128,0.35);
-}
-.capability-card .cap-icon { font-size: 1.6rem; margin-bottom: 0.5rem; }
-.capability-card .cap-title {
-    font-size: 0.88rem;
-    font-weight: 600;
-    color: #e2e8f0;
-    margin-bottom: 0.3rem;
-}
-.capability-card .cap-desc {
-    font-size: 0.78rem;
-    color: #64748b;
-    line-height: 1.5;
-}
-
 /* ── 输入框 focus 光效 ── */
 [data-testid="stChatInputContainer"] {
     transition: box-shadow 0.2s ease, border-color 0.2s ease;
@@ -126,15 +68,6 @@ header {visibility: hidden;}
     outline: none;
     box-shadow: 0 0 0 2px rgba(74,222,128,0.4), 0 0 18px rgba(34,211,238,0.15);
     border-color: rgba(74,222,128,0.5) !important; /* 覆盖 Streamlit 框架注入的 inline border-color */
-}
-
-/* ── 模型信息小字 ── */
-.model-hint {
-    text-align: center;
-    font-size: 0.72rem;
-    color: #64748b;
-    margin-bottom: 0.4rem;
-    letter-spacing: 0.02em;
 }
 
 /* ── 用户消息气泡右对齐 ── */
@@ -186,37 +119,6 @@ header {visibility: hidden;}
         unsafe_allow_html=True,
     )
 
-
-def render_empty_state() -> None:
-    """渲染无消息时的居中欢迎区与能力卡片。"""
-    st.markdown(
-        """
-<div class="empty-state">
-    <div>
-        <div class="empty-hero-title">💬 OpenCortex</div>
-        <div class="empty-hero-sub">连接你的知识库，直接提问</div>
-    </div>
-    <div class="capability-cards">
-        <div class="capability-card">
-            <div class="cap-icon">📝</div>
-            <div class="cap-title">内容摘要</div>
-            <div class="cap-desc">总结某个话题或时间段的内容</div>
-        </div>
-        <div class="capability-card">
-            <div class="cap-icon">🔍</div>
-            <div class="cap-title">精准检索</div>
-            <div class="cap-desc">描述你想找的信息，定位原文</div>
-        </div>
-        <div class="capability-card">
-            <div class="cap-icon">💡</div>
-            <div class="cap-title">深度解读</div>
-            <div class="cap-desc">针对文档内容提问，获取详细分析</div>
-        </div>
-    </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
 
 
 def render_sources(sources: list) -> None:
@@ -277,18 +179,15 @@ init_session_state()
 cfg = read_runtime_config()
 inject_global_css()
 
-if st.session_state.rag_messages:
-    st.markdown(
-        """
+st.markdown(
+    f"""
 <div class="brand-card">
     <div class="hero-title">💬 OpenCortex</div>
-    <div class="hero-sub">本地知识库问答工具</div>
+    <div class="hero-sub">本地知识库问答 · {html.escape(cfg["llm_model"])}</div>
 </div>
 """,
-        unsafe_allow_html=True,
-    )
-else:
-    render_empty_state()
+    unsafe_allow_html=True,
+)
 
 missing_env = []
 if not cfg["embed_api_key"]:
@@ -325,10 +224,6 @@ for msg in st.session_state.rag_messages:
         if msg.get("sources"):
             render_sources(msg["sources"])
 
-st.markdown(
-    f'<div class="model-hint">当前模型：{cfg["llm_model"]}</div>',
-    unsafe_allow_html=True,
-)
 if question := st.chat_input("输入问题..."):
     st.session_state.rag_messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
