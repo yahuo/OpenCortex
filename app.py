@@ -22,14 +22,18 @@ def inject_global_css() -> None:
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-.hero-title {
+/* 共享渐变文字样式 */
+.hero-title,
+.empty-hero-title {
     background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
-    font-size: 3rem;
     font-weight: 700;
     line-height: 1.2;
+}
+.hero-title {
+    font-size: 3rem;
     margin-bottom: 0.35rem;
 }
 .hero-sub { color: #64748b; font-size: 0.95rem; margin-bottom: 0; }
@@ -66,13 +70,7 @@ header {visibility: hidden;}
     gap: 2rem;
 }
 .empty-hero-title {
-    background: linear-gradient(135deg, #4ade80 0%, #22d3ee 50%, #818cf8 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
     font-size: 2.8rem;
-    font-weight: 700;
-    line-height: 1.2;
     margin: 0;
 }
 .empty-hero-sub {
@@ -119,19 +117,21 @@ header {visibility: hidden;}
 }
 
 /* ── 输入框 focus 光效 ── */
+[data-testid="stChatInputContainer"] {
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
 [data-testid="stChatInput"] textarea:focus,
 [data-testid="stChatInputContainer"]:focus-within {
     outline: none;
     box-shadow: 0 0 0 2px rgba(74,222,128,0.4), 0 0 18px rgba(34,211,238,0.15);
-    border-color: rgba(74,222,128,0.5) !important;
-    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+    border-color: rgba(74,222,128,0.5) !important; /* 覆盖 Streamlit 框架注入的 inline border-color */
 }
 
 /* ── 模型信息小字 ── */
 .model-hint {
     text-align: center;
     font-size: 0.72rem;
-    color: #334155;
+    color: #64748b;
     margin-bottom: 0.4rem;
     letter-spacing: 0.02em;
 }
@@ -151,7 +151,7 @@ header {visibility: hidden;}
 /* ── 引用来源卡片 ── */
 .source-card {
     background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: 10px;
     padding: 0.75rem 1rem;
     margin-bottom: 0.5rem;
