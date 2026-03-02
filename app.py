@@ -308,9 +308,21 @@ for msg in st.session_state.rag_messages:
         if msg.get("sources"):
             with st.expander("查看引用"):
                 for src in msg["sources"]:
-                    st.markdown(f"- `{src['source']}` {src['time_range']}")
-                    st.caption(src["snippet"])
+                    st.markdown(
+                        f"""<div class="source-card">
+    <div class="src-meta">
+        <span class="source-badge">{src['source']}</span>
+        <span class="source-time">{src['time_range']}</span>
+    </div>
+    <div class="source-snippet">{src['snippet']}</div>
+</div>""",
+                        unsafe_allow_html=True,
+                    )
 
+st.markdown(
+    f'<div class="model-hint">当前模型：{cfg["llm_model"]}</div>',
+    unsafe_allow_html=True,
+)
 if question := st.chat_input("输入问题..."):
     st.session_state.rag_messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
@@ -349,8 +361,16 @@ if question := st.chat_input("输入问题..."):
         if sources:
             with st.expander("查看引用"):
                 for src in sources:
-                    st.markdown(f"- `{src['source']}` {src['time_range']}")
-                    st.caption(src["snippet"])
+                    st.markdown(
+                        f"""<div class="source-card">
+    <div class="src-meta">
+        <span class="source-badge">{src['source']}</span>
+        <span class="source-time">{src['time_range']}</span>
+    </div>
+    <div class="source-snippet">{src['snippet']}</div>
+</div>""",
+                        unsafe_allow_html=True,
+                    )
 
     st.session_state.rag_messages.append(
         {"role": "assistant", "content": answer, "sources": sources}
