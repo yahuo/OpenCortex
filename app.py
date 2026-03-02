@@ -206,11 +206,15 @@ if not index_file.exists():
     st.info("请在终端运行上面的命令：先重建索引，再启动页面。")
     st.stop()
 
-# 热加载：索引文件 mtime 变化时清除缓存，下次调用自动重新加载
-_current_mtime = index_file.stat().st_mtime
-if _current_mtime != st.session_state.get("_index_mtime", 0.0):
+# 热加载：索引文件 mtime 变化时清除全局缓存，本次渲染的 get_vectorstore() 调用将重新加载
+try:
+    current_mtime = index_file.stat().st_mtime
+except FileNotFoundError:
+    st.error("索引文件已被移除，请重新运行 start.py 重建索引。")
+    st.stop()
+if current_mtime != st.session_state.get("_index_mtime", 0.0):
     get_vectorstore.clear()
-    st.session_state["_index_mtime"] = _current_mtime
+    st.session_state["_index_mtime"] = current_mtime
 
 vectorstore = get_vectorstore(
     embed_api_key=cfg["embed_api_key"],
