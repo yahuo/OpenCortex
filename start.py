@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import argparse
 
 from dotenv import load_dotenv
 
@@ -89,6 +90,14 @@ def launch_streamlit(cfg: dict[str, str]) -> int:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="OpenCortex 启动器")
+    parser.add_argument(
+        "--rebuild-only",
+        action="store_true",
+        help="仅重建向量索引，不启动 Streamlit",
+    )
+    args = parser.parse_args()
+
     load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
     cfg = read_runtime_config()
 
@@ -98,6 +107,10 @@ def main() -> int:
     except Exception as exc:
         print(f"[OpenCortex] 启动失败: {exc}", flush=True)
         return 1
+
+    if args.rebuild_only:
+        print("[OpenCortex] 索引重建完成，退出（--rebuild-only 模式）。", flush=True)
+        return 0
 
     return launch_streamlit(cfg)
 
