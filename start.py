@@ -2,11 +2,11 @@
 """OpenCortex 启动器：先重建索引，再启动 Streamlit。"""
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
 from pathlib import Path
-import argparse
 
 from dotenv import load_dotenv
 
