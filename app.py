@@ -260,15 +260,16 @@ init_session_state()
 cfg = read_runtime_config()
 inject_global_css()
 
-st.markdown(
-    """
+if st.session_state.rag_messages:
+    st.markdown(
+        """
 <div class="brand-card">
     <div class="hero-title">💬 OpenCortex</div>
     <div class="hero-sub">本地知识库问答工具</div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
 missing_env = []
 if not cfg["embed_api_key"]:
@@ -298,6 +299,9 @@ vectorstore = get_vectorstore(
 if vectorstore is None:
     st.error("索引加载失败，请重启应用后重试。")
     st.stop()
+
+if not st.session_state.rag_messages:
+    render_empty_state()
 
 for msg in st.session_state.rag_messages:
     with st.chat_message(msg["role"]):
