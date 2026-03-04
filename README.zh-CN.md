@@ -14,7 +14,7 @@
 ## 功能亮点
 
 - **零配置单页界面** — Streamlit，无需配置页
-- **递归索引** — 支持 `.md`、`.txt`、`.json`、`.yaml`、`.csv`、`.rst`、`.log` 等
+- **递归索引** — 支持 `.md`、`.txt`、`.json`、`.yaml`、`.csv`、`.rst`、`.log`、`.docx`、`.xlsx`、`.pdf` 等
 - **微信导出支持** — 原生解析微信导出的 Markdown，按时间窗口分片
 - **LLM 和 Embedding 可插拔** — 任意 OpenAI 兼容接口：硅基流动、Gemini、DeepSeek、Kimi、GLM 等
 - **本地 FAISS 向量库** — 无云端依赖，数据不离本机
@@ -139,6 +139,7 @@ docker compose up -d      # 重新启动
 | `.md`、`.markdown`、`.mdx` | 微信导出格式 → 时间窗口分片；其他 Markdown → 固定大小分片 |
 | `.txt`、`.rst`、`.log` | 固定大小分片（含重叠） |
 | `.csv`、`.json`、`.yaml`、`.yml` | 固定大小分片（含重叠） |
+| `.docx`、`.xlsx`、`.pdf` | markitdown 转 Markdown → 固定大小分片（含重叠） |
 
 ---
 

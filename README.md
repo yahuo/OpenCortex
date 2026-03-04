@@ -14,7 +14,7 @@
 ## Features
 
 - **Zero-config single-page UI** — Streamlit, no settings page needed
-- **Recursive indexing** — supports `.md`, `.txt`, `.json`, `.yaml`, `.csv`, `.rst`, `.log`, and more
+- **Recursive indexing** — supports `.md`, `.txt`, `.json`, `.yaml`, `.csv`, `.rst`, `.log`, `.docx`, `.xlsx`, `.pdf`, and more
 - **WeChat export support** — natively parses WeChat-exported Markdown with time-window chunking
 - **Pluggable LLM & embeddings** — any OpenAI-compatible API: SiliconFlow, Gemini, DeepSeek, Kimi, GLM, etc.
 - **Local FAISS vector store** — no cloud dependency, data stays on your machine
@@ -139,6 +139,7 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `.md`, `.markdown`, `.mdx` | WeChat format → time-window chunks; otherwise fixed-size |
 | `.txt`, `.rst`, `.log` | Fixed-size with overlap |
 | `.csv`, `.json`, `.yaml`, `.yml` | Fixed-size with overlap |
+| `.docx`, `.xlsx`, `.pdf` | markitdown → Markdown → fixed-size with overlap |
 
 ---
 
