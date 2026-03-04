@@ -41,6 +41,9 @@ SUPPORTED_TEXT_SUFFIXES = {
     ".json",
     ".yaml",
     ".yml",
+    ".docx",
+    ".xlsx",
+    ".pdf",
 }
 GENERIC_CHUNK_SIZE = 1200
 GENERIC_CHUNK_OVERLAP = 180
@@ -203,6 +206,29 @@ def _split_generic_text(
     return chunks
 
 
+# 条件导入 markitdown
+try:
+    from markitdown import MarkItDown
+    _MARKITDOWN_AVAILABLE = True
+except ImportError:
+    _MARKITDOWN_AVAILABLE = False
+
+# 需要通过 markitdown 转换的二进制格式
+_BINARY_SUFFIXES = {".docx", ".xlsx", ".pdf"}
+
+
+def _convert_binary_to_markdown(file_path: Path) -> str:
+    """使用 markitdown 将二进制文档转为 Markdown 文本"""
+    if not _MARKITDOWN_AVAILABLE:
+        raise ImportError(
+            f"处理 {file_path.suffix} 文件需要 markitdown 库，"
+            "请运行: pip install 'markitdown[pdf,docx,xlsx]'"
+        )
+    md = MarkItDown()
+    result = md.convert(str(file_path))
+    return result.text_content
+
+
 def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
     """将 source_dir 下通用文本文件转换为 LangChain Document 列表"""
     root = Path(source_dir)
@@ -212,7 +238,11 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
     for file_path in files:
         rel_path = str(file_path.relative_to(root))
         try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            suffix = file_path.suffix.lower()
+            if suffix in _BINARY_SUFFIXES:
+                text = _convert_binary_to_markdown(file_path)
+            else:
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             # 单文件异常不应中断整体索引流程
             continue
@@ -249,19 +279,23 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
                         if timestamps
                         else ""
                     )
+                    time_range = f"{start_t} ~ {end_t}" if start_t else ""
 
-                    documents.append(
-                        Document(
-                            page_content=page_content,
-                            metadata={
-                                "source": rel_path,
-                                "chunk_index": idx,
-                                "start_time": start_t,
-                                "end_time": end_t,
-                                "time_range": f"{start_t} ~ {end_t}" if start_t else "",
-                            },
+                    # 超长时间窗口二次切分，防止超出 Embedding token 限制
+                    sub_chunks = _split_generic_text(page_content) if len(page_content) > GENERIC_CHUNK_SIZE else [page_content]
+                    for sub_idx, sub_text in enumerate(sub_chunks):
+                        documents.append(
+                            Document(
+                                page_content=sub_text,
+                                metadata={
+                                    "source": rel_path,
+                                    "chunk_index": idx if len(sub_chunks) == 1 else idx * 100 + sub_idx,
+                                    "start_time": start_t,
+                                    "end_time": end_t,
+                                    "time_range": time_range,
+                                },
+                            )
                         )
-                    )
                 continue
 
         for idx, chunk_text in enumerate(_split_generic_text(text)):
