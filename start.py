@@ -6,6 +6,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ def read_runtime_config() -> dict[str, str]:
         "embed_model": os.getenv("EMBED_MODEL", "BAAI/bge-m3").strip(),
         "host": host,
         "port": port,
+        "api_port": os.getenv("API_PORT", "8502").strip() or "8502",
     }
 
 
@@ -44,6 +46,11 @@ def validate_runtime(cfg: dict[str, str]) -> None:
     port = int(cfg["port"])
     if not (1 <= port <= 65535):
         raise ValueError(f"APP_PORT 超出范围: {cfg['port']}")
+    if not cfg["api_port"].isdigit():
+        raise ValueError(f"API_PORT 非法: {cfg['api_port']}")
+    api_port = int(cfg["api_port"])
+    if not (1 <= api_port <= 65535):
+        raise ValueError(f"API_PORT 超出范围: {cfg['api_port']}")
 
 
 def rebuild_index(cfg: dict[str, str]) -> None:
@@ -63,10 +70,10 @@ def rebuild_index(cfg: dict[str, str]) -> None:
     )
 
 
-def launch_streamlit(cfg: dict[str, str]) -> int:
+def launch_streamlit(cfg: dict[str, str]) -> subprocess.Popen:
+    """启动 Streamlit Web 服务（后台子进程）"""
     url = f"http://{cfg['host']}:{cfg['port']}"
-    print(f"[OpenCortex] 索引重建完成。请访问: {url}", flush=True)
-    print("[OpenCortex] 正在启动 Web 服务（不会自动打开浏览器）...", flush=True)
+    print(f"[OpenCortex] Web 服务启动中: {url}", flush=True)
 
     app_path = PROJECT_ROOT / "app.py"
     cmd = [
@@ -84,9 +91,26 @@ def launch_streamlit(cfg: dict[str, str]) -> int:
     ]
     env = os.environ.copy()
     env["BROWSER"] = "none"
+    return subprocess.Popen(cmd, env=env, cwd=str(PROJECT_ROOT))
 
-    proc = subprocess.run(cmd, env=env, cwd=str(PROJECT_ROOT))
-    return proc.returncode
+
+def launch_api(cfg: dict[str, str]) -> subprocess.Popen:
+    """启动 FastAPI API 服务（后台子进程）"""
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "api:app",
+        "--host",
+        cfg["host"],
+        "--port",
+        cfg["api_port"],
+    ]
+    print(
+        f"[OpenCortex] API  服务启动中: http://{cfg['host']}:{cfg['api_port']}",
+        flush=True,
+    )
+    return subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
 
 
 def main() -> int:
@@ -112,7 +136,21 @@ def main() -> int:
         print("[OpenCortex] 索引重建完成，退出（--rebuild-only 模式）。", flush=True)
         return 0
 
-    return launch_streamlit(cfg)
+    print("[OpenCortex] 索引重建完成，正在启动服务（不会自动打开浏览器）...", flush=True)
+    procs = [launch_streamlit(cfg), launch_api(cfg)]
+    try:
+        while True:
+            for p in procs:
+                ret = p.poll()
+                if ret is not None:
+                    for other in procs:
+                        other.terminate()
+                    return ret
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        for p in procs:
+            p.terminate()
+        return 0
 
 
 if __name__ == "__main__":
