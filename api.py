@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from ragbot import ask_stream as rag_ask_stream
-from ragbot import load_vectorstore
+from ragbot import list_kbs, load_vectorstore
 
 load_dotenv()
 
@@ -61,6 +61,7 @@ app = FastAPI(title="OpenCortex API", lifespan=lifespan)
 class AskRequest(BaseModel):
     question: str
     stream: bool = False
+    kb: str | None = None
 
 
 def _stream_response(result: dict):
@@ -81,6 +82,11 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/kbs")
+def kbs():
+    return {"kbs": list_kbs(persist_dir=_cfg["persist_dir"])}
+
+
 @app.post("/api/ask")
 def ask(req: AskRequest):
     if not req.question.strip():
@@ -92,6 +98,7 @@ def ask(req: AskRequest):
         llm_api_key=_cfg["llm_api_key"],
         llm_model=_cfg["llm_model"],
         llm_base_url=_cfg["llm_base_url"],
+        kb=req.kb,
     )
 
     if not req.stream:

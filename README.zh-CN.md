@@ -18,6 +18,8 @@
 - **微信导出支持** — 原生解析微信导出的 Markdown，按时间窗口分片
 - **LLM 和 Embedding 可插拔** — 任意 OpenAI 兼容接口：硅基流动、Gemini、DeepSeek、Kimi、GLM 等
 - **本地 FAISS 向量库** — 无云端依赖，数据不离本机
+- **多知识库** — `docs/` 下的子目录自动成为独立知识库，API 可指定知识库检索或全量检索
+- **HTTP API** — FastAPI 端点（`/api/ask`、`/api/kbs`、`/api/health`），支持 SSE 流式输出
 - **索引热加载** — 更新文档后重建索引，无需重启服务，刷新页面即生效
 - **Docker 部署** — 将同一知识库以局域网服务形式共享给多人
 
@@ -30,12 +32,14 @@
       │
       ▼ ragbot.py — 解析、分片、向量化 → FAISS 索引（本地持久化）
       │
-      ▼ app.py — Streamlit 界面，加载 FAISS，处理对话
+      ├─▶ app.py — Streamlit 界面（端口 8501），全量检索
+      │
+      └─▶ api.py — FastAPI HTTP API（端口 8502），支持分知识库检索
       │
       ▼ 任意 OpenAI 兼容 LLM（流式输出）
 ```
 
-`start.py` 负责协调：重建索引 → 启动 Web 服务。
+`start.py` 负责协调：重建索引 → 启动 Streamlit + API 服务。
 
 ---
 
@@ -118,7 +122,8 @@ docker compose up -d      # 重新启动
 | `LLM_MODEL` | | `gemini-2.0-flash` | LLM 模型名称 |
 | `CHROMA_PERSIST_DIR` | | `~/wechat_rag_db` | FAISS 索引持久化目录 |
 | `APP_HOST` | | `127.0.0.1` | 服务绑定地址 |
-| `APP_PORT` | | `8501` | 服务端口 |
+| `APP_PORT` | | `8501` | Streamlit 服务端口 |
+| `API_PORT` | | `8502` | FastAPI 服务端口 |
 
 **兼容的 LLM 服务商**（设置对应的 `LLM_BASE_URL`）：
 
@@ -147,46 +152,68 @@ docker compose up -d      # 重新启动
 
 除 Streamlit 界面外，OpenCortex 还通过 `api.py`（基于 FastAPI）提供 HTTP API，支持程序化调用。
 
-**启动 API 服务**（需先用 `start.py` 构建索引）：
+`start.py` 会在 `8502` 端口同时启动 FastAPI 服务。也可单独运行：
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+uvicorn api:app --host 127.0.0.1 --port 8502
 ```
 
-**接口列表：**
-
-| 方法 | 路径 | 说明 |
+| 端点 | 方法 | 说明 |
 |---|---|---|
-| `GET` | `/api/health` | 健康检查 |
-| `POST` | `/api/ask` | 提问 |
+| `/api/health` | GET | 健康检查 |
+| `/api/kbs` | GET | 列出可用知识库 |
+| `/api/ask` | POST | 提问（支持流式输出） |
 
-**`POST /api/ask` 请求体：**
+### 多知识库
 
-```json
-{
-  "question": "你的问题",
-  "stream": false
-}
+`LOCAL_DOCS_DIR` 下的子目录自动成为独立知识库：
+
+```
+docs/
+├── 产品/     → 知识库 "产品"
+├── 设计/     → 知识库 "设计"
+└── readme.md → （无归属，仅全量检索）
 ```
 
-- `stream: false` — 返回 `{"answer": "...", "sources": [...]}` JSON
-- `stream: true` — 返回 SSE 流，包含 `chunk`、`sources`、`done` 事件
-
-**示例（非流式）：**
+**列出知识库：**
 
 ```bash
-curl -X POST http://localhost:8000/api/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "这个项目是做什么的？", "stream": false}'
+curl http://127.0.0.1:8502/api/kbs
+# {"kbs": ["产品", "设计"]}
 ```
 
+**指定知识库检索：**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "产品路线图是什么？", "kb": "产品"}'
+```
+
+**全量检索（不传 `kb`）：**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "产品路线图是什么？"}'
+```
+
+**SSE 流式输出：**
+
+```bash
+curl -N -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "产品路线图是什么？", "stream": true}'
+```
+
+> 新增或调整子目录后，需要运行 `python start.py --rebuild-only` 重建索引。
 ---
 
 ## 目录结构
 
 ```
 OpenCortex/
-├── start.py          # 启动器：重建索引 → 启动 Web 服务
+├── start.py          # 启动器：重建索引 → 启动 Streamlit + API
 ├── app.py            # Streamlit 单页界面
 ├── api.py            # FastAPI HTTP API（流式 + 非流式）
 ├── ragbot.py         # 核心：分片、向量化、FAISS、RAG 问答

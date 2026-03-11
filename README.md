@@ -18,6 +18,8 @@
 - **WeChat export support** — natively parses WeChat-exported Markdown with time-window chunking
 - **Pluggable LLM & embeddings** — any OpenAI-compatible API: SiliconFlow, Gemini, DeepSeek, Kimi, GLM, etc.
 - **Local FAISS vector store** — no cloud dependency, data stays on your machine
+- **Multi-knowledge-base** — subdirectories under `docs/` become named knowledge bases; API can target a specific KB or search globally
+- **HTTP API** — FastAPI endpoints (`/api/ask`, `/api/kbs`, `/api/health`) with SSE streaming support
 - **Hot-reload** — update your docs and trigger re-indexing without restarting the server
 - **Docker deployment** — serve the same knowledge base to multiple users on a LAN
 
@@ -30,12 +32,14 @@ Local docs directory
       │
       ▼ ragbot.py — parse, chunk, embed → FAISS index (persisted locally)
       │
-      ▼ app.py — Streamlit UI, loads FAISS, handles chat
+      ├─▶ app.py — Streamlit UI (port 8501), global search
+      │
+      └─▶ api.py — FastAPI HTTP API (port 8502), supports per-KB search
       │
       ▼ Any OpenAI-compatible LLM (streaming)
 ```
 
-`start.py` orchestrates the flow: rebuild index → launch web server.
+`start.py` orchestrates the flow: rebuild index → launch Streamlit + API server.
 
 ---
 
@@ -118,7 +122,8 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `LLM_MODEL` | | `gemini-2.0-flash` | LLM model name |
 | `CHROMA_PERSIST_DIR` | | `~/wechat_rag_db` | Directory to persist the FAISS index |
 | `APP_HOST` | | `127.0.0.1` | Server bind address |
-| `APP_PORT` | | `8501` | Server port |
+| `APP_PORT` | | `8501` | Streamlit server port |
+| `API_PORT` | | `8502` | FastAPI server port |
 
 **Compatible LLM providers** (set `LLM_BASE_URL` accordingly):
 
@@ -147,46 +152,68 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 In addition to the Streamlit UI, OpenCortex exposes a FastAPI-based HTTP API (`api.py`) for programmatic access.
 
-**Start the API server** (after building the index with `start.py`):
+`start.py` launches the FastAPI server on port `8502` alongside Streamlit. You can also run it standalone:
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+uvicorn api:app --host 127.0.0.1 --port 8502
 ```
 
-**Endpoints:**
-
-| Method | Path | Description |
+| Endpoint | Method | Description |
 |---|---|---|
-| `GET` | `/api/health` | Health check |
-| `POST` | `/api/ask` | Ask a question |
+| `/api/health` | GET | Health check |
+| `/api/kbs` | GET | List available knowledge bases |
+| `/api/ask` | POST | Ask a question (supports streaming) |
 
-**`POST /api/ask` request body:**
+### Multi-knowledge-base
 
-```json
-{
-  "question": "your question here",
-  "stream": false
-}
+Subdirectories under your `LOCAL_DOCS_DIR` automatically become named knowledge bases:
+
+```
+docs/
+├── products/   → KB "products"
+├── design/     → KB "design"
+└── readme.md   → (no KB, global only)
 ```
 
-- `stream: false` — returns `{"answer": "...", "sources": [...]}` as JSON
-- `stream: true` — returns a Server-Sent Events stream with `chunk`, `sources`, and `done` events
-
-**Example (non-streaming):**
+**List knowledge bases:**
 
 ```bash
-curl -X POST http://localhost:8000/api/ask \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is this project about?", "stream": false}'
+curl http://127.0.0.1:8502/api/kbs
+# {"kbs": ["design", "products"]}
 ```
 
+**Ask within a specific KB:**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the product roadmap?", "kb": "products"}'
+```
+
+**Global search (omit `kb`):**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the product roadmap?"}'
+```
+
+**SSE streaming:**
+
+```bash
+curl -N -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the product roadmap?", "stream": true}'
+```
+
+> After adding/reorganizing subdirectories, run `python start.py --rebuild-only` to update the index.
 ---
 
 ## File Structure
 
 ```
 OpenCortex/
-├── start.py          # Launcher: rebuild index → start web server
+├── start.py          # Launcher: rebuild index → start Streamlit + API
 ├── app.py            # Streamlit single-page UI
 ├── api.py            # FastAPI HTTP API (streaming + non-streaming)
 ├── ragbot.py         # Core: chunking, embedding, FAISS, RAG Q&A

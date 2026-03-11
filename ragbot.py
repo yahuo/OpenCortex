@@ -229,6 +229,19 @@ def _convert_binary_to_markdown(file_path: Path) -> str:
     return result.text_content
 
 
+def _extract_kb(rel_path: str) -> str:
+    """Extract first-level subdirectory name as KB identifier.
+
+    'products/spec.md' → 'products'
+    'design/v2/ui.md' → 'design'
+    'readme.md' → ''
+    """
+    parts = Path(rel_path).parts
+    if len(parts) > 1:
+        return parts[0]
+    return ""
+
+
 def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
     """将 source_dir 下通用文本文件转换为 LangChain Document 列表"""
     root = Path(source_dir)
@@ -237,6 +250,7 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
 
     for file_path in files:
         rel_path = str(file_path.relative_to(root))
+        kb = _extract_kb(rel_path)
         try:
             suffix = file_path.suffix.lower()
             if suffix in _BINARY_SUFFIXES:
@@ -289,6 +303,7 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
                                 page_content=sub_text,
                                 metadata={
                                     "source": rel_path,
+                                    "kb": kb,
                                     "chunk_index": idx if len(sub_chunks) == 1 else idx * 100 + sub_idx,
                                     "start_time": start_t,
                                     "end_time": end_t,
@@ -304,6 +319,7 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[Path]]:
                     page_content=chunk_text,
                     metadata={
                         "source": rel_path,
+                        "kb": kb,
                         "chunk_index": idx,
                         "time_range": f"chunk {idx + 1}",
                     },
@@ -418,6 +434,21 @@ def load_vectorstore(
     )
 
 
+def list_kbs(persist_dir: str = DEFAULT_FAISS_DIR) -> list[str]:
+    """Read index manifest and return sorted list of non-empty KB names."""
+    manifest_path = Path(persist_dir) / "index_manifest.json"
+    if not manifest_path.exists():
+        return []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    kbs: set[str] = set()
+    for file_entry in manifest.get("files", []):
+        name = file_entry.get("name", "")
+        kb = _extract_kb(name)
+        if kb:
+            kbs.add(kb)
+    return sorted(kbs)
+
+
 # ─────────────────────────────────────────────────────────
 # RAG 问答
 # ─────────────────────────────────────────────────────────
@@ -492,6 +523,7 @@ def ask_stream(
     llm_model: str,
     llm_base_url: str,
     top_k: int = DEFAULT_TOP_K,
+    kb: str | None = None,
 ) -> dict:
     """
     检索 + 流式生成，返回：
@@ -501,7 +533,8 @@ def ask_stream(
       }
     """
     # 1. 检索
-    results = vectorstore.similarity_search(question, k=top_k)
+    filter_dict = {"kb": kb} if kb is not None else None
+    results = vectorstore.similarity_search(question, k=top_k, filter=filter_dict)
 
     # 2. 构造上下文 + 引用列表
     context, sources = _build_context_and_sources(results)
