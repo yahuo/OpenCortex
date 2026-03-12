@@ -92,6 +92,14 @@ def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question 不能为空")
 
+    if req.kb is not None:
+        available = list_kbs(persist_dir=_cfg["persist_dir"])
+        if req.kb not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"知识库 '{req.kb}' 不存在，可用知识库: {available}",
+            )
+
     result = rag_ask_stream(
         question=req.question,
         vectorstore=_vectorstore,

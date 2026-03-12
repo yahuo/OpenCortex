@@ -388,6 +388,7 @@ def build_vectorstore(
         "build_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "embed_model": embed_model,
         "total_chunks": total,
+        "kb_enabled": True,
         "files": [],
     }
     root = Path(md_dir)
@@ -435,11 +436,17 @@ def load_vectorstore(
 
 
 def list_kbs(persist_dir: str = DEFAULT_FAISS_DIR) -> list[str]:
-    """Read index manifest and return sorted list of non-empty KB names."""
+    """Read index manifest and return sorted list of non-empty KB names.
+
+    Returns empty list if the index was built before multi-KB support
+    (missing kb_enabled flag), to prevent stale-index false positives.
+    """
     manifest_path = Path(persist_dir) / "index_manifest.json"
     if not manifest_path.exists():
         return []
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not manifest.get("kb_enabled"):
+        return []
     kbs: set[str] = set()
     for file_entry in manifest.get("files", []):
         name = file_entry.get("name", "")
@@ -533,8 +540,12 @@ def ask_stream(
       }
     """
     # 1. 检索
+    # 按 kb 过滤时 fetch_k 设为全量，保证小占比知识库不会漏召回。
+    # 代价是每次按库查询都遍历整个索引，基于"本地小规模文档库"假设可接受。
+    # 若索引规模增长到 10 万+ chunk 导致延迟明显，应改为按 KB 拆分独立索引。
     filter_dict = {"kb": kb} if kb is not None else None
-    results = vectorstore.similarity_search(question, k=top_k, filter=filter_dict)
+    fetch_k = vectorstore.index.ntotal if filter_dict else top_k * 4
+    results = vectorstore.similarity_search(question, k=top_k, filter=filter_dict, fetch_k=fetch_k)
 
     # 2. 构造上下文 + 引用列表
     context, sources = _build_context_and_sources(results)
