@@ -47,7 +47,7 @@
 
 ```bash
 git clone https://github.com/yahuo/OpenCortex.git
-cd WechatLLM
+cd OpenCortex
 
 python3.12 -m venv venv
 source venv/bin/activate       # Windows: venv\Scripts\activate
@@ -143,12 +143,52 @@ docker compose up -d      # 重新启动
 
 ---
 
+## HTTP API
+
+除 Streamlit 界面外，OpenCortex 还通过 `api.py`（基于 FastAPI）提供 HTTP API，支持程序化调用。
+
+**启动 API 服务**（需先用 `start.py` 构建索引）：
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+**接口列表：**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/health` | 健康检查 |
+| `POST` | `/api/ask` | 提问 |
+
+**`POST /api/ask` 请求体：**
+
+```json
+{
+  "question": "你的问题",
+  "stream": false
+}
+```
+
+- `stream: false` — 返回 `{"answer": "...", "sources": [...]}` JSON
+- `stream: true` — 返回 SSE 流，包含 `chunk`、`sources`、`done` 事件
+
+**示例（非流式）：**
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "这个项目是做什么的？", "stream": false}'
+```
+
+---
+
 ## 目录结构
 
 ```
 OpenCortex/
 ├── start.py          # 启动器：重建索引 → 启动 Web 服务
 ├── app.py            # Streamlit 单页界面
+├── api.py            # FastAPI HTTP API（流式 + 非流式）
 ├── ragbot.py         # 核心：分片、向量化、FAISS、RAG 问答
 ├── Dockerfile        # 容器镜像定义
 ├── docker-compose.yml# 多用户部署编排

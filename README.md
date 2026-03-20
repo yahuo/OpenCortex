@@ -47,7 +47,7 @@ Requires Python 3.12.
 
 ```bash
 git clone https://github.com/yahuo/OpenCortex.git
-cd WechatLLM
+cd OpenCortex
 
 python3.12 -m venv venv
 source venv/bin/activate       # Windows: venv\Scripts\activate
@@ -143,12 +143,52 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 ---
 
+## HTTP API
+
+In addition to the Streamlit UI, OpenCortex exposes a FastAPI-based HTTP API (`api.py`) for programmatic access.
+
+**Start the API server** (after building the index with `start.py`):
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/health` | Health check |
+| `POST` | `/api/ask` | Ask a question |
+
+**`POST /api/ask` request body:**
+
+```json
+{
+  "question": "your question here",
+  "stream": false
+}
+```
+
+- `stream: false` — returns `{"answer": "...", "sources": [...]}` as JSON
+- `stream: true` — returns a Server-Sent Events stream with `chunk`, `sources`, and `done` events
+
+**Example (non-streaming):**
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is this project about?", "stream": false}'
+```
+
+---
+
 ## File Structure
 
 ```
 OpenCortex/
 ├── start.py          # Launcher: rebuild index → start web server
 ├── app.py            # Streamlit single-page UI
+├── api.py            # FastAPI HTTP API (streaming + non-streaming)
 ├── ragbot.py         # Core: chunking, embedding, FAISS, RAG Q&A
 ├── Dockerfile        # Container image
 ├── docker-compose.yml# Multi-user deployment
