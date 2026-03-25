@@ -13,7 +13,9 @@ ragbot.py — 通用本地文档 RAG 问答核心模块
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -47,6 +49,12 @@ SUPPORTED_TEXT_SUFFIXES = {
 }
 GENERIC_CHUNK_SIZE = 1200
 GENERIC_CHUNK_OVERLAP = 180
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """粗略识别第三方 embedding 服务的限流错误。"""
+    message = str(exc).lower()
+    return "429" in message or "rate limit" in message or "tpm limit" in message
 
 
 # ─────────────────────────────────────────────────────────
@@ -365,18 +373,38 @@ def build_vectorstore(
         api_key=embed_api_key, base_url=embed_base_url, model=embed_model
     )
 
-    # 分批向量化，避免超出 API 限制
-    BATCH_SIZE = 50
+    # 分批向量化，避免超出 API 限制；必要时按退避策略重试。
+    batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", "10")))
+    batch_sleep_seconds = max(0.0, float(os.getenv("EMBED_BATCH_SLEEP_SECONDS", "0.5")))
+    max_retries = max(0, int(os.getenv("EMBED_MAX_RETRIES", "8")))
+    retry_base_seconds = max(
+        0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5"))
+    )
     vectorstore: FAISS | None = None
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = documents[i: i + BATCH_SIZE]
-        if vectorstore is None:
-            vectorstore = FAISS.from_documents(batch, embeddings)
-        else:
-            vectorstore.add_documents(batch)
-        done = min(i + BATCH_SIZE, total)
+    for i in range(0, total, batch_size):
+        batch = documents[i: i + batch_size]
+        for attempt in range(max_retries + 1):
+            try:
+                if vectorstore is None:
+                    vectorstore = FAISS.from_documents(batch, embeddings)
+                else:
+                    vectorstore.add_documents(batch)
+                break
+            except Exception as exc:
+                if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                    raise
+                delay = retry_base_seconds * (2 ** attempt)
+                _cb(
+                    i,
+                    total_steps,
+                    f"触发 embedding 限流，{delay:.1f}s 后重试第 {attempt + 1}/{max_retries} 次...",
+                )
+                time.sleep(delay)
+        done = min(i + batch_size, total)
         _cb(done, total_steps, f"向量化中 {done}/{total}...")
+        if batch_sleep_seconds > 0 and done < total:
+            time.sleep(batch_sleep_seconds)
 
     persist_path = Path(persist_dir)
     persist_path.mkdir(parents=True, exist_ok=True)
