@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from ragbot import ask_stream as rag_ask_stream
+from ragbot import SEARCH_MODES, ask_stream as rag_ask_stream
 from ragbot import list_kbs, load_search_bundle
 
 load_dotenv()
@@ -101,7 +101,7 @@ def ask(req: AskRequest):
         raise HTTPException(status_code=400, detail="question 不能为空")
 
     search_mode = (req.search_mode or _cfg["search_mode"]).strip().lower()
-    if search_mode not in {"vector", "hybrid", "agentic"}:
+    if search_mode not in SEARCH_MODES:
         raise HTTPException(
             status_code=400,
             detail="search_mode 必须是 vector、hybrid 或 agentic",

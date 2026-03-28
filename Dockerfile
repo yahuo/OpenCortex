@@ -8,6 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
     APP_PORT=8501 \
     API_PORT=8502
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN adduser --disabled-password --gecos "" appuser
 
 COPY --chown=appuser:appuser requirements.txt .

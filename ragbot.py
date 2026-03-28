@@ -12,7 +12,6 @@ from __future__ import annotations
 import ast
 import configparser
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -99,6 +98,26 @@ MARKDOWN_SUFFIXES = {".md", ".markdown", ".mdx"}
 STRUCTURED_SUFFIXES = {".json", ".yaml", ".yml", ".toml", ".ini"}
 PYTHON_SUFFIXES = {".py"}
 _BINARY_SUFFIXES = {".docx", ".xlsx", ".pdf"}
+_EXTENSION_ALIASES = {
+    "python": "*.py",
+    "py": "*.py",
+    "yaml": "*.yaml",
+    "yml": "*.yml",
+    "json": "*.json",
+    "toml": "*.toml",
+    "ini": "*.ini",
+    "md": "*.md",
+    "markdown": "*.md",
+    "tsx": "*.tsx",
+    "ts": "*.ts",
+    "jsx": "*.jsx",
+    "js": "*.js",
+    "java": "*.java",
+    "go": "*.go",
+    "rs": "*.rs",
+    "shell": "*.sh",
+    "sh": "*.sh",
+}
 DEFAULT_IGNORED_DIRS = {
     ".git",
     "node_modules",
@@ -992,6 +1011,7 @@ def build_vectorstore(
         source_dir=md_dir,
         total_chunks=total,
     )
+    _read_cached_text.cache_clear()
     _cb(total + 2, total_steps, "正在加载检索 bundle...")
 
     bundle = load_search_bundle(
@@ -1182,28 +1202,8 @@ def _extract_query_plan(question: str) -> QueryPlan:
         symbols.append(match)
         keywords.append(f"{match}(")
 
-    extension_aliases = {
-        "python": "*.py",
-        "py": "*.py",
-        "yaml": "*.yaml",
-        "yml": "*.yml",
-        "json": "*.json",
-        "toml": "*.toml",
-        "ini": "*.ini",
-        "md": "*.md",
-        "markdown": "*.md",
-        "tsx": "*.tsx",
-        "ts": "*.ts",
-        "jsx": "*.jsx",
-        "js": "*.js",
-        "java": "*.java",
-        "go": "*.go",
-        "rs": "*.rs",
-        "shell": "*.sh",
-        "sh": "*.sh",
-    }
     lowered_question = question.lower()
-    for alias, pattern in extension_aliases.items():
+    for alias, pattern in _EXTENSION_ALIASES.items():
         if re.search(rf"(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])", lowered_question):
             path_globs.append(pattern)
 
@@ -1640,8 +1640,7 @@ def vector_search(
             break
 
     if candidate_sources and len(filtered) < min(2, top_k):
-        fallback_hits = _vector_search_raw(bundle, query, kb=kb, fetch_k=fetch_k)
-        for hit in fallback_hits:
+        for hit in raw_hits:
             key = hit.dedupe_key()
             if key in seen:
                 continue
