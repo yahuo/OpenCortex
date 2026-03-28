@@ -89,7 +89,7 @@ docker compose run --rm app python start.py --rebuild-only   # build index
 docker compose up -d                                          # start service
 ```
 
-Access via `http://<server-ip>:8501`.
+Access via `http://<server-ip>:8501`, API via `http://<server-ip>:8502`.
 
 **Reload docs without restarting:**
 
@@ -97,6 +97,8 @@ Access via `http://<server-ip>:8501`.
 docker compose exec app python start.py --rebuild-only
 # Then refresh the browser — new index loads automatically
 ```
+
+`docker compose up -d` uses the image default command `python start.py --skip-rebuild`, so container startup will not rebuild the index every time.
 
 **Common ops:**
 

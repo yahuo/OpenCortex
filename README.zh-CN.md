@@ -89,7 +89,7 @@ docker compose run --rm app python start.py --rebuild-only   # 建索引
 docker compose up -d                                          # 启动服务
 ```
 
-通过 `http://<服务器IP>:8501` 访问。
+通过 `http://<服务器IP>:8501` 访问 UI，通过 `http://<服务器IP>:8502` 访问 API。
 
 **文档更新后热加载（无需重启容器）：**
 
@@ -97,6 +97,8 @@ docker compose up -d                                          # 启动服务
 docker compose exec app python start.py --rebuild-only
 # 刷新浏览器后自动加载新索引
 ```
+
+`docker compose up -d` 会使用镜像默认命令 `python start.py --skip-rebuild`，因此容器重启时不会重复重建索引。
 
 **常用运维命令：**
 

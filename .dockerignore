@@ -1,8 +1,11 @@
 venv/
+.venv/
 .env
 wechat_export/
+docs/wechat_export/
 .worktrees/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 .git/

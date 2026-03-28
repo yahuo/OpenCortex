@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenCortex 启动器：先重建索引，再启动 Streamlit。"""
+"""OpenCortex 启动器：重建索引并启动 Streamlit / FastAPI。"""
 from __future__ import annotations
 
 import argparse
@@ -37,10 +37,6 @@ def read_runtime_config() -> dict[str, str]:
 
 
 def validate_runtime(cfg: dict[str, str]) -> None:
-    if not cfg["embed_api_key"]:
-        raise ValueError("缺少环境变量 EMBED_API_KEY")
-    if not Path(cfg["source_dir"]).is_dir():
-        raise ValueError(f"源目录不存在: {cfg['source_dir']}")
     if not cfg["port"].isdigit():
         raise ValueError(f"APP_PORT 非法: {cfg['port']}")
     port = int(cfg["port"])
@@ -51,6 +47,24 @@ def validate_runtime(cfg: dict[str, str]) -> None:
     api_port = int(cfg["api_port"])
     if not (1 <= api_port <= 65535):
         raise ValueError(f"API_PORT 超出范围: {cfg['api_port']}")
+
+
+def validate_rebuild_runtime(cfg: dict[str, str]) -> None:
+    if not cfg["embed_api_key"]:
+        raise ValueError("缺少环境变量 EMBED_API_KEY")
+    if not Path(cfg["source_dir"]).is_dir():
+        raise ValueError(f"源目录不存在: {cfg['source_dir']}")
+
+
+def ensure_index_artifacts(cfg: dict[str, str]) -> None:
+    persist_dir = Path(cfg["persist_dir"])
+    required = [persist_dir / "index.faiss", persist_dir / "index_manifest.json"]
+    missing = [path.name for path in required if not path.exists()]
+    if missing:
+        raise ValueError(
+            "缺少索引文件，请先执行 `python start.py --rebuild-only`："
+            + ", ".join(missing)
+        )
 
 
 def rebuild_index(cfg: dict[str, str]) -> None:
@@ -115,10 +129,16 @@ def launch_api(cfg: dict[str, str]) -> subprocess.Popen:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="OpenCortex 启动器")
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--rebuild-only",
         action="store_true",
         help="仅重建向量索引，不启动 Streamlit",
+    )
+    mode_group.add_argument(
+        "--skip-rebuild",
+        action="store_true",
+        help="跳过索引重建，直接启动 Streamlit 和 FastAPI",
     )
     args = parser.parse_args()
 
@@ -127,7 +147,11 @@ def main() -> int:
 
     try:
         validate_runtime(cfg)
-        rebuild_index(cfg)
+        if args.skip_rebuild:
+            ensure_index_artifacts(cfg)
+        else:
+            validate_rebuild_runtime(cfg)
+            rebuild_index(cfg)
     except Exception as exc:
         print(f"[OpenCortex] 启动失败: {exc}", flush=True)
         return 1
@@ -136,7 +160,14 @@ def main() -> int:
         print("[OpenCortex] 索引重建完成，退出（--rebuild-only 模式）。", flush=True)
         return 0
 
-    print("[OpenCortex] 索引重建完成，正在启动服务（不会自动打开浏览器）...", flush=True)
+    if args.skip_rebuild:
+        print("[OpenCortex] 已跳过索引重建，直接启动服务。", flush=True)
+    else:
+        print(
+            "[OpenCortex] 索引重建完成，正在启动服务（不会自动打开浏览器）...",
+            flush=True,
+        )
+
     procs = [launch_streamlit(cfg), launch_api(cfg)]
     try:
         while True:

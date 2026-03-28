@@ -3,11 +3,15 @@ services:
     build: .
     ports:
       - "${APP_PORT:-8501}:8501"
+      - "${API_PORT:-8502}:8502"
     env_file: .env
     volumes:
       - "${LOCAL_DOCS_DIR:-./wechat_export}:/data/docs:ro"
       - "${CHROMA_PERSIST_DIR:-./data/index}:/data/index"
     environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8501
+      API_PORT: 8502
       LOCAL_DOCS_DIR: /data/docs
       CHROMA_PERSIST_DIR: /data/index
     restart: unless-stopped
