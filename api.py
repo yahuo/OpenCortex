@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from ragbot import ask_stream as rag_ask_stream
-from ragbot import list_kbs, load_vectorstore
+from ragbot import list_kbs, load_search_bundle
 
 load_dotenv()
 
@@ -33,25 +33,26 @@ def _read_config() -> dict[str, str]:
             "https://generativelanguage.googleapis.com/v1beta/openai/",
         ).strip(),
         "llm_model": os.getenv("LLM_MODEL", "gemini-2.0-flash").strip(),
+        "search_mode": os.getenv("SEARCH_MODE", "hybrid").strip().lower() or "hybrid",
     }
 
 
-_vectorstore = None
+_search_bundle = None
 _cfg: dict[str, str] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _vectorstore, _cfg
+    global _search_bundle, _cfg
     _cfg = _read_config()
-    _vectorstore = load_vectorstore(
+    _search_bundle = load_search_bundle(
         embed_api_key=_cfg["embed_api_key"],
         embed_base_url=_cfg["embed_base_url"],
         embed_model=_cfg["embed_model"],
         persist_dir=_cfg["persist_dir"],
     )
-    if _vectorstore is None:
-        raise RuntimeError("向量索引加载失败，请先运行 start.py 重建索引。")
+    if _search_bundle is None:
+        raise RuntimeError("检索索引加载失败，请先运行 start.py 重建索引。")
     yield
 
 
@@ -62,6 +63,8 @@ class AskRequest(BaseModel):
     question: str
     stream: bool = False
     kb: str | None = None
+    search_mode: str | None = None
+    debug: bool = False
 
 
 def _stream_response(result: dict):
@@ -72,6 +75,11 @@ def _stream_response(result: dict):
             "event": "sources",
             "data": json.dumps(result["sources"], ensure_ascii=False),
         }
+        if result.get("search_trace") is not None:
+            yield {
+                "event": "search_trace",
+                "data": json.dumps(result["search_trace"], ensure_ascii=False),
+            }
         yield {"event": "done", "data": ""}
 
     return EventSourceResponse(event_generator())
@@ -92,6 +100,13 @@ def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question 不能为空")
 
+    search_mode = (req.search_mode or _cfg["search_mode"]).strip().lower()
+    if search_mode not in {"vector", "hybrid", "agentic"}:
+        raise HTTPException(
+            status_code=400,
+            detail="search_mode 必须是 vector、hybrid 或 agentic",
+        )
+
     if req.kb is not None:
         available = list_kbs(persist_dir=_cfg["persist_dir"])
         if req.kb not in available:
@@ -102,15 +117,20 @@ def ask(req: AskRequest):
 
     result = rag_ask_stream(
         question=req.question,
-        vectorstore=_vectorstore,
+        search_bundle=_search_bundle,
         llm_api_key=_cfg["llm_api_key"],
         llm_model=_cfg["llm_model"],
         llm_base_url=_cfg["llm_base_url"],
         kb=req.kb,
+        search_mode=search_mode,
+        debug=req.debug,
     )
 
     if not req.stream:
         answer = "".join(result["answer_stream"])
-        return {"answer": answer, "sources": result["sources"]}
+        payload = {"answer": answer, "sources": result["sources"]}
+        if req.debug:
+            payload["search_trace"] = result.get("search_trace", [])
+        return payload
 
     return _stream_response(result)

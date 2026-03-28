@@ -18,8 +18,9 @@
 - **微信导出支持** — 原生解析微信导出的 Markdown，按时间窗口分片
 - **LLM 和 Embedding 可插拔** — 任意 OpenAI 兼容接口：硅基流动、Gemini、DeepSeek、Kimi、GLM 等
 - **本地 FAISS 向量库** — 无云端依赖，数据不离本机
+- **Hybrid / Agentic Search** — `glob + grep + AST + vector` 混合检索，支持有边界的二跳检索
 - **多知识库** — `docs/` 下的子目录自动成为独立知识库，API 可指定知识库检索或全量检索
-- **HTTP API** — FastAPI 端点（`/api/ask`、`/api/kbs`、`/api/health`），支持 SSE 流式输出
+- **HTTP API** — FastAPI 端点（`/api/ask`、`/api/kbs`、`/api/health`），支持 `search_mode` 和 SSE 流式输出
 - **索引热加载** — 更新文档后重建索引，无需重启服务，刷新页面即生效
 - **Docker 部署** — 将同一知识库以局域网服务形式共享给多人
 
@@ -121,6 +122,10 @@ docker compose up -d      # 重新启动
 | `LLM_BASE_URL` | | `https://generativelanguage.googleapis.com/v1beta/openai/` | LLM API 地址 |
 | `LLM_MODEL` | | `gemini-2.0-flash` | LLM 模型名称 |
 | `CHROMA_PERSIST_DIR` | | `~/wechat_rag_db` | FAISS 索引持久化目录 |
+| `SEARCH_MODE` | | `hybrid` | 默认检索模式：`vector` / `hybrid` / `agentic` |
+| `SEARCH_MAX_STEPS` | | `2` | agentic 模式最大检索步数，仅支持 `1` 或 `2` |
+| `EXCLUDE_GLOBS` | | — | 额外忽略的目录 / 文件模式，逗号分隔 |
+| `SEARCH_DEBUG` | | — | Streamlit 中展示检索轨迹 |
 | `APP_HOST` | | `127.0.0.1` | 服务绑定地址 |
 | `APP_PORT` | | `8501` | Streamlit 服务端口 |
 | `API_PORT` | | `8502` | FastAPI 服务端口 |
@@ -162,7 +167,7 @@ uvicorn api:app --host 127.0.0.1 --port 8502
 |---|---|---|
 | `/api/health` | GET | 健康检查 |
 | `/api/kbs` | GET | 列出可用知识库 |
-| `/api/ask` | POST | 提问（支持流式输出） |
+| `/api/ask` | POST | 提问（支持 `search_mode`、`debug` 和流式输出） |
 
 ### 多知识库
 
@@ -188,6 +193,14 @@ curl http://127.0.0.1:8502/api/kbs
 curl -X POST http://127.0.0.1:8502/api/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "产品路线图是什么？", "kb": "产品"}'
+```
+
+**指定检索模式并返回检索轨迹：**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "bootstrap_session 在哪定义", "search_mode": "agentic", "debug": true}'
 ```
 
 **全量检索（不传 `kb`）：**

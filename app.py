@@ -7,7 +7,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from ragbot import ask_stream as rag_ask_stream
-from ragbot import load_vectorstore
+from ragbot import load_search_bundle
 
 load_dotenv()
 
@@ -124,11 +124,18 @@ def render_sources(sources: list) -> None:
     """渲染引用来源卡片列表。"""
     with st.expander("查看引用"):
         for src in sources:
+            location = src.get("time_range") or ""
+            line_start = src.get("line_start")
+            line_end = src.get("line_end")
+            if not location and line_start:
+                location = f"L{line_start}" if not line_end or line_end == line_start else f"L{line_start}-L{line_end}"
+            badge = src.get("match_kind", "source")
             st.markdown(
                 f"""<div class="source-card">
     <div class="src-meta">
         <span class="source-badge">{html.escape(src['source'])}</span>
-        <span class="source-time">{html.escape(src['time_range'])}</span>
+        <span class="source-badge">{html.escape(badge)}</span>
+        <span class="source-time">{html.escape(location)}</span>
     </div>
     <div class="source-snippet">{html.escape(src['snippet'])}</div>
 </div>""",
@@ -137,13 +144,13 @@ def render_sources(sources: list) -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def get_vectorstore(
+def get_search_bundle(
     embed_api_key: str,
     embed_base_url: str,
     embed_model: str,
     persist_dir: str,
 ):
-    return load_vectorstore(
+    return load_search_bundle(
         embed_api_key=embed_api_key,
         embed_base_url=embed_base_url,
         embed_model=embed_model,
@@ -173,11 +180,20 @@ def read_runtime_config() -> dict[str, str]:
             "https://generativelanguage.googleapis.com/v1beta/openai/",
         ).strip(),
         "llm_model": os.getenv("LLM_MODEL", "gemini-2.0-flash").strip(),
+        "search_mode": os.getenv("SEARCH_MODE", "hybrid").strip().lower() or "hybrid",
+        "search_debug": os.getenv("SEARCH_DEBUG", "").strip().lower(),
     }
 
 
 def init_session_state() -> None:
     st.session_state.setdefault("rag_messages", [])
+
+
+def render_search_trace(search_trace: list[dict]) -> None:
+    with st.expander("查看检索轨迹"):
+        for step in search_trace:
+            st.markdown(f"**{step.get('step', 'step')}**")
+            st.json(step, expanded=False)
 
 
 init_session_state()
@@ -226,17 +242,17 @@ except FileNotFoundError:
     st.stop()
 _mtime_tracker = _get_mtime_tracker()
 if current_mtime != _mtime_tracker["last_mtime"]:
-    get_vectorstore.clear()
+    get_search_bundle.clear()
     _mtime_tracker["last_mtime"] = current_mtime
 
-vectorstore = get_vectorstore(
+search_bundle = get_search_bundle(
     embed_api_key=cfg["embed_api_key"],
     embed_base_url=cfg["embed_base_url"],
     embed_model=cfg["embed_model"],
     persist_dir=cfg["persist_dir"],
 )
 
-if vectorstore is None:
+if search_bundle is None:
     st.error("索引加载失败，请重启应用后重试。")
     st.stop()
 
@@ -245,6 +261,8 @@ for msg in st.session_state.rag_messages:
         st.markdown(msg["content"])
         if msg.get("sources"):
             render_sources(msg["sources"])
+        if msg.get("search_trace"):
+            render_search_trace(msg["search_trace"])
 
 if question := st.chat_input("输入问题..."):
     st.session_state.rag_messages.append({"role": "user", "content": question})
@@ -257,13 +275,16 @@ if question := st.chat_input("输入问题..."):
         try:
             result = rag_ask_stream(
                 question=question,
-                vectorstore=vectorstore,
+                search_bundle=search_bundle,
                 llm_api_key=cfg["llm_api_key"],
                 llm_model=cfg["llm_model"],
                 llm_base_url=cfg["llm_base_url"],
+                search_mode=cfg["search_mode"],
+                debug=cfg["search_debug"] in {"1", "true", "yes", "on"},
             )
             sources = result["sources"]
             base_stream = result["answer_stream"]
+            search_trace = result.get("search_trace", [])
 
             def stream_with_status():
                 first_chunk = True
@@ -278,12 +299,20 @@ if question := st.chat_input("输入问题..."):
         except Exception as exc:
             answer = f"问答失败：{exc}"
             sources = []
+            search_trace = []
             status_placeholder.empty()
             st.markdown(answer)
 
         if sources:
             render_sources(sources)
+        if search_trace:
+            render_search_trace(search_trace)
 
     st.session_state.rag_messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "search_trace": search_trace,
+        }
     )

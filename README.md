@@ -18,8 +18,9 @@
 - **WeChat export support** — natively parses WeChat-exported Markdown with time-window chunking
 - **Pluggable LLM & embeddings** — any OpenAI-compatible API: SiliconFlow, Gemini, DeepSeek, Kimi, GLM, etc.
 - **Local FAISS vector store** — no cloud dependency, data stays on your machine
+- **Hybrid / Agentic Search** — combines `glob + grep + AST + vector`, with a bounded second retrieval hop
 - **Multi-knowledge-base** — subdirectories under `docs/` become named knowledge bases; API can target a specific KB or search globally
-- **HTTP API** — FastAPI endpoints (`/api/ask`, `/api/kbs`, `/api/health`) with SSE streaming support
+- **HTTP API** — FastAPI endpoints (`/api/ask`, `/api/kbs`, `/api/health`) with `search_mode` and SSE streaming support
 - **Hot-reload** — update your docs and trigger re-indexing without restarting the server
 - **Docker deployment** — serve the same knowledge base to multiple users on a LAN
 
@@ -121,6 +122,10 @@ Copy `.env.example` to `.env` and fill in the required values.
 | `LLM_BASE_URL` | | `https://generativelanguage.googleapis.com/v1beta/openai/` | LLM API base URL |
 | `LLM_MODEL` | | `gemini-2.0-flash` | LLM model name |
 | `CHROMA_PERSIST_DIR` | | `~/wechat_rag_db` | Directory to persist the FAISS index |
+| `SEARCH_MODE` | | `hybrid` | Default retrieval mode: `vector`, `hybrid`, or `agentic` |
+| `SEARCH_MAX_STEPS` | | `2` | Max retrieval steps for agentic mode, only `1` or `2` |
+| `EXCLUDE_GLOBS` | | — | Extra ignore patterns, comma-separated |
+| `SEARCH_DEBUG` | | — | Show retrieval trace in Streamlit |
 | `APP_HOST` | | `127.0.0.1` | Server bind address |
 | `APP_PORT` | | `8501` | Streamlit server port |
 | `API_PORT` | | `8502` | FastAPI server port |
@@ -162,7 +167,7 @@ uvicorn api:app --host 127.0.0.1 --port 8502
 |---|---|---|
 | `/api/health` | GET | Health check |
 | `/api/kbs` | GET | List available knowledge bases |
-| `/api/ask` | POST | Ask a question (supports streaming) |
+| `/api/ask` | POST | Ask a question (supports `search_mode`, `debug`, and streaming) |
 
 ### Multi-knowledge-base
 
@@ -196,6 +201,14 @@ curl -X POST http://127.0.0.1:8502/api/ask \
 curl -X POST http://127.0.0.1:8502/api/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "What is the product roadmap?"}'
+```
+
+**Choose retrieval mode and return a retrieval trace:**
+
+```bash
+curl -X POST http://127.0.0.1:8502/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Where is bootstrap_session defined?", "search_mode": "agentic", "debug": true}'
 ```
 
 **SSE streaming:**

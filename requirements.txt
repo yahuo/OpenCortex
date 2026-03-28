@@ -7,3 +7,5 @@ markitdown[pdf,docx,xlsx]>=0.1,<1
 fastapi>=0.115,<1
 uvicorn>=0.34,<1
 sse-starlette>=2.0,<3
+PyYAML>=6.0,<7
+pytest>=8.0,<9
