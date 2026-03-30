@@ -28,19 +28,57 @@
 
 ## Architecture
 
-```
-Local docs directory
-      │
-      ▼ ragbot.py — parse, chunk, embed → FAISS index (persisted locally)
-      │
-      ├─▶ app.py — Streamlit UI (port 8501), global search
-      │
-      └─▶ api.py — FastAPI HTTP API (port 8502), supports per-KB search
-      │
-      ▼ Any OpenAI-compatible LLM (streaming)
+```mermaid
+flowchart LR
+    Docs["LOCAL_DOCS_DIR<br/>Local documents<br/>subdirectories become KBs"] --> Start["start.py<br/>launcher"]
+    Env[".env<br/>Embedding / LLM / ports / search mode"] --> Start
+
+    subgraph Build["Index Build"]
+        Parse["ragbot.build_vectorstore()<br/>parse and normalize<br/>Markdown / JSON / YAML / PDF / DOCX / XLSX / code"]
+        Chunk["chunking strategies<br/>headings / WeChat time windows / code blocks / fixed-size"]
+        Embed["OpenAI-compatible Embedding API"]
+        Persist["local artifacts<br/>index.faiss / index.pkl<br/>index_manifest.json<br/>normalized_texts/<br/>symbol_index.jsonl"]
+    end
+
+    subgraph Runtime["Runtime Services"]
+        Bundle["ragbot.load_search_bundle()<br/>load vector store + manifest + normalized texts + symbol index"]
+        App["app.py<br/>Streamlit UI :8501<br/>global search + hot reload"]
+        API["api.py<br/>FastAPI :8502<br/>/api/ask /api/kbs /api/health"]
+    end
+
+    subgraph Query["Question Answering"]
+        Retrieve["retrieve()<br/>vector / hybrid / agentic"]
+        LLM["ask_stream()<br/>OpenAI-compatible LLM streaming"]
+        Output["answer + cited sources<br/>JSON or SSE"]
+    end
+
+    Start --> Parse
+    Parse --> Chunk --> Embed --> Persist
+    Start --> App
+    Start --> API
+    Env --> Bundle
+    Persist --> Bundle
+    Bundle --> App
+    Bundle --> API
+    App --> Retrieve
+    API --> Retrieve
+    Bundle --> Retrieve
+    Retrieve --> LLM --> Output
 ```
 
-`start.py` orchestrates the flow: rebuild index → launch Streamlit + API server.
+Key implementation details:
+
+1. `start.py` rebuilds the index by default, then launches Streamlit and Uvicorn as parallel subprocesses.
+2. `ragbot.py` persists more than FAISS alone: `index_manifest.json`, `normalized_texts/`, and `symbol_index.jsonl` are also written for hybrid / agentic retrieval.
+3. `app.py` only exposes global search, but watches the `index.faiss` mtime and clears its cached `SearchBundle` when the index changes.
+4. `api.py` loads the same `SearchBundle` during FastAPI lifespan startup and exposes `kb`, `search_mode`, `stream`, and `debug` controls.
+
+### Request Flow
+
+1. The UI or API receives a question and calls `ragbot.ask_stream()`.
+2. `retrieve()` runs `vector` or `hybrid` retrieval first; `agentic` may add one bounded second hop when needed.
+3. Retrieved hits are turned into context and citations, then passed to any OpenAI-compatible LLM for streaming generation.
+4. Streamlit renders the streamed answer plus source cards, while FastAPI returns JSON or SSE events.
 
 ---
 

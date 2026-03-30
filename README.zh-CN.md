@@ -28,19 +28,57 @@
 
 ## 架构
 
-```
-本地文档目录
-      │
-      ▼ ragbot.py — 解析、分片、向量化 → FAISS 索引（本地持久化）
-      │
-      ├─▶ app.py — Streamlit 界面（端口 8501），全量检索
-      │
-      └─▶ api.py — FastAPI HTTP API（端口 8502），支持分知识库检索
-      │
-      ▼ 任意 OpenAI 兼容 LLM（流式输出）
+```mermaid
+flowchart LR
+    Docs["LOCAL_DOCS_DIR<br/>本地文档目录<br/>子目录自动映射为知识库"] --> Start["start.py<br/>启动器"]
+    Env[".env<br/>Embedding / LLM / 端口 / 检索模式"] --> Start
+
+    subgraph Build["索引构建"]
+        Parse["ragbot.build_vectorstore()<br/>解析与标准化<br/>Markdown / JSON / YAML / PDF / DOCX / XLSX / code"]
+        Chunk["分片策略<br/>标题分段 / 微信时间窗口 / 代码块 / 固定大小"]
+        Embed["OpenAI 兼容 Embedding API"]
+        Persist["本地持久化产物<br/>index.faiss / index.pkl<br/>index_manifest.json<br/>normalized_texts/<br/>symbol_index.jsonl"]
+    end
+
+    subgraph Runtime["运行时服务"]
+        Bundle["ragbot.load_search_bundle()<br/>加载向量库 + manifest + 标准化文本 + 符号索引"]
+        App["app.py<br/>Streamlit UI :8501<br/>全量检索 + 索引热加载"]
+        API["api.py<br/>FastAPI :8502<br/>/api/ask /api/kbs /api/health"]
+    end
+
+    subgraph Query["问答链路"]
+        Retrieve["retrieve()<br/>vector / hybrid / agentic"]
+        LLM["ask_stream()<br/>OpenAI 兼容 LLM 流式生成"]
+        Output["答案 + 引用来源<br/>JSON 或 SSE"]
+    end
+
+    Start --> Parse
+    Parse --> Chunk --> Embed --> Persist
+    Start --> App
+    Start --> API
+    Env --> Bundle
+    Persist --> Bundle
+    Bundle --> App
+    Bundle --> API
+    App --> Retrieve
+    API --> Retrieve
+    Bundle --> Retrieve
+    Retrieve --> LLM --> Output
 ```
 
-`start.py` 负责协调：重建索引 → 启动 Streamlit + API 服务。
+当前实现的关键点：
+
+1. `start.py` 默认先重建索引，再以两个子进程并行启动 Streamlit 和 Uvicorn。
+2. `ragbot.py` 不只保存 FAISS，还会额外落盘 `index_manifest.json`、`normalized_texts/` 和 `symbol_index.jsonl`，供 hybrid / agentic 检索使用。
+3. `app.py` 只做全量检索，但会监听 `index.faiss` 的 `mtime`，索引更新后自动清理缓存并热加载。
+4. `api.py` 在 FastAPI lifespan 中加载同一套 `SearchBundle`，支持 `kb`、`search_mode`、`stream` 和 `debug` 参数。
+
+### 问答链路
+
+1. UI 或 API 收到问题后，统一调用 `ragbot.ask_stream()`。
+2. `retrieve()` 先执行 `vector` / `hybrid` 检索；`agentic` 模式在必要时追加一次有边界的二跳检索。
+3. 检索结果会被组装成上下文和引用来源，再交给任意 OpenAI 兼容 LLM 流式生成答案。
+4. Streamlit 直接展示流式结果和引用卡片；FastAPI 则返回 JSON 或 SSE 事件流。
 
 ---
 
