@@ -80,6 +80,37 @@ flowchart LR
 3. 检索结果会被组装成上下文和引用来源，再交给任意 OpenAI 兼容 LLM 流式生成答案。
 4. Streamlit 直接展示流式结果和引用卡片；FastAPI 则返回 JSON 或 SSE 事件流。
 
+### 与传统 RAG 的区别
+
+```mermaid
+flowchart LR
+    subgraph Classic["传统 RAG"]
+        CQ["用户问题"]
+        CE["问题向量化"]
+        CV["向量库 top-k"]
+        CC["拼接上下文"]
+        CA["LLM 生成答案"]
+        CQ --> CE --> CV --> CC --> CA
+    end
+
+    subgraph Current["当前实现"]
+        NQ["用户问题"]
+        NP["规则规划<br/>symbols / keywords / path_globs"]
+        NG["glob / grep / AST"]
+        NV["受限向量召回"]
+        NF["RRF 融合排序"]
+        NA["可选二跳规划<br/>仅 agentic 模式"]
+        NC["上下文 + 引用 + 检索轨迹"]
+        NO["LLM 流式答案"]
+        NQ --> NP --> NG --> NV --> NF --> NC --> NO
+        NF --> NA --> NF
+    end
+```
+
+- `vector` 模式仍然是传统单路向量 RAG，适合作为性能和行为基线。
+- 默认的 `hybrid` 模式会把规则检索和向量检索融合，更适合问文件名、符号名、配置项这类“可精确定位”的问题。
+- `agentic` 模式不是无限循环的 agent，而是在首轮结果不够确定时，额外做一次有边界的二跳检索。
+
 ---
 
 ## 快速开始

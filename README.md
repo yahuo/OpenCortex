@@ -80,6 +80,37 @@ Key implementation details:
 3. Retrieved hits are turned into context and citations, then passed to any OpenAI-compatible LLM for streaming generation.
 4. Streamlit renders the streamed answer plus source cards, while FastAPI returns JSON or SSE events.
 
+### How This Differs From Classic RAG
+
+```mermaid
+flowchart LR
+    subgraph Classic["Classic RAG"]
+        CQ["User question"]
+        CE["Query embedding"]
+        CV["Vector store top-k"]
+        CC["Assemble context"]
+        CA["LLM answer"]
+        CQ --> CE --> CV --> CC --> CA
+    end
+
+    subgraph Current["Current Implementation"]
+        NQ["User question"]
+        NP["Rule planning<br/>symbols / keywords / path_globs"]
+        NG["glob / grep / AST"]
+        NV["Scoped vector recall"]
+        NF["RRF fusion ranking"]
+        NA["Optional second-hop planning<br/>agentic mode only"]
+        NC["Context + citations + search trace"]
+        NO["Streaming LLM answer"]
+        NQ --> NP --> NG --> NV --> NF --> NC --> NO
+        NF --> NA --> NF
+    end
+```
+
+- `vector` mode is still the classic single-route vector RAG path, useful as a baseline for behavior and latency.
+- The default `hybrid` mode fuses rule-based retrieval with vector retrieval, which works better for exact filenames, symbols, and config keys.
+- `agentic` is not an open-ended agent loop; it adds at most one bounded second retrieval hop when the first pass is not decisive.
+
 ---
 
 ## Quick Start
