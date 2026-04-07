@@ -286,6 +286,44 @@ See the canonical reference at [linked](../bar/linked.md).
     assert "bar/linked.md" in expansion.sources
 
 
+def test_document_graph_resolves_relative_links_for_windows_style_sources():
+    indexed_files = [
+        ragbot.IndexedFile(
+            rel_path=r"工程\nested\doc.md",
+            suffix=".md",
+            kb="工程",
+            file_path=Path("doc.md"),
+            normalized_text="See [bootstrap](../bootstrap_session.py) for details.",
+            chunks=[],
+            symbols=[],
+        ),
+        ragbot.IndexedFile(
+            rel_path=r"工程\bootstrap_session.py",
+            suffix=".py",
+            kb="工程",
+            file_path=Path("bootstrap_session.py"),
+            normalized_text="def bootstrap_session():\n    pass\n",
+            chunks=[],
+            symbols=[],
+        ),
+        ragbot.IndexedFile(
+            rel_path=r"产品\bootstrap_session.py",
+            suffix=".py",
+            kb="产品",
+            file_path=Path("bootstrap_session.py"),
+            normalized_text="def bootstrap_session():\n    pass\n",
+            chunks=[],
+            symbols=[],
+        ),
+    ]
+
+    graph = ragbot._build_document_graph(indexed_files)
+
+    neighbors = [edge["target"] for edge in graph["neighbors"]["工程/nested/doc.md"]]
+    assert "工程/bootstrap_session.py" in neighbors
+    assert all("\\" not in source for source in graph["neighbors"])
+
+
 def test_grep_search_prioritizes_exact_config_key(search_bundle):
     result = ragbot.retrieve("api_key 配置项在哪里定义", search_bundle, kb="产品", mode="hybrid")
     assert result["hits"]
@@ -450,6 +488,60 @@ def test_agentic_step2_prefilter_seeds_all_step1_sources(search_bundle, monkeypa
 
     assert captured["seed_sources"] == ["工程/a.md", "工程/b.md", "工程/c.md"]
     assert captured["allowed_sources"] == {"工程/a.md", "工程/b.md", "工程/c.md"}
+
+
+def test_run_search_step_preserves_hit_order_for_bounded_graph_expansion(search_bundle, monkeypatch):
+    query_plan = ragbot.QueryPlan(
+        symbols=[],
+        keywords=["session"],
+        path_globs=["*session*"],
+        semantic_query="session bootstrap flow",
+        reason="test ordered seeds",
+    )
+    glob_hits = [
+        ragbot.SearchHit(source="工程/a.md", match_kind="glob", snippet="a", score=0.9),
+        ragbot.SearchHit(source="工程/a.md", match_kind="glob", snippet="a duplicate", score=0.8),
+        ragbot.SearchHit(source="工程/b.md", match_kind="glob", snippet="b", score=0.7),
+    ]
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: glob_hits)
+    monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+
+    def fake_expand(bundle, seed_sources, kb=None, allowed_sources=None, max_hops=1, max_extra_sources=12):
+        ordered = list(seed_sources)
+        captured["seed_sources"] = ordered
+        neighbor = "工程/a_neighbor.md" if ordered and ordered[0] == "工程/a.md" else "工程/b_neighbor.md"
+        return ragbot.GraphExpansionResult(
+            sources=set([*ordered, neighbor]),
+            seed_sources=ordered,
+            expanded_sources=[neighbor],
+            edge_reasons=[{"from": ordered[0], "to": neighbor, "kind": "links_to", "reason": "test", "hop": 1}],
+            hops=1,
+        )
+
+    def fake_vector_search(bundle, query, kb=None, top_k=8, candidate_sources=None):
+        captured["candidate_sources"] = candidate_sources
+        return []
+
+    monkeypatch.setattr(ragbot, "_expand_candidate_sources_detailed", fake_expand)
+    monkeypatch.setattr(ragbot, "vector_search", fake_vector_search)
+
+    result = ragbot._run_search_step(
+        "哪里处理初始化流程",
+        search_bundle,
+        query_plan,
+        kb="工程",
+        top_k=4,
+        graph_max_hops=1,
+        graph_max_extra_sources=1,
+    )
+
+    assert captured["seed_sources"] == ["工程/a.md", "工程/b.md"]
+    assert "工程/a_neighbor.md" in result.trace["candidate_scope"]
+    assert "工程/b_neighbor.md" not in result.trace["candidate_scope"]
+    assert result.trace["graph_seed_sources"] == ["工程/a.md", "工程/b.md"]
 
 
 def test_kb_filter_applies_to_all_retrievers(search_bundle):

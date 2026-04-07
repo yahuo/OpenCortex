@@ -331,6 +331,14 @@ def _dedupe_strings(items: Iterable[str]) -> list[str]:
     return results
 
 
+def _normalize_source_path(path_like: str | Path) -> str:
+    text = str(path_like).strip()
+    if not text:
+        return ""
+    normalized = posixpath.normpath(text.replace("\\", "/"))
+    return "" if normalized in {"", "."} else normalized
+
+
 def _safe_signature_from_args(node: ast.AST) -> str:
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return ""
@@ -809,14 +817,14 @@ def _extract_python_symbols(text: str, rel_path: str) -> list[dict[str, Any]]:
 
 
 def _extract_kb(rel_path: str) -> str:
-    parts = Path(rel_path).parts
+    parts = [part for part in _normalize_source_path(rel_path).split("/") if part]
     if len(parts) > 1:
         return parts[0]
     return ""
 
 
 def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
-    rel_path = str(file_path.relative_to(root))
+    rel_path = _normalize_source_path(file_path.relative_to(root).as_posix())
     kb = _extract_kb(rel_path)
     suffix = file_path.suffix.lower()
 
@@ -1000,12 +1008,13 @@ def _resolve_document_reference(
     if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", clean) or clean.startswith("mailto:"):
         return None
 
-    clean = clean.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
+    clean = _normalize_source_path(clean.split("#", 1)[0].split("?", 1)[0])
     if not clean:
         return None
     if clean in source_lookup:
         return clean
 
+    source = _normalize_source_path(source)
     if clean.startswith("/"):
         candidate = posixpath.normpath(clean.lstrip("/"))
     else:
@@ -1046,7 +1055,13 @@ def _add_graph_edge(
 
 
 def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
-    sources = sorted(indexed.rel_path for indexed in indexed_files)
+    sources = sorted(
+        {
+            normalized
+            for indexed in indexed_files
+            if (normalized := _normalize_source_path(indexed.rel_path))
+        }
+    )
     source_lookup = set(sources)
     basename_lookup: dict[str, list[str]] = {}
     for source in sources:
@@ -1057,21 +1072,27 @@ def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
     }
 
     for indexed in indexed_files:
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
         for kind, reference in _iter_local_path_references(indexed.normalized_text):
             target = _resolve_document_reference(
-                indexed.rel_path,
+                source,
                 reference,
                 source_lookup,
                 basename_lookup,
             )
             if target is None:
                 continue
-            _add_graph_edge(edges_by_source, indexed.rel_path, target, kind, reference)
+            _add_graph_edge(edges_by_source, source, target, kind, reference)
 
     token_sources: dict[str, set[str]] = {}
     for indexed in indexed_files:
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
         for token in _extract_shared_tokens(indexed):
-            token_sources.setdefault(token, set()).add(indexed.rel_path)
+            token_sources.setdefault(token, set()).add(source)
 
     for token, matched_sources in token_sources.items():
         if not 2 <= len(matched_sources) <= GRAPH_SHARED_TOKEN_MAX_DOC_FREQ:
@@ -1311,7 +1332,22 @@ def load_search_bundle(
         if manifest_path.exists()
         else {"files": []}
     )
-    files = manifest.get("files", [])
+    raw_files = manifest.get("files", [])
+    files: list[dict[str, Any]] = []
+    for entry in raw_files if isinstance(raw_files, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        normalized_entry = dict(entry)
+        source = _normalize_source_path(normalized_entry.get("name", ""))
+        if not source:
+            continue
+        normalized_entry["name"] = source
+        normalized_entry["kb"] = _extract_kb(source) or normalized_entry.get("kb", "")
+        normalized_text = normalized_entry.get("normalized_text", "")
+        if isinstance(normalized_text, str):
+            normalized_entry["normalized_text"] = _normalize_source_path(normalized_text)
+        files.append(normalized_entry)
+    manifest["files"] = files
     files_by_source = {entry.get("name", ""): entry for entry in files if entry.get("name")}
     normalized_text_dir = Path(persist_dir) / manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME)
     symbol_index_path = Path(persist_dir) / manifest.get("symbol_index_file", SYMBOL_INDEX_FILENAME)
@@ -1324,9 +1360,16 @@ def load_search_bundle(
             if not line:
                 continue
             try:
-                symbol_index.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict):
+                continue
+            source = _normalize_source_path(record.get("source", ""))
+            if not source:
+                continue
+            record["source"] = source
+            symbol_index.append(record)
 
     document_graph: dict[str, Any] = {"version": 1, "edge_count": 0, "neighbors": {}}
     if document_graph_path.exists():
@@ -1334,9 +1377,38 @@ def load_search_bundle(
             document_graph = json.loads(document_graph_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             document_graph = {"version": 1, "edge_count": 0, "neighbors": {}}
-    graph_neighbors = document_graph.get("neighbors", {})
-    if not isinstance(graph_neighbors, dict):
-        graph_neighbors = {}
+    graph_neighbors: dict[str, list[dict[str, Any]]] = {}
+    raw_neighbors = document_graph.get("neighbors", {})
+    if isinstance(raw_neighbors, dict):
+        for source, edges in raw_neighbors.items():
+            normalized_source = _normalize_source_path(source)
+            if not normalized_source or not isinstance(edges, list):
+                continue
+            bucket = graph_neighbors.setdefault(normalized_source, [])
+            seen_edges: set[tuple[str, str, str, int]] = set()
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                target = _normalize_source_path(edge.get("target", ""))
+                if not target or target == normalized_source:
+                    continue
+                payload = dict(edge)
+                payload["target"] = target
+                key = (
+                    str(payload.get("kind", "")),
+                    target,
+                    str(payload.get("reason", "")),
+                    int(payload.get("hop") or 0),
+                )
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                bucket.append(payload)
+    document_graph = {
+        **document_graph,
+        "neighbors": graph_neighbors,
+        "edge_count": sum(len(edges) for edges in graph_neighbors.values()),
+    }
 
     source_dir = manifest.get("source_dir")
     return SearchBundle(
@@ -1850,7 +1922,7 @@ def ast_search(
 def _vector_hit_from_document(doc: Document, raw_score: float | None = None) -> SearchHit:
     meta = doc.metadata
     return SearchHit(
-        source=meta.get("source", ""),
+        source=_normalize_source_path(meta.get("source", "")),
         match_kind="vector",
         snippet=doc.page_content,
         score=1.0 if raw_score is None else 1.0 / (1.0 + max(raw_score, 0.0)),
@@ -1925,12 +1997,12 @@ def vector_search(
     return filtered
 
 
-def _candidate_sources_from_hits(*hit_lists: list[SearchHit]) -> set[str]:
-    sources: set[str] = set()
-    for hits in hit_lists:
-        for hit in hits:
-            sources.add(hit.source)
-    return sources
+def _candidate_sources_from_hits(*hit_lists: list[SearchHit]) -> list[str]:
+    return _dedupe_strings(
+        hit.source
+        for hits in hit_lists
+        for hit in hits
+    )
 
 
 def _merge_grouped_hits(*grouped_sets: dict[str, list[SearchHit]]) -> dict[str, list[SearchHit]]:
@@ -2082,7 +2154,7 @@ def _run_search_step(
     graph_max_extra_sources: int = 12,
 ) -> SearchStepResult:
     glob_hits = glob_search(bundle, query_plan.path_globs, kb=kb, allowed_sources=allowed_sources)
-    glob_scope = _candidate_sources_from_hits(glob_hits)
+    glob_scope = set(_candidate_sources_from_hits(glob_hits))
     grep_scope = glob_scope or allowed_sources
     grep_hits = grep_search(
         bundle,
@@ -2109,7 +2181,7 @@ def _run_search_step(
         max_hops=graph_max_hops,
         max_extra_sources=graph_max_extra_sources,
     )
-    narrowed_vector_scope = _candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4])
+    narrowed_vector_scope = set(_candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4]))
     if graph_expansion.sources:
         narrowed_vector_scope = narrowed_vector_scope | graph_expansion.sources
     if not narrowed_vector_scope:
