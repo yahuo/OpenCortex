@@ -10,10 +10,12 @@ ragbot.py — 通用本地文档 RAG / Hybrid Search 核心模块
 from __future__ import annotations
 
 import ast
+from collections import deque
 import configparser
 import fnmatch
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -60,6 +62,7 @@ SEARCH_MODES = {"vector", "hybrid", "agentic"}
 SEARCH_MAX_STEPS_DEFAULT = 2
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 SYMBOL_INDEX_FILENAME = "symbol_index.jsonl"
+DOCUMENT_GRAPH_FILENAME = "document_graph.json"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -67,6 +70,33 @@ RRF_WEIGHTS = {
     "grep": 0.9,
     "glob": 0.6,
     "vector": 0.5,
+}
+GRAPH_MAX_NEIGHBORS = 8
+GRAPH_SHARED_TOKEN_MIN_LENGTH = 3
+GRAPH_SHARED_TOKEN_MAX_DOC_FREQ = 5
+GRAPH_EDGE_PRIORITY = {
+    "links_to": 0,
+    "mentions_path": 1,
+    "shared_symbol": 2,
+    "same_series": 3,
+}
+GRAPH_STOPWORDS = {
+    "this",
+    "that",
+    "with",
+    "from",
+    "have",
+    "file",
+    "files",
+    "docs",
+    "document",
+    "documents",
+    "guide",
+    "notes",
+    "readme",
+    "config",
+    "setting",
+    "settings",
 }
 SUPPORTED_TEXT_SUFFIXES = {
     ".md",
@@ -134,6 +164,9 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_./*:-]{2,}")
 SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 WORD_CHARS_RE = re.compile(r"^[A-Za-z0-9_]+$")
+MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+HTML_HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.I)
+CODE_SPAN_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
 
 
 # ─────────────────────────────────────────────────────────
@@ -175,6 +208,15 @@ class SearchStepResult:
 
 
 @dataclass(slots=True)
+class GraphExpansionResult:
+    sources: set[str]
+    seed_sources: list[str]
+    expanded_sources: list[str]
+    edge_reasons: list[dict[str, Any]]
+    hops: int = 0
+
+
+@dataclass(slots=True)
 class SearchHit:
     source: str
     match_kind: str
@@ -199,6 +241,8 @@ class SearchBundle:
     files_by_source: dict[str, dict[str, Any]]
     normalized_text_dir: Path
     symbol_index: list[dict[str, Any]]
+    document_graph: dict[str, Any]
+    graph_neighbors: dict[str, list[dict[str, Any]]]
 
     def cache_path_for(self, source: str) -> Path | None:
         entry = self.files_by_source.get(source)
@@ -876,6 +920,214 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[IndexedFile]
     return documents, indexed_files
 
 
+def _normalize_graph_token(token: str) -> str | None:
+    clean = token.strip().strip("`\"'").rstrip("()")
+    if len(clean) < GRAPH_SHARED_TOKEN_MIN_LENGTH:
+        return None
+    if not WORD_CHARS_RE.fullmatch(clean):
+        return None
+    lowered = clean.lower()
+    if lowered in GRAPH_STOPWORDS:
+        return None
+    return lowered
+
+
+def _extract_shared_tokens(indexed: IndexedFile) -> set[str]:
+    tokens: set[str] = set()
+
+    for record in indexed.symbols:
+        for raw in (record.get("name", ""), record.get("qualified_name", "")):
+            for piece in re.split(r"[.\[\]]+", str(raw)):
+                token = _normalize_graph_token(piece)
+                if token:
+                    tokens.add(token)
+
+    if indexed.suffix in STRUCTURED_SUFFIXES:
+        for line in indexed.normalized_text.splitlines():
+            if " = " not in line:
+                continue
+            key = line.split(" = ", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_.-]{3,}", key):
+                tokens.add(key.lower())
+            for piece in re.split(r"[.\[\]-]+", key):
+                token = _normalize_graph_token(piece)
+                if token:
+                    tokens.add(token)
+
+    for match in CODE_SPAN_RE.findall(indexed.normalized_text):
+        token = _normalize_graph_token(match)
+        if token:
+            tokens.add(token)
+
+    for match in CALL_RE.findall(indexed.normalized_text):
+        token = _normalize_graph_token(match)
+        if token:
+            tokens.add(token)
+
+    return tokens
+
+
+def _iter_local_path_references(text: str) -> list[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    refs: list[tuple[str, str]] = []
+    for ref in MARKDOWN_LINK_RE.findall(text):
+        item = ("links_to", ref)
+        if item not in seen:
+            seen.add(item)
+            refs.append(item)
+    for ref in HTML_HREF_RE.findall(text):
+        item = ("links_to", ref)
+        if item not in seen:
+            seen.add(item)
+            refs.append(item)
+    for ref in PATHISH_RE.findall(text):
+        item = ("mentions_path", ref)
+        if item not in seen:
+            seen.add(item)
+            refs.append(item)
+    return refs
+
+
+def _resolve_document_reference(
+    source: str,
+    reference: str,
+    source_lookup: set[str],
+    basename_lookup: dict[str, list[str]],
+) -> str | None:
+    clean = reference.strip().strip("<>").strip("'\"")
+    if not clean or clean.startswith("#"):
+        return None
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", clean) or clean.startswith("mailto:"):
+        return None
+
+    clean = clean.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
+    if not clean:
+        return None
+    if clean in source_lookup:
+        return clean
+
+    if clean.startswith("/"):
+        candidate = posixpath.normpath(clean.lstrip("/"))
+    else:
+        parent = posixpath.dirname(source)
+        candidate = posixpath.normpath(posixpath.join(parent, clean))
+    if candidate in source_lookup:
+        return candidate
+
+    basename = posixpath.basename(clean)
+    matches = basename_lookup.get(basename, [])
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _stem_tokens(stem: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[_\-.]", stem.lower())
+        if len(token) >= GRAPH_SHARED_TOKEN_MIN_LENGTH
+    }
+
+
+def _add_graph_edge(
+    edges_by_source: dict[str, dict[str, tuple[int, dict[str, Any]]]],
+    source: str,
+    target: str,
+    kind: str,
+    reason: str,
+) -> None:
+    if not source or not target or source == target:
+        return
+    priority = GRAPH_EDGE_PRIORITY[kind]
+    payload = {"target": target, "kind": kind, "reason": reason}
+    current = edges_by_source[source].get(target)
+    if current is None or priority < current[0]:
+        edges_by_source[source][target] = (priority, payload)
+
+
+def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
+    sources = sorted(indexed.rel_path for indexed in indexed_files)
+    source_lookup = set(sources)
+    basename_lookup: dict[str, list[str]] = {}
+    for source in sources:
+        basename_lookup.setdefault(Path(source).name, []).append(source)
+
+    edges_by_source: dict[str, dict[str, tuple[int, dict[str, Any]]]] = {
+        source: {} for source in sources
+    }
+
+    for indexed in indexed_files:
+        for kind, reference in _iter_local_path_references(indexed.normalized_text):
+            target = _resolve_document_reference(
+                indexed.rel_path,
+                reference,
+                source_lookup,
+                basename_lookup,
+            )
+            if target is None:
+                continue
+            _add_graph_edge(edges_by_source, indexed.rel_path, target, kind, reference)
+
+    token_sources: dict[str, set[str]] = {}
+    for indexed in indexed_files:
+        for token in _extract_shared_tokens(indexed):
+            token_sources.setdefault(token, set()).add(indexed.rel_path)
+
+    for token, matched_sources in token_sources.items():
+        if not 2 <= len(matched_sources) <= GRAPH_SHARED_TOKEN_MAX_DOC_FREQ:
+            continue
+        ordered_sources = sorted(matched_sources)
+        for source in ordered_sources:
+            for target in ordered_sources:
+                if source == target:
+                    continue
+                _add_graph_edge(edges_by_source, source, target, "shared_symbol", token)
+
+    siblings_by_dir: dict[str, list[str]] = {}
+    for source in sources:
+        siblings_by_dir.setdefault(posixpath.dirname(source), []).append(source)
+    for siblings in siblings_by_dir.values():
+        for source in siblings:
+            source_stem = Path(source).stem.lower()
+            source_tokens = _stem_tokens(source_stem)
+            for target in siblings:
+                if source == target:
+                    continue
+                target_stem = Path(target).stem.lower()
+                target_tokens = _stem_tokens(target_stem)
+                shared_tokens = source_tokens & target_tokens
+                if source_stem in target_stem or target_stem in source_stem or len(shared_tokens) >= 2:
+                    _add_graph_edge(
+                        edges_by_source,
+                        source,
+                        target,
+                        "same_series",
+                        ",".join(sorted(shared_tokens)) or target_stem,
+                    )
+
+    neighbors: dict[str, list[dict[str, Any]]] = {}
+    edge_count = 0
+    for source in sources:
+        source_kb = _extract_kb(source)
+        ranked = sorted(
+            edges_by_source[source].values(),
+            key=lambda item: (
+                item[0],
+                0 if _extract_kb(item[1]["target"]) == source_kb else 1,
+                item[1]["target"],
+            ),
+        )
+        selected = [payload for _, payload in ranked[:GRAPH_MAX_NEIGHBORS]]
+        edge_count += len(selected)
+        neighbors[source] = selected
+
+    return {
+        "version": 1,
+        "edge_count": edge_count,
+        "neighbors": neighbors,
+    }
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -900,6 +1152,7 @@ def _write_index_artifacts(
         "source_dir": str(Path(source_dir).expanduser()),
         "normalized_text_dir": NORMALIZED_TEXT_DIRNAME,
         "symbol_index_file": SYMBOL_INDEX_FILENAME,
+        "document_graph_file": DOCUMENT_GRAPH_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "files": [],
     }
@@ -932,6 +1185,13 @@ def _write_index_artifacts(
         )
     elif symbol_index_path.exists():
         symbol_index_path.unlink()
+
+    document_graph = _build_document_graph(indexed_files)
+    document_graph_path = persist_path / DOCUMENT_GRAPH_FILENAME
+    document_graph_path.write_text(
+        json.dumps(document_graph, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     (persist_path / "index_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -1055,6 +1315,7 @@ def load_search_bundle(
     files_by_source = {entry.get("name", ""): entry for entry in files if entry.get("name")}
     normalized_text_dir = Path(persist_dir) / manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME)
     symbol_index_path = Path(persist_dir) / manifest.get("symbol_index_file", SYMBOL_INDEX_FILENAME)
+    document_graph_path = Path(persist_dir) / manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME)
 
     symbol_index: list[dict[str, Any]] = []
     if symbol_index_path.exists():
@@ -1067,6 +1328,16 @@ def load_search_bundle(
             except json.JSONDecodeError:
                 continue
 
+    document_graph: dict[str, Any] = {"version": 1, "edge_count": 0, "neighbors": {}}
+    if document_graph_path.exists():
+        try:
+            document_graph = json.loads(document_graph_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            document_graph = {"version": 1, "edge_count": 0, "neighbors": {}}
+    graph_neighbors = document_graph.get("neighbors", {})
+    if not isinstance(graph_neighbors, dict):
+        graph_neighbors = {}
+
     source_dir = manifest.get("source_dir")
     return SearchBundle(
         vectorstore=vectorstore,
@@ -1077,6 +1348,8 @@ def load_search_bundle(
         files_by_source=files_by_source,
         normalized_text_dir=normalized_text_dir,
         symbol_index=symbol_index,
+        document_graph=document_graph,
+        graph_neighbors=graph_neighbors,
     )
 
 
@@ -1668,6 +1941,135 @@ def _merge_grouped_hits(*grouped_sets: dict[str, list[SearchHit]]) -> dict[str, 
     return merged
 
 
+def _heuristic_expand_candidate_sources(
+    bundle: SearchBundle,
+    seed_sources: list[str],
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+) -> GraphExpansionResult:
+    expanded = set(seed_sources)
+    grouped: dict[Path, list[str]] = {}
+    for source in seed_sources:
+        source_path = Path(source)
+        grouped.setdefault(source_path.parent, []).append(source_path.stem.lower())
+
+    edge_reasons: list[dict[str, Any]] = []
+    for source in _bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources):
+        if source in expanded:
+            continue
+        candidate = Path(source)
+        sibling_stems = grouped.get(candidate.parent)
+        if not sibling_stems:
+            continue
+        stem = candidate.stem.lower()
+        stem_tokens = _stem_tokens(stem)
+        for sibling in sibling_stems:
+            sibling_tokens = _stem_tokens(sibling)
+            shared_tokens = stem_tokens & sibling_tokens
+            if sibling in stem or stem in sibling or len(shared_tokens) >= 2:
+                expanded.add(source)
+                edge_reasons.append(
+                    {
+                        "from": str(candidate.parent / sibling),
+                        "to": source,
+                        "kind": "same_series",
+                        "reason": ",".join(sorted(shared_tokens)) or sibling,
+                        "hop": 1,
+                    }
+                )
+                break
+
+    return GraphExpansionResult(
+        sources=expanded,
+        seed_sources=seed_sources,
+        expanded_sources=[source for source in expanded if source not in seed_sources],
+        edge_reasons=edge_reasons,
+        hops=1 if edge_reasons else 0,
+    )
+
+
+def _expand_candidate_sources_detailed(
+    bundle: SearchBundle,
+    seed_sources: Iterable[str],
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    max_hops: int = 1,
+    max_extra_sources: int = 12,
+) -> GraphExpansionResult:
+    valid_sources = (
+        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
+        if kb is not None or allowed_sources is not None
+        else None
+    )
+    ordered_seeds = [
+        source
+        for source in _dedupe_strings(seed_sources)
+        if valid_sources is None or source in valid_sources
+    ]
+    if not ordered_seeds:
+        return GraphExpansionResult(set(), [], [], [], 0)
+
+    if not bundle.graph_neighbors:
+        return _heuristic_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            kb=kb,
+            allowed_sources=allowed_sources,
+        )
+
+    seen = set(ordered_seeds)
+    expanded_sources: list[str] = []
+    edge_reasons: list[dict[str, Any]] = []
+    queue: deque[tuple[str, int]] = deque((source, 0) for source in ordered_seeds)
+    max_seen = len(ordered_seeds) + max_extra_sources
+
+    while queue and len(seen) < max_seen:
+        current, depth = queue.popleft()
+        if depth >= max_hops:
+            continue
+        for edge in bundle.graph_neighbors.get(current, []):
+            if not isinstance(edge, dict):
+                continue
+            target = str(edge.get("target", "")).strip()
+            if not target or target in seen:
+                continue
+            if valid_sources is not None and target not in valid_sources:
+                continue
+            seen.add(target)
+            expanded_sources.append(target)
+            hop = depth + 1
+            edge_reasons.append(
+                {
+                    "from": current,
+                    "to": target,
+                    "kind": edge.get("kind", ""),
+                    "reason": edge.get("reason", ""),
+                    "hop": hop,
+                }
+            )
+            if len(seen) >= max_seen:
+                break
+            queue.append((target, hop))
+
+    if not expanded_sources:
+        heuristic = _heuristic_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            kb=kb,
+            allowed_sources=allowed_sources,
+        )
+        if heuristic.expanded_sources:
+            return heuristic
+
+    return GraphExpansionResult(
+        sources=seen,
+        seed_sources=ordered_seeds,
+        expanded_sources=expanded_sources,
+        edge_reasons=edge_reasons,
+        hops=max((item["hop"] for item in edge_reasons), default=0),
+    )
+
+
 def _run_search_step(
     question: str,
     bundle: SearchBundle,
@@ -1676,6 +2078,8 @@ def _run_search_step(
     top_k: int,
     allowed_sources: set[str] | None = None,
     step_name: str = "step1",
+    graph_max_hops: int = 1,
+    graph_max_extra_sources: int = 12,
 ) -> SearchStepResult:
     glob_hits = glob_search(bundle, query_plan.path_globs, kb=kb, allowed_sources=allowed_sources)
     glob_scope = _candidate_sources_from_hits(glob_hits)
@@ -1697,13 +2101,26 @@ def _run_search_step(
         )
         grep_fallback_used = True
     ast_hits = ast_search(bundle, query_plan, kb=kb, allowed_sources=allowed_sources)
-    narrowed_vector_scope = _candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4]) or allowed_sources
+    graph_expansion = _expand_candidate_sources_detailed(
+        bundle,
+        _candidate_sources_from_hits(glob_hits[:3], grep_hits[:3], ast_hits[:3]),
+        kb=kb,
+        allowed_sources=allowed_sources,
+        max_hops=graph_max_hops,
+        max_extra_sources=graph_max_extra_sources,
+    )
+    narrowed_vector_scope = _candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4])
+    if graph_expansion.sources:
+        narrowed_vector_scope = narrowed_vector_scope | graph_expansion.sources
+    if not narrowed_vector_scope:
+        narrowed_vector_scope = allowed_sources or set()
+
     vector_hits = vector_search(
         bundle,
         query=query_plan.semantic_query or question,
         kb=kb,
         top_k=max(top_k * 2, 8),
-        candidate_sources=narrowed_vector_scope,
+        candidate_sources=narrowed_vector_scope or None,
     )
 
     grouped = {
@@ -1725,6 +2142,10 @@ def _run_search_step(
         "retrievers": {name: len(hits) for name, hits in grouped.items()},
         "candidate_scope": sorted(narrowed_vector_scope) if narrowed_vector_scope else [],
         "grep_fallback_used": grep_fallback_used,
+        "graph_seed_sources": graph_expansion.seed_sources,
+        "graph_expanded_sources": graph_expansion.expanded_sources,
+        "graph_edge_reasons": graph_expansion.edge_reasons,
+        "graph_hops": graph_expansion.hops,
         "top_sources": [hit.source for hit in fused[:3]],
     }
     return SearchStepResult(grouped_hits=grouped, hits=fused, trace=trace)
@@ -1834,33 +2255,22 @@ def _call_retrieval_planner(
         return None
 
 
-def _expand_candidate_sources(bundle: SearchBundle, seed_sources: set[str]) -> set[str]:
-    if not seed_sources:
-        return set()
-
-    expanded = set(seed_sources)
-    grouped: dict[Path, list[str]] = {}
-    for source in seed_sources:
-        source_path = Path(source)
-        grouped.setdefault(source_path.parent, []).append(source_path.stem.lower())
-
-    for source in _bundle_sources(bundle):
-        if source in expanded:
-            continue
-        candidate = Path(source)
-        sibling_stems = grouped.get(candidate.parent)
-        if not sibling_stems:
-            continue
-        stem = candidate.stem.lower()
-        stem_tokens = {token for token in re.split(r"[_\-\.]", stem) if len(token) >= 2}
-        for sibling in sibling_stems:
-            sibling_tokens = {token for token in re.split(r"[_\-\.]", sibling) if len(token) >= 2}
-            shared_tokens = stem_tokens & sibling_tokens
-            if sibling in stem or stem in sibling or len(shared_tokens) >= 2:
-                expanded.add(source)
-                break
-
-    return expanded
+def _expand_candidate_sources(
+    bundle: SearchBundle,
+    seed_sources: Iterable[str],
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    max_hops: int = 1,
+    max_extra_sources: int = 12,
+) -> set[str]:
+    return _expand_candidate_sources_detailed(
+        bundle,
+        seed_sources,
+        kb=kb,
+        allowed_sources=allowed_sources,
+        max_hops=max_hops,
+        max_extra_sources=max_extra_sources,
+    ).sources
 
 
 def _merge_plans(base: QueryPlan, followup: QueryPlan | None, question: str) -> QueryPlan:
@@ -1960,7 +2370,13 @@ def retrieve(
 
     final_hits = step1_result.hits
     if search_mode == "agentic" and not stopped and _search_max_steps() > 1:
-        expanded_sources = _expand_candidate_sources(search_bundle, {hit.source for hit in step1_result.hits})
+        prefilter_expansion = _expand_candidate_sources_detailed(
+            search_bundle,
+            _dedupe_strings(hit.source for hit in step1_result.hits),
+            kb=kb,
+            max_hops=2,
+            max_extra_sources=20,
+        )
         planner_plan = _call_retrieval_planner(
             question=question,
             hits=step1_result.hits,
@@ -1975,10 +2391,16 @@ def retrieve(
             query_plan=merged_plan,
             kb=kb,
             top_k=top_k,
-            allowed_sources=expanded_sources or None,
+            allowed_sources=prefilter_expansion.sources or None,
             step_name="step2",
+            graph_max_hops=2,
+            graph_max_extra_sources=20,
         )
         step2_result.trace["planner_used"] = planner_plan is not None
+        step2_result.trace["prefilter_graph_seed_sources"] = prefilter_expansion.seed_sources
+        step2_result.trace["prefilter_graph_expanded_sources"] = prefilter_expansion.expanded_sources
+        step2_result.trace["prefilter_graph_edge_reasons"] = prefilter_expansion.edge_reasons
+        step2_result.trace["prefilter_graph_hops"] = prefilter_expansion.hops
         step2_result.trace["stopped"] = True
         step2_result.trace["stop_reason"] = "bounded_agentic_complete"
         trace.append(step2_result.trace)
