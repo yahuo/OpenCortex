@@ -23,6 +23,7 @@
 - **HTTP API** — FastAPI 端点（`/api/ask`、`/api/kbs`、`/api/health`），支持 `search_mode` 和 SSE 流式输出
 - **索引热加载** — 更新文档后重建索引，无需重启服务，刷新页面即生效
 - **Docker 部署** — 将同一知识库以局域网服务形式共享给多人
+- **离线知识产物** — 额外生成 `wiki/`、`community_index.json`、`GRAPH_REPORT.md`、`query note` 和 `lint_report.json`，方便导航和维护
 
 ---
 
@@ -72,6 +73,17 @@ flowchart LR
 2. `ragbot.py` 不只保存 FAISS，还会额外落盘 `index_manifest.json`、`normalized_texts/` 和 `symbol_index.jsonl`，供 hybrid / agentic 检索使用。
 3. `app.py` 只做全量检索，但会监听 `index.faiss` 的 `mtime`，索引更新后自动清理缓存并热加载。
 4. `api.py` 在 FastAPI lifespan 中加载同一套 `SearchBundle`，支持 `kb`、`search_mode`、`stream` 和 `debug` 参数。
+
+### 离线知识产物
+
+除了 FAISS 索引之外，OpenCortex 现在还会生成一组离线产物，帮助你做知识导航和后续维护：
+
+- `wiki/index.md` 和 `wiki/files/*.md`：面向人类的文件导航页
+- `wiki/queries/*.md`：在 UI 中显式点击“保存为知识”后生成的 query note
+- `community_index.json` 和 `reports/GRAPH_REPORT.md`：结构摘要和社区报告
+- `lint_report.json`：wiki 健康检查结果，当前覆盖 `stale_pages`、`orphan_pages`、`missing_links`
+
+这些产物都是“二级知识”，不是最高优先级真相源。运行时回答仍然应优先回到原始文档和引用片段；wiki 和 query note 的价值在于导航、沉淀和复用。
 
 ### 问答链路
 

@@ -213,8 +213,10 @@ def load_structure_summary(
     persist_path = Path(persist_dir)
     community_index_path = persist_path / "community_index.json"
     graph_report_path = persist_path / "reports" / "GRAPH_REPORT.md"
+    lint_report_path = persist_path / "lint_report.json"
 
     community_index: dict[str, Any] | None = None
+    lint_report: dict[str, Any] | None = None
     graph_report = ""
 
     if community_index_path.exists():
@@ -231,10 +233,20 @@ def load_structure_summary(
         except OSError:
             graph_report = ""
 
+    if lint_report_path.exists():
+        try:
+            payload = json.loads(lint_report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            lint_report = payload
+
     return {
         "community_index": community_index,
+        "lint_report": lint_report,
         "graph_report": graph_report,
         "community_index_path": str(community_index_path),
+        "lint_report_path": str(lint_report_path),
         "graph_report_path": str(graph_report_path),
     }
 
@@ -361,6 +373,13 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
     communities = community_index.get("communities", [])
     god_nodes = community_index.get("god_nodes", [])
     bridges = community_index.get("bridges", [])
+    lint_report = summary.get("lint_report")
+    lint_summary = lint_report.get("summary", {}) if isinstance(lint_report, dict) else {}
+    lint_issue_count = sum(
+        int(lint_summary.get(key, 0) or 0)
+        for key in ("stale_pages", "orphan_pages", "missing_links")
+    )
+    lint_report_path = str(summary.get("lint_report_path", "") or "")
     graph_report = str(summary.get("graph_report", "") or "")
     graph_report_path = str(summary.get("graph_report_path", "") or "")
 
@@ -381,6 +400,11 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
             "连接多个上下文的高频枢纽",
         ),
         (
+            "健康检查",
+            str(lint_issue_count),
+            "wiki / query note / 链接的待处理问题",
+        ),
+        (
             "跨社区桥",
             str(len(bridges)),
             "帮助从一个主题跳到另一个主题",
@@ -393,8 +417,8 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
             render_stat_card(label, value, hint)
 
     with st.expander("查看知识结构摘要", expanded=False):
-        st.caption("这些摘要来自离线生成的 community index 和结构报告，不参与本轮检索排序。")
-        tabs = st.tabs(["核心社区", "关键枢纽", "桥接关系", "结构报告"])
+        st.caption("这些摘要来自离线生成的 community index、lint report 和结构报告，不参与本轮检索排序。")
+        tabs = st.tabs(["核心社区", "关键枢纽", "桥接关系", "健康检查", "结构报告"])
 
         with tabs[0]:
             top_communities = [item for item in communities if isinstance(item, dict)][:3]
@@ -464,6 +488,33 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                     st.markdown(f"- `{source}` -> `{target}` · `{kind}`")
 
         with tabs[3]:
+            if lint_issue_count == 0:
+                st.success("当前没有检测到 stale page、orphan page 或 missing link。")
+            else:
+                st.warning(f"当前共有 {lint_issue_count} 个健康检查问题，建议先处理后再依赖 wiki 导航。")
+
+            issue_specs = [
+                ("stale_pages", "过期页面", "page"),
+                ("orphan_pages", "孤儿页面", "page"),
+                ("missing_links", "失效链接", "page"),
+            ]
+            for key, title, page_key in issue_specs:
+                issues = lint_report.get(key, []) if isinstance(lint_report, dict) else []
+                if not issues:
+                    st.markdown(f"**{title}**：0")
+                    continue
+                st.markdown(f"**{title}**：{len(issues)}")
+                for issue in issues[:8]:
+                    if not isinstance(issue, dict):
+                        continue
+                    page = str(issue.get(page_key) or "unknown")
+                    reason = str(issue.get("reason") or issue.get("target") or "")
+                    suffix = f" · `{reason}`" if reason else ""
+                    st.markdown(f"- `{page}`{suffix}")
+            if lint_report_path:
+                st.caption(f"健康检查路径：{lint_report_path}")
+
+        with tabs[4]:
             if graph_report:
                 st.caption(f"结构报告路径：{graph_report_path}")
                 st.markdown(graph_report)
