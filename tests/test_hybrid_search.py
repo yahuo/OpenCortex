@@ -208,6 +208,15 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     graph_report = graph_report_path.read_text(encoding="utf-8")
     assert search_bundle.manifest["graph_report_file"] == "reports/GRAPH_REPORT.md"
     assert "# 图谱报告" in graph_report
+    lint_report_path = search_bundle.persist_dir / "lint_report.json"
+    assert lint_report_path.exists()
+    lint_report = json.loads(lint_report_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["lint_report_file"] == "lint_report.json"
+    assert lint_report["summary"] == {
+        "stale_pages": 0,
+        "orphan_pages": 0,
+        "missing_links": 0,
+    }
     wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
     assert wiki_index_path.exists()
     wiki_index = wiki_index_path.read_text(encoding="utf-8")

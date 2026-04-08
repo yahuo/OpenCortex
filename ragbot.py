@@ -67,6 +67,7 @@ ENTITY_GRAPH_FILENAME = "entity_graph.json"
 COMMUNITY_INDEX_FILENAME = "community_index.json"
 REPORTS_DIRNAME = "reports"
 GRAPH_REPORT_FILENAME = "GRAPH_REPORT.md"
+LINT_REPORT_FILENAME = "lint_report.json"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -2280,6 +2281,7 @@ def _write_index_artifacts(
         "entity_graph_file": ENTITY_GRAPH_FILENAME,
         "community_index_file": COMMUNITY_INDEX_FILENAME,
         "graph_report_file": f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}",
+        "lint_report_file": LINT_REPORT_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "files": [],
     }

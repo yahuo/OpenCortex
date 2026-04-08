@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 import shutil
 from typing import Any
+from urllib.parse import unquote
 
 WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
+LINT_REPORT_FILENAME = "lint_report.json"
 MAX_PREVIEW_LINES = 12
 MAX_PREVIEW_CHARS = 1200
 LINK_TEXT_ESCAPES = str.maketrans({
@@ -212,6 +215,15 @@ def _append_query_note_log(log_path: Path, created_at: datetime, question: str, 
     log_path.write_text(content, encoding="utf-8")
 
 
+def _extract_query_notes_section(log_text: str) -> str:
+    marker = "## Query Notes"
+    if marker not in log_text:
+        return ""
+    _, _, tail = log_text.partition(marker)
+    section = f"{marker}{tail}".strip()
+    return section
+
+
 def _preview_from_normalized_text(normalized_root: Path, normalized_rel: str) -> str:
     normalized_path = normalized_root / normalized_rel
     if not normalized_path.exists():
@@ -302,18 +314,169 @@ def _render_file_page(entry: dict[str, Any], preview: str) -> str:
     return "\n".join(lines)
 
 
-def _render_log(entries: list[dict[str, Any]], build_time: str) -> str:
-    return "\n".join(
-        [
-            "# 知识日志",
-            "",
-            "此文件由构建阶段自动创建，当前作为后续知识沉淀的占位页。",
-            "",
-            f"- 最近构建：`{build_time or 'unknown'}`",
-            f"- 文件总数：`{len(entries)}`",
-            "",
-        ]
-    )
+def _render_log(entries: list[dict[str, Any]], build_time: str, existing_log_text: str = "") -> str:
+    lines = [
+        "# 知识日志",
+        "",
+        "此文件由构建阶段自动创建，用于记录构建产物和显式保存的 query notes。",
+        "",
+        f"- 最近构建：`{build_time or 'unknown'}`",
+        f"- 文件总数：`{len(entries)}`",
+        "",
+    ]
+    query_notes_section = _extract_query_notes_section(existing_log_text)
+    if query_notes_section:
+        lines.extend([query_notes_section, ""])
+    return "\n".join(lines)
+
+
+def _iter_markdown_links(text: str) -> list[str]:
+    links: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    fence_len = 0
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        fence_match = re.match(r"^([`~]{3,})", stripped)
+        if fence_match:
+            marker_run = fence_match.group(1)
+            marker = marker_run[0]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+                fence_len = len(marker_run)
+                continue
+            if marker == fence_marker and len(marker_run) >= fence_len:
+                in_fence = False
+                fence_marker = ""
+                fence_len = 0
+                continue
+        if in_fence:
+            continue
+        links.extend(
+            target.strip()
+            for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", line)
+            if target.strip()
+        )
+    return links
+
+
+def _resolve_local_link(page_path: Path, raw_target: str) -> Path | None:
+    if raw_target.startswith(("http://", "https://", "mailto:")):
+        return None
+    if raw_target.startswith("#"):
+        return None
+    target_path = unquote(raw_target.split("#", 1)[0])
+    if not target_path:
+        return None
+    return (page_path.parent / target_path).resolve()
+
+
+def _page_rel_to_wiki(wiki_dir: Path, page_path: Path) -> str:
+    return page_path.relative_to(wiki_dir).as_posix()
+
+
+def generate_lint_report(
+    persist_path: Path,
+    manifest: dict[str, Any] | None = None,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    wiki_dir = persist_path / WIKI_DIRNAME
+    generated = generated_at or datetime.now().astimezone()
+    report: dict[str, Any] = {
+        "version": 1,
+        "generated_at": generated.isoformat(timespec="seconds"),
+        "summary": {
+            "stale_pages": 0,
+            "orphan_pages": 0,
+            "missing_links": 0,
+        },
+        "stale_pages": [],
+        "orphan_pages": [],
+        "missing_links": [],
+    }
+
+    if not wiki_dir.exists():
+        return report
+
+    markdown_pages = sorted(wiki_dir.rglob("*.md"))
+    inbound_links: set[Path] = set()
+    missing_links: list[dict[str, str]] = []
+    page_set = {page.resolve() for page in markdown_pages}
+
+    for page_path in markdown_pages:
+        text = page_path.read_text(encoding="utf-8")
+        for raw_target in _iter_markdown_links(text):
+            resolved_target = _resolve_local_link(page_path, raw_target)
+            if resolved_target is None:
+                continue
+            if resolved_target in page_set:
+                inbound_links.add(resolved_target)
+                continue
+            if wiki_dir.resolve() in resolved_target.parents or resolved_target == wiki_dir.resolve():
+                missing_links.append(
+                    {
+                        "page": _page_rel_to_wiki(wiki_dir, page_path),
+                        "target": raw_target,
+                    }
+                )
+
+    root_pages = {
+        (wiki_dir / "index.md").resolve(),
+        (wiki_dir / "log.md").resolve(),
+    }
+    orphan_pages = [
+        {
+            "page": _page_rel_to_wiki(wiki_dir, page_path),
+        }
+        for page_path in markdown_pages
+        if page_path.resolve() not in root_pages and page_path.resolve() not in inbound_links
+    ]
+
+    stale_pages: list[dict[str, str]] = []
+    if isinstance(manifest, dict):
+        normalized_root = persist_path / str(
+            manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME) or NORMALIZED_TEXT_DIRNAME
+        )
+        for entry in _iter_file_entries(manifest):
+            source = str(entry["name"])
+            page_path = wiki_dir / _page_relpath_for_source(source)
+            normalized_rel = str(entry.get("normalized_text", "") or "")
+            normalized_path = normalized_root / normalized_rel if normalized_rel else None
+            if not page_path.exists():
+                stale_pages.append(
+                    {
+                        "page": _page_relpath_for_source(source).as_posix(),
+                        "reason": "missing_page",
+                        "source": source,
+                    }
+                )
+                continue
+            if normalized_path is None or not normalized_path.exists():
+                continue
+            page_mtime = page_path.stat().st_mtime
+            normalized_mtime = normalized_path.stat().st_mtime
+            if page_mtime + 1e-6 < normalized_mtime:
+                stale_pages.append(
+                    {
+                        "page": _page_rel_to_wiki(wiki_dir, page_path),
+                        "reason": "normalized_text_newer",
+                        "source": source,
+                    }
+                )
+
+    report["stale_pages"] = stale_pages
+    report["orphan_pages"] = orphan_pages
+    report["missing_links"] = missing_links
+    report["summary"] = {
+        "stale_pages": len(stale_pages),
+        "orphan_pages": len(orphan_pages),
+        "missing_links": len(missing_links),
+    }
+
+    lint_path = persist_path / LINT_REPORT_FILENAME
+    lint_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
 
 
 def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int]:
@@ -325,6 +488,9 @@ def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int
 
     wiki_dir = persist_path / WIKI_DIRNAME
     files_dir = wiki_dir / "files"
+    existing_log_text = ""
+    if (wiki_dir / "log.md").exists():
+        existing_log_text = (wiki_dir / "log.md").read_text(encoding="utf-8")
     if files_dir.exists():
         shutil.rmtree(files_dir)
     files_dir.mkdir(parents=True, exist_ok=True)
@@ -338,8 +504,12 @@ def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int
 
     wiki_dir.mkdir(parents=True, exist_ok=True)
     (wiki_dir / "index.md").write_text(_render_index(entries, build_time), encoding="utf-8")
-    (wiki_dir / "log.md").write_text(_render_log(entries, build_time), encoding="utf-8")
-    return {"pages": len(entries)}
+    (wiki_dir / "log.md").write_text(
+        _render_log(entries, build_time, existing_log_text=existing_log_text),
+        encoding="utf-8",
+    )
+    lint_report = generate_lint_report(persist_path=persist_path, manifest=manifest)
+    return {"pages": len(entries), "lint_issues": sum(int(count) for count in lint_report["summary"].values())}
 
 
 def save_query_note(
@@ -378,6 +548,16 @@ def save_query_note(
 
     log_path = wiki_dir / "log.md"
     _append_query_note_log(log_path, created, question, note_relpath)
+    manifest_path = persist_path / "index_manifest.json"
+    manifest = None
+    if manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            manifest = loaded
+    generate_lint_report(persist_path=persist_path, manifest=manifest, generated_at=created)
     return {
         "note_path": str(note_path),
         "note_relpath": (Path(WIKI_DIRNAME) / note_relpath).as_posix(),
