@@ -107,3 +107,12 @@ def test_build_vectorstore_writes_community_index_with_bridges(
     ]
     assert any("bootstrap_session" in symbols for symbols in top_symbol_sets)
     assert any("archive_report" in symbols for symbols in top_symbol_sets)
+
+    graph_report_path = bundle.persist_dir / "reports" / "GRAPH_REPORT.md"
+    graph_report = graph_report_path.read_text(encoding="utf-8")
+    assert "## God Nodes" in graph_report
+    assert "### community-001: bootstrap_session" in graph_report
+    assert "bootstrap_session @ 工程/bootstrap_session.py" in graph_report
+    assert "archive_report @ 报告/archive_report.py" in graph_report
+    assert "工程/session_notes.md -> 报告/report_notes.md" in graph_report
+    assert "bootstrap_session 在哪里实现？" in graph_report

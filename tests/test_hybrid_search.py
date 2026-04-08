@@ -203,6 +203,11 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert search_bundle.manifest["community_index_file"] == "community_index.json"
     assert community_index["community_count"] >= 1
     assert community_index["file_to_community"]["工程/session_playbook.md"].startswith("community-")
+    graph_report_path = search_bundle.persist_dir / "reports" / "GRAPH_REPORT.md"
+    assert graph_report_path.exists()
+    graph_report = graph_report_path.read_text(encoding="utf-8")
+    assert search_bundle.manifest["graph_report_file"] == "reports/GRAPH_REPORT.md"
+    assert "# 图谱报告" in graph_report
     wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
     assert wiki_index_path.exists()
     wiki_index = wiki_index_path.read_text(encoding="utf-8")

@@ -65,6 +65,8 @@ SYMBOL_INDEX_FILENAME = "symbol_index.jsonl"
 DOCUMENT_GRAPH_FILENAME = "document_graph.json"
 ENTITY_GRAPH_FILENAME = "entity_graph.json"
 COMMUNITY_INDEX_FILENAME = "community_index.json"
+REPORTS_DIRNAME = "reports"
+GRAPH_REPORT_FILENAME = "GRAPH_REPORT.md"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -2137,6 +2139,119 @@ def _build_community_index(
     }
 
 
+def _format_report_list(items: list[str], empty_text: str) -> list[str]:
+    if not items:
+        return [f"- {empty_text}"]
+    return [f"- {item}" for item in items]
+
+
+def _render_graph_report(
+    community_index: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    build_time = str(manifest.get("build_time", "") or "unknown")
+    source_dir = str(manifest.get("source_dir", "") or "unknown")
+    file_count = int(community_index.get("file_count") or 0)
+    relationship_count = int(community_index.get("relationship_count") or 0)
+    community_count = int(community_index.get("community_count") or 0)
+    communities = community_index.get("communities", [])
+    god_nodes = community_index.get("god_nodes", [])
+    bridges = community_index.get("bridges", [])
+
+    lines = [
+        "# 图谱报告",
+        "",
+        "此报告由构建阶段自动生成，当前用于帮助理解知识库结构。",
+        "",
+        f"- 最近构建：{build_time}",
+        f"- 源目录：{source_dir}",
+        f"- 文件总数：{file_count}",
+        f"- 社区数量：{community_count}",
+        f"- 关系总数：{relationship_count}",
+        "",
+        "## God Nodes",
+        "",
+    ]
+
+    god_node_lines = [
+        f"{item.get('source', '')} (degree={item.get('degree', 0)})"
+        for item in god_nodes
+        if isinstance(item, dict) and item.get("source")
+    ]
+    lines.extend(_format_report_list(god_node_lines, "暂无显著 hub 节点"))
+    lines.extend(["", "## 社区概览", ""])
+
+    if not isinstance(communities, list) or not communities:
+        lines.extend(["- 暂无社区数据", ""])
+    else:
+        for community in communities:
+            if not isinstance(community, dict):
+                continue
+            community_id = str(community.get("id", "") or "community")
+            label = str(community.get("label", "") or community_id)
+            size = int(community.get("size") or 0)
+            kbs = ", ".join(str(item) for item in community.get("kbs", []) if item) or "未分类"
+            lines.extend(
+                [
+                    f"### {community_id}: {label}",
+                    "",
+                    f"- 文件数：{size}",
+                    f"- 知识库：{kbs}",
+                    "- Top Files:",
+                ]
+            )
+            top_file_lines = [
+                f"{item.get('source', '')} (degree={item.get('degree', 0)})"
+                for item in community.get("top_files", [])
+                if isinstance(item, dict) and item.get("source")
+            ]
+            lines.extend(_format_report_list(top_file_lines, "暂无文件摘要"))
+            lines.append("- Top Symbols:")
+            top_symbol_lines = [
+                f"{item.get('name', '')} @ {item.get('source', '')} (score={item.get('score', 0)})"
+                for item in community.get("top_symbols", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            lines.extend(_format_report_list(top_symbol_lines, "暂无符号摘要"))
+            lines.append("- Suggested Questions:")
+            suggested_query_lines = [
+                str(item)
+                for item in community.get("suggested_queries", [])
+                if isinstance(item, str) and item
+            ]
+            lines.extend(_format_report_list(suggested_query_lines, "暂无建议问题"))
+            lines.append("")
+
+    lines.extend(["## 跨社区连接", ""])
+    bridge_lines: list[str] = []
+    if isinstance(bridges, list):
+        for bridge in bridges:
+            if not isinstance(bridge, dict):
+                continue
+            source_community = str(bridge.get("source_community", "") or "?")
+            target_community = str(bridge.get("target_community", "") or "?")
+            kind = str(bridge.get("kind", "") or "unknown")
+            source = str(bridge.get("source", "") or "")
+            target = str(bridge.get("target", "") or "")
+            reason = str(bridge.get("reason", "") or "")
+            origin = str(bridge.get("origin", "") or "")
+            bridge_summary = ""
+            raw_bridge_entities = bridge.get("bridges", [])
+            if isinstance(raw_bridge_entities, list) and raw_bridge_entities:
+                names = [
+                    str(item.get("name", "") or item.get("id", ""))
+                    for item in raw_bridge_entities
+                    if isinstance(item, dict)
+                ]
+                bridge_summary = f" | bridges: {', '.join(name for name in names if name)}" if names else ""
+            bridge_lines.append(
+                f"{source_community} -> {target_community} | {kind} | {source} -> {target} | reason: {reason} | origin: {origin}{bridge_summary}"
+            )
+    lines.extend(_format_report_list(bridge_lines, "暂无跨社区连接"))
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -2164,6 +2279,7 @@ def _write_index_artifacts(
         "document_graph_file": DOCUMENT_GRAPH_FILENAME,
         "entity_graph_file": ENTITY_GRAPH_FILENAME,
         "community_index_file": COMMUNITY_INDEX_FILENAME,
+        "graph_report_file": f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}",
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "files": [],
     }
@@ -2219,6 +2335,14 @@ def _write_index_artifacts(
     community_index_path = persist_path / COMMUNITY_INDEX_FILENAME
     community_index_path.write_text(
         json.dumps(community_index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    reports_dir = persist_path / REPORTS_DIRNAME
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    graph_report_path = reports_dir / GRAPH_REPORT_FILENAME
+    graph_report_path.write_text(
+        _render_graph_report(community_index, manifest),
         encoding="utf-8",
     )
 
