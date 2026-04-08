@@ -75,6 +75,11 @@ def _stream_response(result: dict):
             "event": "sources",
             "data": json.dumps(result["sources"], ensure_ascii=False),
         }
+        if result.get("bridge_entities") is not None:
+            yield {
+                "event": "bridge_entities",
+                "data": json.dumps(result["bridge_entities"], ensure_ascii=False),
+            }
         if result.get("search_trace") is not None:
             yield {
                 "event": "search_trace",
@@ -130,6 +135,7 @@ def ask(req: AskRequest):
         answer = "".join(result["answer_stream"])
         payload = {"answer": answer, "sources": result["sources"]}
         if req.debug:
+            payload["bridge_entities"] = result.get("bridge_entities", [])
             payload["search_trace"] = result.get("search_trace", [])
         return payload
 

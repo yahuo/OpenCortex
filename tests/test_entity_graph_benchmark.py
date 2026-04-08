@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -88,32 +89,6 @@ def _write_entity_benchmark_corpus(root: Path, cases: list[dict[str, str]]) -> N
         code_path.write_text(_code_fixture_for_target(target_source, symbol), encoding="utf-8")
 
 
-def _entity_graph_file_targets(bundle: ragbot.SearchBundle, seed_source: str) -> set[str]:
-    start_nodes = {
-        node_id
-        for node_id, node in bundle.entity_nodes_by_id.items()
-        if node.get("source") == seed_source and node.get("type") in {"file", "section"}
-    }
-    targets: set[str] = set()
-    for start_node in start_nodes:
-        for edge in bundle.entity_edges_by_source.get(start_node, []):
-            target = bundle.entity_nodes_by_id.get(edge["target"])
-            if not target:
-                continue
-            target_source = str(target.get("source", "") or "")
-            if target.get("type") in {"file", "symbol"} and target_source:
-                targets.add(target_source)
-    return targets
-
-
-def _document_graph_file_targets(bundle: ragbot.SearchBundle, seed_source: str) -> set[str]:
-    return {
-        str(edge.get("target", "") or "")
-        for edge in bundle.graph_neighbors.get(seed_source, [])
-        if edge.get("target")
-    }
-
-
 def test_entity_graph_benchmark_establishes_gain_baseline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -132,6 +107,12 @@ def test_entity_graph_benchmark_establishes_gain_baseline(
         embed_api_key="fake-key",
         persist_dir=str(index_dir),
     )
+    doc_only_bundle = replace(
+        bundle,
+        entity_graph={"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []},
+        entity_nodes_by_id={},
+        entity_edges_by_source={},
+    )
 
     gained_case_ids: list[str] = []
     missing_entity_targets: list[str] = []
@@ -139,8 +120,20 @@ def test_entity_graph_benchmark_establishes_gain_baseline(
     for case in cases:
         seed_source = case["seed_source"]
         expected_target = case["target_source"]
-        doc_targets = _document_graph_file_targets(bundle, seed_source)
-        entity_targets = _entity_graph_file_targets(bundle, seed_source)
+        doc_targets = ragbot._expand_candidate_sources_detailed(
+            doc_only_bundle,
+            [seed_source],
+            max_hops=1,
+            max_extra_sources=12,
+        ).sources
+        entity_expansion = ragbot._expand_candidate_sources_detailed(
+            bundle,
+            [seed_source],
+            max_hops=1,
+            max_extra_sources=12,
+        )
+        entity_targets = entity_expansion.sources
+        assert entity_expansion.strategy == "entity_graph"
 
         if expected_target not in entity_targets:
             missing_entity_targets.append(case["id"])

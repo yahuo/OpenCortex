@@ -81,6 +81,14 @@ GRAPH_EDGE_PRIORITY = {
     "shared_symbol": 2,
     "same_series": 3,
 }
+ENTITY_EXPANSION_PRIORITY = {
+    "references": 0,
+    "imports": 1,
+    "links_to": 2,
+    "mentions_path": 3,
+    "shared_symbol": 4,
+    "same_series": 5,
+}
 ENTITY_INFERRED_EDGE_TYPES = {"shared_symbol", "same_series"}
 GRAPH_STOPWORDS = {
     "this",
@@ -216,6 +224,8 @@ class GraphExpansionResult:
     expanded_sources: list[str]
     edge_reasons: list[dict[str, Any]]
     hops: int = 0
+    strategy: str = "heuristic"
+    bridge_entities: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -1649,6 +1659,148 @@ def _normalize_entity_edge_payload(payload: dict[str, Any]) -> dict[str, Any] | 
     return normalized
 
 
+def _entity_bridge_payload(node: dict[str, Any], relation: str = "") -> dict[str, Any]:
+    payload = {
+        "id": str(node.get("id", "")),
+        "type": str(node.get("type", "")),
+        "name": str(node.get("qualified_name") or node.get("name") or ""),
+        "source": str(node.get("source", "") or ""),
+    }
+    if node.get("line_start") is not None:
+        payload["line_start"] = node.get("line_start")
+    if node.get("line_end") is not None:
+        payload["line_end"] = node.get("line_end")
+    if relation:
+        payload["relation"] = relation
+    return payload
+
+
+def _add_bridge_entity(
+    bridge_entities: list[dict[str, Any]],
+    seen: set[tuple[str, str]],
+    payload: dict[str, Any],
+) -> None:
+    entity_id = str(payload.get("id", ""))
+    relation = str(payload.get("relation", ""))
+    key = (entity_id, relation)
+    if not entity_id or key in seen:
+        return
+    seen.add(key)
+    bridge_entities.append(payload)
+
+
+def _entity_expansion_priority(kind: str) -> int:
+    return ENTITY_EXPANSION_PRIORITY.get(kind, len(ENTITY_EXPANSION_PRIORITY) + 10)
+
+
+def _entity_file_neighbors(
+    bundle: SearchBundle,
+    source: str,
+    valid_sources: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    source = _normalize_source_path(source)
+    file_node_id = _entity_file_node_id(source)
+    if not source or file_node_id not in bundle.entity_nodes_by_id:
+        return []
+
+    source_kb = _extract_kb(source)
+    best_by_target: dict[str, tuple[tuple[int, int, str], dict[str, Any]]] = {}
+
+    def consider(
+        target_source: str,
+        kind: str,
+        reason: str,
+        bridges: list[dict[str, Any]],
+    ) -> None:
+        target_source = _normalize_source_path(target_source)
+        if not target_source or target_source == source:
+            return
+        if valid_sources is not None and target_source not in valid_sources:
+            return
+        priority = (
+            _entity_expansion_priority(kind),
+            0 if _extract_kb(target_source) == source_kb else 1,
+            target_source,
+        )
+        payload = {
+            "to": target_source,
+            "kind": kind,
+            "reason": reason,
+            "bridges": bridges,
+        }
+        current = best_by_target.get(target_source)
+        if current is None or priority < current[0]:
+            best_by_target[target_source] = (priority, payload)
+
+    def target_node_for(edge: dict[str, Any]) -> dict[str, Any] | None:
+        target_id = str(edge.get("target", "") or "")
+        return bundle.entity_nodes_by_id.get(target_id)
+
+    for edge in bundle.entity_edges_by_source.get(file_node_id, []):
+        target_node = target_node_for(edge)
+        if not target_node:
+            continue
+        edge_kind = str(edge.get("type", "") or "")
+        edge_reason = str(edge.get("reason", "") or "")
+        target_type = str(target_node.get("type", "") or "")
+
+        if target_type == "file":
+            consider(
+                target_source=str(target_node.get("source", "") or ""),
+                kind=edge_kind,
+                reason=edge_reason,
+                bridges=[],
+            )
+            continue
+
+        if target_type == "section":
+            section_bridge = _entity_bridge_payload(target_node, relation=edge_kind or "contains")
+            for section_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
+                section_target = target_node_for(section_edge)
+                if not section_target:
+                    continue
+                section_kind = str(section_edge.get("type", "") or "")
+                section_reason = str(section_edge.get("reason", "") or "")
+                section_target_type = str(section_target.get("type", "") or "")
+                if section_target_type == "file":
+                    consider(
+                        target_source=str(section_target.get("source", "") or ""),
+                        kind=section_kind,
+                        reason=section_reason,
+                        bridges=[section_bridge],
+                    )
+                elif section_target_type == "symbol":
+                    symbol_bridge = _entity_bridge_payload(section_target, relation=section_kind)
+                    consider(
+                        target_source=str(section_target.get("source", "") or ""),
+                        kind=section_kind,
+                        reason=section_reason,
+                        bridges=[section_bridge, symbol_bridge],
+                    )
+            continue
+
+        if target_type == "symbol":
+            symbol_bridge = _entity_bridge_payload(target_node, relation=edge_kind or "defines")
+            for symbol_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
+                symbol_target = target_node_for(symbol_edge)
+                if not symbol_target or str(symbol_target.get("type", "") or "") != "file":
+                    continue
+                consider(
+                    target_source=str(symbol_target.get("source", "") or ""),
+                    kind=str(symbol_edge.get("type", "") or ""),
+                    reason=str(symbol_edge.get("reason", "") or ""),
+                    bridges=[symbol_bridge],
+                )
+
+    return [
+        payload
+        for _, payload in sorted(
+            best_by_target.values(),
+            key=lambda item: item[0],
+        )
+    ]
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -2638,38 +2790,17 @@ def _heuristic_expand_candidate_sources(
         expanded_sources=[source for source in expanded if source not in seed_sources],
         edge_reasons=edge_reasons,
         hops=1 if edge_reasons else 0,
+        strategy="heuristic",
     )
 
 
-def _expand_candidate_sources_detailed(
+def _document_graph_expand_candidate_sources(
     bundle: SearchBundle,
-    seed_sources: Iterable[str],
-    kb: str | None = None,
-    allowed_sources: set[str] | None = None,
-    max_hops: int = 1,
-    max_extra_sources: int = 12,
+    ordered_seeds: list[str],
+    valid_sources: set[str] | None,
+    max_hops: int,
+    max_extra_sources: int,
 ) -> GraphExpansionResult:
-    valid_sources = (
-        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
-        if kb is not None or allowed_sources is not None
-        else None
-    )
-    ordered_seeds = [
-        source
-        for source in _dedupe_strings(seed_sources)
-        if valid_sources is None or source in valid_sources
-    ]
-    if not ordered_seeds:
-        return GraphExpansionResult(set(), [], [], [], 0)
-
-    if not bundle.graph_neighbors:
-        return _heuristic_expand_candidate_sources(
-            bundle,
-            ordered_seeds,
-            kb=kb,
-            allowed_sources=allowed_sources,
-        )
-
     seen = set(ordered_seeds)
     expanded_sources: list[str] = []
     edge_reasons: list[dict[str, Any]] = []
@@ -2704,15 +2835,58 @@ def _expand_candidate_sources_detailed(
                 break
             queue.append((target, hop))
 
-    if not expanded_sources:
-        heuristic = _heuristic_expand_candidate_sources(
-            bundle,
-            ordered_seeds,
-            kb=kb,
-            allowed_sources=allowed_sources,
-        )
-        if heuristic.expanded_sources:
-            return heuristic
+    return GraphExpansionResult(
+        sources=seen,
+        seed_sources=ordered_seeds,
+        expanded_sources=expanded_sources,
+        edge_reasons=edge_reasons,
+        hops=max((item["hop"] for item in edge_reasons), default=0),
+        strategy="document_graph",
+    )
+
+
+def _entity_graph_expand_candidate_sources(
+    bundle: SearchBundle,
+    ordered_seeds: list[str],
+    valid_sources: set[str] | None,
+    max_hops: int,
+    max_extra_sources: int,
+) -> GraphExpansionResult:
+    seen = set(ordered_seeds)
+    expanded_sources: list[str] = []
+    edge_reasons: list[dict[str, Any]] = []
+    bridge_entities: list[dict[str, Any]] = []
+    seen_bridges: set[tuple[str, str]] = set()
+    queue: deque[tuple[str, int]] = deque((source, 0) for source in ordered_seeds)
+    max_seen = len(ordered_seeds) + max_extra_sources
+
+    while queue and len(seen) < max_seen:
+        current, depth = queue.popleft()
+        if depth >= max_hops:
+            continue
+        for neighbor in _entity_file_neighbors(bundle, current, valid_sources=valid_sources):
+            target = str(neighbor.get("to", "")).strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            expanded_sources.append(target)
+            hop = depth + 1
+            bridges = list(neighbor.get("bridges") or [])
+            for bridge in bridges:
+                _add_bridge_entity(bridge_entities, seen_bridges, bridge)
+            edge_reasons.append(
+                {
+                    "from": current,
+                    "to": target,
+                    "kind": neighbor.get("kind", ""),
+                    "reason": neighbor.get("reason", ""),
+                    "hop": hop,
+                    "bridges": bridges,
+                }
+            )
+            if len(seen) >= max_seen:
+                break
+            queue.append((target, hop))
 
     return GraphExpansionResult(
         sources=seen,
@@ -2720,6 +2894,59 @@ def _expand_candidate_sources_detailed(
         expanded_sources=expanded_sources,
         edge_reasons=edge_reasons,
         hops=max((item["hop"] for item in edge_reasons), default=0),
+        strategy="entity_graph",
+        bridge_entities=bridge_entities,
+    )
+
+
+def _expand_candidate_sources_detailed(
+    bundle: SearchBundle,
+    seed_sources: Iterable[str],
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    max_hops: int = 1,
+    max_extra_sources: int = 12,
+) -> GraphExpansionResult:
+    valid_sources = (
+        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
+        if kb is not None or allowed_sources is not None
+        else None
+    )
+    ordered_seeds = [
+        source
+        for source in _dedupe_strings(seed_sources)
+        if valid_sources is None or source in valid_sources
+    ]
+    if not ordered_seeds:
+        return GraphExpansionResult(set(), [], [], [], 0)
+
+    if bundle.entity_edges_by_source and bundle.entity_nodes_by_id:
+        entity_result = _entity_graph_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            valid_sources=valid_sources,
+            max_hops=max_hops,
+            max_extra_sources=max_extra_sources,
+        )
+        if entity_result.expanded_sources:
+            return entity_result
+
+    if bundle.graph_neighbors:
+        document_result = _document_graph_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            valid_sources=valid_sources,
+            max_hops=max_hops,
+            max_extra_sources=max_extra_sources,
+        )
+        if document_result.expanded_sources:
+            return document_result
+
+    return _heuristic_expand_candidate_sources(
+        bundle,
+        ordered_seeds,
+        kb=kb,
+        allowed_sources=allowed_sources,
     )
 
 
@@ -2795,9 +3022,11 @@ def _run_search_step(
         "retrievers": {name: len(hits) for name, hits in grouped.items()},
         "candidate_scope": sorted(narrowed_vector_scope) if narrowed_vector_scope else [],
         "grep_fallback_used": grep_fallback_used,
+        "graph_strategy": graph_expansion.strategy,
         "graph_seed_sources": graph_expansion.seed_sources,
         "graph_expanded_sources": graph_expansion.expanded_sources,
         "graph_edge_reasons": graph_expansion.edge_reasons,
+        "graph_bridge_entities": graph_expansion.bridge_entities,
         "graph_hops": graph_expansion.hops,
         "top_sources": [hit.source for hit in fused[:3]],
     }
@@ -2961,6 +3190,20 @@ def _sources_from_hits(results: list[SearchHit]) -> list[dict[str, Any]]:
     return sources
 
 
+def _collect_bridge_entities(search_trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bridge_entities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for step in search_trace:
+        raw_entities = step.get("graph_bridge_entities", [])
+        if not isinstance(raw_entities, list):
+            continue
+        for raw_entity in raw_entities:
+            if not isinstance(raw_entity, dict):
+                continue
+            _add_bridge_entity(bridge_entities, seen, raw_entity)
+    return bridge_entities
+
+
 def _build_context_and_sources(results: list[SearchHit]) -> tuple[str, list[dict[str, Any]]]:
     context_parts = []
     for index, hit in enumerate(results, start=1):
@@ -3001,11 +3244,19 @@ def retrieve(
                 "retrievers": {"vector": len(vector_hits)},
                 "candidate_scope": [],
                 "top_sources": [hit.source for hit in vector_hits[:3]],
+                "graph_strategy": "disabled",
+                "graph_bridge_entities": [],
                 "stopped": True,
                 "stop_reason": "vector_mode",
             }
         )
-        return {"hits": vector_hits, "context": context, "sources": sources, "search_trace": trace}
+        return {
+            "hits": vector_hits,
+            "context": context,
+            "sources": sources,
+            "search_trace": trace,
+            "bridge_entities": [],
+        }
 
     step1_result = _run_search_step(
         question=question,
@@ -3053,6 +3304,8 @@ def retrieve(
         step2_result.trace["prefilter_graph_seed_sources"] = prefilter_expansion.seed_sources
         step2_result.trace["prefilter_graph_expanded_sources"] = prefilter_expansion.expanded_sources
         step2_result.trace["prefilter_graph_edge_reasons"] = prefilter_expansion.edge_reasons
+        step2_result.trace["prefilter_graph_strategy"] = prefilter_expansion.strategy
+        step2_result.trace["prefilter_graph_bridge_entities"] = prefilter_expansion.bridge_entities
         step2_result.trace["prefilter_graph_hops"] = prefilter_expansion.hops
         step2_result.trace["stopped"] = True
         step2_result.trace["stop_reason"] = "bounded_agentic_complete"
@@ -3063,11 +3316,13 @@ def retrieve(
         )
 
     context, sources = _build_context_and_sources(final_hits)
+    bridge_entities = _collect_bridge_entities(trace)
     return {
         "hits": final_hits,
         "context": context,
         "sources": sources,
         "search_trace": trace,
+        "bridge_entities": bridge_entities,
     }
 
 
@@ -3142,4 +3397,5 @@ def ask_stream(
     }
     if debug:
         result["search_trace"] = retrieval["search_trace"]
+        result["bridge_entities"] = retrieval.get("bridge_entities", [])
     return result

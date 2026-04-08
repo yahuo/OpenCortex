@@ -196,6 +196,11 @@ def render_search_trace(search_trace: list[dict]) -> None:
             st.json(step, expanded=False)
 
 
+def render_bridge_entities(bridge_entities: list[dict]) -> None:
+    with st.expander("查看桥接实体"):
+        st.json(bridge_entities, expanded=False)
+
+
 init_session_state()
 cfg = read_runtime_config()
 inject_global_css()
@@ -261,6 +266,8 @@ for msg in st.session_state.rag_messages:
         st.markdown(msg["content"])
         if msg.get("sources"):
             render_sources(msg["sources"])
+        if msg.get("bridge_entities"):
+            render_bridge_entities(msg["bridge_entities"])
         if msg.get("search_trace"):
             render_search_trace(msg["search_trace"])
 
@@ -284,6 +291,7 @@ if question := st.chat_input("输入问题..."):
             )
             sources = result["sources"]
             base_stream = result["answer_stream"]
+            bridge_entities = result.get("bridge_entities", [])
             search_trace = result.get("search_trace", [])
 
             def stream_with_status():
@@ -299,12 +307,15 @@ if question := st.chat_input("输入问题..."):
         except Exception as exc:
             answer = f"问答失败：{exc}"
             sources = []
+            bridge_entities = []
             search_trace = []
             status_placeholder.empty()
             st.markdown(answer)
 
         if sources:
             render_sources(sources)
+        if bridge_entities:
+            render_bridge_entities(bridge_entities)
         if search_trace:
             render_search_trace(search_trace)
 
@@ -313,6 +324,7 @@ if question := st.chat_input("输入问题..."):
             "role": "assistant",
             "content": answer,
             "sources": sources,
+            "bridge_entities": bridge_entities,
             "search_trace": search_trace,
         }
     )

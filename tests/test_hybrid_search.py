@@ -862,6 +862,133 @@ def test_ask_stream_debug_includes_trace(search_bundle, monkeypatch):
     assert "".join(result["answer_stream"]) == "mock answer"
 
 
+def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeLLM(*args, **kwargs))
+    monkeypatch.setattr(
+        ragbot,
+        "retrieve",
+        lambda *args, **kwargs: {
+            "hits": [],
+            "context": "ctx",
+            "sources": [],
+            "search_trace": [
+                {
+                    "step": "step1",
+                    "graph_bridge_entities": [
+                        {
+                            "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                            "type": "symbol",
+                            "name": "bootstrap_session",
+                            "source": "工程/bootstrap_session.py",
+                            "relation": "references",
+                        }
+                    ],
+                }
+            ],
+            "bridge_entities": [
+                {
+                    "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                    "type": "symbol",
+                    "name": "bootstrap_session",
+                    "source": "工程/bootstrap_session.py",
+                    "relation": "references",
+                }
+            ],
+        },
+    )
+
+    result = ragbot.ask_stream(
+        question="bootstrap_session 在哪",
+        search_bundle=search_bundle,
+        llm_api_key="fake-key",
+        llm_model="fake-model",
+        llm_base_url="https://example.com",
+        search_mode="agentic",
+        debug=True,
+    )
+
+    assert "bridge_entities" in result
+    assert result["bridge_entities"][0]["name"] == "bootstrap_session"
+
+
+def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
+    fake_vectorstore = SimpleNamespace(index=SimpleNamespace(ntotal=0))
+    files = [
+        {"name": "工程/guide.md", "kb": "工程", "normalized_text": "工程/guide.md.txt"},
+        {"name": "工程/bootstrap_session.py", "kb": "工程", "normalized_text": "工程/bootstrap_session.py.txt"},
+    ]
+    bundle = ragbot.SearchBundle(
+        vectorstore=fake_vectorstore,
+        persist_dir=tmp_path,
+        source_dir=None,
+        manifest={"files": files},
+        files=files,
+        files_by_source={entry["name"]: entry for entry in files},
+        normalized_text_dir=tmp_path,
+        symbol_index=[],
+        document_graph={"version": 1, "edge_count": 0, "neighbors": {}},
+        graph_neighbors={},
+        entity_graph={"version": 1, "node_count": 4, "edge_count": 2, "nodes": [], "edges": []},
+        entity_nodes_by_id={
+            "file:工程/guide.md": {
+                "id": "file:工程/guide.md",
+                "type": "file",
+                "name": "guide.md",
+                "source": "工程/guide.md",
+            },
+            "section:工程/guide.md:0": {
+                "id": "section:工程/guide.md:0",
+                "type": "section",
+                "name": "Guide",
+                "source": "工程/guide.md",
+                "line_start": 1,
+                "line_end": 3,
+            },
+            "symbol:工程/bootstrap_session.py:bootstrap_session:4": {
+                "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                "type": "symbol",
+                "name": "bootstrap_session",
+                "qualified_name": "bootstrap_session",
+                "source": "工程/bootstrap_session.py",
+                "line_start": 4,
+                "line_end": 7,
+            },
+            "file:工程/bootstrap_session.py": {
+                "id": "file:工程/bootstrap_session.py",
+                "type": "file",
+                "name": "bootstrap_session.py",
+                "source": "工程/bootstrap_session.py",
+            },
+        },
+        entity_edges_by_source={
+            "file:工程/guide.md": [
+                {
+                    "source": "file:工程/guide.md",
+                    "target": "section:工程/guide.md:0",
+                    "type": "contains",
+                    "reason": "Guide",
+                }
+            ],
+            "section:工程/guide.md:0": [
+                {
+                    "source": "section:工程/guide.md:0",
+                    "target": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                    "type": "references",
+                    "reason": "bootstrap_session",
+                }
+            ],
+        },
+    )
+
+    expansion = ragbot._expand_candidate_sources_detailed(bundle, ["工程/guide.md"])
+
+    assert expansion.strategy == "entity_graph"
+    assert "工程/bootstrap_session.py" in expansion.sources
+    assert expansion.expanded_sources == ["工程/bootstrap_session.py"]
+    assert any(entity["name"] == "bootstrap_session" for entity in expansion.bridge_entities)
+    assert expansion.edge_reasons[0]["bridges"]
+
+
 def test_grep_scope_falls_back_to_broader_allowed_sources(search_bundle):
     query_plan = ragbot.QueryPlan(
         symbols=[],
@@ -942,6 +1069,9 @@ def test_expand_candidate_sources_requires_stronger_token_overlap(search_bundle,
         ],
     )
     monkeypatch.setattr(search_bundle, "graph_neighbors", {})
+    monkeypatch.setattr(search_bundle, "entity_graph", {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []})
+    monkeypatch.setattr(search_bundle, "entity_nodes_by_id", {})
+    monkeypatch.setattr(search_bundle, "entity_edges_by_source", {})
 
     expanded = ragbot._expand_candidate_sources(search_bundle, {"工程/bootstrap_session.py"})
 
