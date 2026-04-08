@@ -168,6 +168,13 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert entity_graph_path.exists()
     entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
     assert search_bundle.manifest["entity_graph_file"] == "entity_graph.json"
+    assert search_bundle.entity_graph["node_count"] == len(search_bundle.entity_graph["nodes"])
+    assert "file:工程/bootstrap_session.py" in search_bundle.entity_nodes_by_id
+    assert any(
+        edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        and edge["type"] == "references"
+        for edge in search_bundle.entity_edges_by_source["section:工程/session_playbook.md:0"]
+    )
     assert any(
         node["type"] == "file" and node["source"] == "工程/bootstrap_session.py"
         for node in entity_graph["nodes"]
@@ -200,6 +207,63 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert "- 知识库：`工程`" in wiki_file
     assert "bootstrap_session.py" in wiki_file
     assert (search_bundle.persist_dir / "wiki" / "log.md").exists()
+
+
+def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: pytest.MonkeyPatch):
+    entity_graph_path = search_bundle.persist_dir / "entity_graph.json"
+    entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+
+    def rewrite_node_id(node_id: str) -> str:
+        return node_id.replace("/", "\\")
+
+    for node in entity_graph["nodes"]:
+        if isinstance(node.get("id"), str):
+            node["id"] = rewrite_node_id(node["id"])
+        for key in ("source", "file", "path"):
+            value = node.get(key)
+            if isinstance(value, str):
+                node[key] = value.replace("/", "\\")
+
+    duplicated_edge = None
+    for edge in entity_graph["edges"]:
+        if isinstance(edge.get("source"), str):
+            edge["source"] = rewrite_node_id(edge["source"])
+        if isinstance(edge.get("target"), str):
+            edge["target"] = rewrite_node_id(edge["target"])
+        evidence = edge.get("evidence")
+        if isinstance(evidence, dict) and isinstance(evidence.get("source"), str):
+            evidence["source"] = evidence["source"].replace("/", "\\")
+        if (
+            duplicated_edge is None
+            and edge.get("source") == "section:工程\\session_playbook.md:0"
+            and edge.get("target") == "symbol:工程\\bootstrap_session.py:bootstrap_session:4"
+            and edge.get("type") == "references"
+        ):
+            duplicated_edge = json.loads(json.dumps(edge, ensure_ascii=False))
+
+    assert duplicated_edge is not None
+    entity_graph["edges"].append(duplicated_edge)
+    entity_graph_path.write_text(json.dumps(entity_graph, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    reloaded = ragbot.load_search_bundle(
+        embed_api_key="fake-key",
+        persist_dir=str(search_bundle.persist_dir),
+    )
+
+    assert reloaded is not None
+    assert "file:工程/bootstrap_session.py" in reloaded.entity_nodes_by_id
+    assert all("\\" not in node["id"] for node in reloaded.entity_graph["nodes"])
+    assert all("\\" not in node.get("source", "") for node in reloaded.entity_graph["nodes"])
+    section_edges = reloaded.entity_edges_by_source["section:工程/session_playbook.md:0"]
+    assert sum(
+        1
+        for edge in section_edges
+        if edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        and edge["type"] == "references"
+    ) == 1
+    assert all("\\" not in edge["source"] for edge in reloaded.entity_graph["edges"])
+    assert all("\\" not in edge["target"] for edge in reloaded.entity_graph["edges"])
 
 
 def test_generate_wiki_escapes_markdown_link_metacharacters(tmp_path: Path):

@@ -245,6 +245,9 @@ class SearchBundle:
     symbol_index: list[dict[str, Any]]
     document_graph: dict[str, Any]
     graph_neighbors: dict[str, list[dict[str, Any]]]
+    entity_graph: dict[str, Any]
+    entity_nodes_by_id: dict[str, dict[str, Any]]
+    entity_edges_by_source: dict[str, list[dict[str, Any]]]
 
     def cache_path_for(self, source: str) -> Path | None:
         entry = self.files_by_source.get(source)
@@ -1579,6 +1582,73 @@ def _build_entity_graph(
     }
 
 
+def _normalize_entity_node_id(node_id: str) -> str:
+    text = str(node_id).strip()
+    if not text:
+        return ""
+    if text.startswith("file:"):
+        return f"file:{_normalize_source_path(text[5:])}"
+    if text.startswith("section:"):
+        body = text[8:]
+        source, sep, chunk_index = body.rpartition(":")
+        if sep and source:
+            return f"section:{_normalize_source_path(source)}:{chunk_index}"
+    if text.startswith("symbol:"):
+        body = text[7:]
+        try:
+            source, qualified_name, line_start = body.rsplit(":", 2)
+        except ValueError:
+            return text
+        return f"symbol:{_normalize_source_path(source)}:{qualified_name}:{line_start}"
+    return text
+
+
+def _normalize_entity_node_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    node_id = _normalize_entity_node_id(str(payload.get("id", "")))
+    if not node_id:
+        return None
+
+    normalized = dict(payload)
+    normalized["id"] = node_id
+    for key in ("source", "file", "path"):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            clean = _normalize_source_path(value)
+            if clean:
+                normalized[key] = clean
+            elif key in normalized:
+                normalized.pop(key)
+
+    source = str(normalized.get("source", "") or "")
+    if source and not normalized.get("kb"):
+        normalized["kb"] = _extract_kb(source)
+    return normalized
+
+
+def _normalize_entity_edge_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    source = _normalize_entity_node_id(str(payload.get("source", "")))
+    target = _normalize_entity_node_id(str(payload.get("target", "")))
+    if not source or not target or source == target:
+        return None
+
+    normalized = dict(payload)
+    normalized["source"] = source
+    normalized["target"] = target
+
+    evidence = normalized.get("evidence")
+    if isinstance(evidence, dict):
+        normalized_evidence = dict(evidence)
+        evidence_source = normalized_evidence.get("source")
+        if isinstance(evidence_source, str):
+            clean = _normalize_source_path(evidence_source)
+            if clean:
+                normalized_evidence["source"] = clean
+            else:
+                normalized_evidence.pop("source", None)
+        normalized["evidence"] = normalized_evidence
+    return normalized
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -1794,6 +1864,7 @@ def load_search_bundle(
     normalized_text_dir = Path(persist_dir) / manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME)
     symbol_index_path = Path(persist_dir) / manifest.get("symbol_index_file", SYMBOL_INDEX_FILENAME)
     document_graph_path = Path(persist_dir) / manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME)
+    entity_graph_path = Path(persist_dir) / manifest.get("entity_graph_file", ENTITY_GRAPH_FILENAME)
 
     symbol_index: list[dict[str, Any]] = []
     if symbol_index_path.exists():
@@ -1852,6 +1923,71 @@ def load_search_bundle(
         "edge_count": sum(len(edges) for edges in graph_neighbors.values()),
     }
 
+    raw_entity_graph: dict[str, Any] = {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []}
+    if entity_graph_path.exists():
+        try:
+            raw_entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raw_entity_graph = {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []}
+
+    entity_nodes: list[dict[str, Any]] = []
+    entity_nodes_by_id: dict[str, dict[str, Any]] = {}
+    raw_nodes = raw_entity_graph.get("nodes", [])
+    if isinstance(raw_nodes, list):
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            normalized_node = _normalize_entity_node_payload(raw_node)
+            if normalized_node is None:
+                continue
+            node_id = str(normalized_node["id"])
+            if node_id in entity_nodes_by_id:
+                continue
+            entity_nodes_by_id[node_id] = normalized_node
+            entity_nodes.append(normalized_node)
+
+    entity_edges: list[dict[str, Any]] = []
+    entity_edges_by_source: dict[str, list[dict[str, Any]]] = {}
+    seen_entity_edges: set[tuple[Any, ...]] = set()
+    raw_edges = raw_entity_graph.get("edges", [])
+    if isinstance(raw_edges, list):
+        for raw_edge in raw_edges:
+            if not isinstance(raw_edge, dict):
+                continue
+            normalized_edge = _normalize_entity_edge_payload(raw_edge)
+            if normalized_edge is None:
+                continue
+            evidence = normalized_edge.get("evidence")
+            evidence_source = ""
+            evidence_line_start = None
+            evidence_line_end = None
+            if isinstance(evidence, dict):
+                evidence_source = str(evidence.get("source", "") or "")
+                evidence_line_start = evidence.get("line_start")
+                evidence_line_end = evidence.get("line_end")
+            dedupe_key = (
+                normalized_edge["source"],
+                normalized_edge["target"],
+                normalized_edge.get("type", ""),
+                normalized_edge.get("reason", ""),
+                evidence_source,
+                evidence_line_start,
+                evidence_line_end,
+            )
+            if dedupe_key in seen_entity_edges:
+                continue
+            seen_entity_edges.add(dedupe_key)
+            entity_edges.append(normalized_edge)
+            entity_edges_by_source.setdefault(str(normalized_edge["source"]), []).append(normalized_edge)
+
+    entity_graph = {
+        **raw_entity_graph,
+        "nodes": entity_nodes,
+        "edges": entity_edges,
+        "node_count": len(entity_nodes),
+        "edge_count": len(entity_edges),
+    }
+
     source_dir = manifest.get("source_dir")
     return SearchBundle(
         vectorstore=vectorstore,
@@ -1864,6 +2000,9 @@ def load_search_bundle(
         symbol_index=symbol_index,
         document_graph=document_graph,
         graph_neighbors=graph_neighbors,
+        entity_graph=entity_graph,
+        entity_nodes_by_id=entity_nodes_by_id,
+        entity_edges_by_source=entity_edges_by_source,
     )
 
 
