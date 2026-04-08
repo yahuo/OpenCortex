@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from ragbot import ask_stream as rag_ask_stream
 from ragbot import load_search_bundle
+from wiki import save_query_note
 
 load_dotenv()
 
@@ -296,6 +297,51 @@ def render_bridge_entities(bridge_entities: list[dict]) -> None:
         st.json(bridge_entities, expanded=False)
 
 
+def render_query_note_actions(message_index: int, message: dict[str, Any], persist_dir: str) -> None:
+    if message.get("role") != "assistant":
+        return
+
+    question = str(message.get("question", "") or "").strip()
+    answer = str(message.get("content", "") or "").strip()
+    sources = message.get("sources", [])
+    if not question or not answer or not isinstance(sources, list) or not sources:
+        return
+
+    saved_relpath = str(message.get("query_note_relpath", "") or "").strip()
+    save_error = str(message.get("query_note_error", "") or "").strip()
+    button_key = f"save-query-note-{message_index}"
+
+    left, right = st.columns([1, 4])
+    with left:
+        clicked = st.button("保存为知识", key=button_key, disabled=bool(saved_relpath))
+    with right:
+        if saved_relpath:
+            st.caption(f"已保存到 `{saved_relpath}`")
+        else:
+            st.caption("显式接受后回写，默认不进入最高优先级检索证据链。")
+        if save_error:
+            st.error(f"保存失败：{save_error}")
+
+    if not clicked:
+        return
+
+    try:
+        result = save_query_note(
+            persist_path=Path(persist_dir),
+            question=question,
+            answer=answer,
+            sources=sources,
+        )
+    except Exception as exc:
+        st.session_state.rag_messages[message_index]["query_note_error"] = str(exc)
+        st.rerun()
+        return
+
+    st.session_state.rag_messages[message_index]["query_note_relpath"] = result["note_relpath"]
+    st.session_state.rag_messages[message_index]["query_note_error"] = ""
+    st.rerun()
+
+
 def render_stat_card(label: str, value: str, hint: str) -> None:
     st.markdown(
         f"""<div class="summary-card">
@@ -492,7 +538,7 @@ if search_bundle is None:
 
 render_structure_summary(structure_summary)
 
-for msg in st.session_state.rag_messages:
+for msg_index, msg in enumerate(st.session_state.rag_messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("sources"):
@@ -501,6 +547,8 @@ for msg in st.session_state.rag_messages:
             render_bridge_entities(msg["bridge_entities"])
         if msg.get("search_trace"):
             render_search_trace(msg["search_trace"])
+        if msg.get("role") == "assistant":
+            render_query_note_actions(msg_index, msg, cfg["persist_dir"])
 
 if question := st.chat_input("输入问题..."):
     st.session_state.rag_messages.append({"role": "user", "content": question})
@@ -553,9 +601,12 @@ if question := st.chat_input("输入问题..."):
     st.session_state.rag_messages.append(
         {
             "role": "assistant",
+            "question": question,
             "content": answer,
             "sources": sources,
             "bridge_entities": bridge_entities,
             "search_trace": search_trace,
+            "query_note_relpath": "",
+            "query_note_error": "",
         }
     )
