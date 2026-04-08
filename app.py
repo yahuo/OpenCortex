@@ -1,7 +1,9 @@
 """OpenCortex — 单页对话界面。"""
 import html
+import json
 import os
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -113,6 +115,62 @@ header {visibility: hidden;}
     font-size: 0.8rem;
     line-height: 1.55;
 }
+
+.summary-card {
+    background: linear-gradient(180deg, rgba(15,23,42,0.78), rgba(15,23,42,0.55));
+    border: 1px solid rgba(148,163,184,0.16);
+    border-radius: 14px;
+    padding: 0.9rem 1rem;
+    min-height: 112px;
+    margin-bottom: 0.7rem;
+}
+.summary-label {
+    color: #94a3b8;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.35rem;
+}
+.summary-value {
+    color: #e2e8f0;
+    font-size: 1.7rem;
+    font-weight: 700;
+    line-height: 1.1;
+    margin-bottom: 0.3rem;
+}
+.summary-hint {
+    color: #64748b;
+    font-size: 0.84rem;
+    line-height: 1.45;
+}
+.community-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 0.85rem 1rem;
+    min-height: 170px;
+}
+.community-title {
+    color: #e2e8f0;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+}
+.community-meta {
+    color: #94a3b8;
+    font-size: 0.82rem;
+    line-height: 1.5;
+}
+.token-pill {
+    display: inline-block;
+    background: rgba(34,211,238,0.08);
+    border: 1px solid rgba(34,211,238,0.15);
+    color: #67e8f9;
+    border-radius: 999px;
+    padding: 0.14rem 0.55rem;
+    font-size: 0.76rem;
+    margin: 0 0.35rem 0.35rem 0;
+}
 </style>
 """,
         unsafe_allow_html=True,
@@ -141,6 +199,43 @@ def render_sources(sources: list) -> None:
 </div>""",
                 unsafe_allow_html=True,
             )
+
+
+@st.cache_data(show_spinner=False)
+def load_structure_summary(
+    persist_dir: str,
+    index_mtime: float,
+) -> dict[str, Any]:
+    """读取离线结构产物。index_mtime 仅用于缓存失效。"""
+    del index_mtime
+
+    persist_path = Path(persist_dir)
+    community_index_path = persist_path / "community_index.json"
+    graph_report_path = persist_path / "reports" / "GRAPH_REPORT.md"
+
+    community_index: dict[str, Any] | None = None
+    graph_report = ""
+
+    if community_index_path.exists():
+        try:
+            payload = json.loads(community_index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            community_index = payload
+
+    if graph_report_path.exists():
+        try:
+            graph_report = graph_report_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            graph_report = ""
+
+    return {
+        "community_index": community_index,
+        "graph_report": graph_report,
+        "community_index_path": str(community_index_path),
+        "graph_report_path": str(graph_report_path),
+    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -201,6 +296,135 @@ def render_bridge_entities(bridge_entities: list[dict]) -> None:
         st.json(bridge_entities, expanded=False)
 
 
+def render_stat_card(label: str, value: str, hint: str) -> None:
+    st.markdown(
+        f"""<div class="summary-card">
+    <div class="summary-label">{html.escape(label)}</div>
+    <div class="summary-value">{html.escape(value)}</div>
+    <div class="summary-hint">{html.escape(hint)}</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_structure_summary(summary: dict[str, Any]) -> None:
+    community_index = summary.get("community_index")
+    if not isinstance(community_index, dict):
+        return
+
+    communities = community_index.get("communities", [])
+    god_nodes = community_index.get("god_nodes", [])
+    bridges = community_index.get("bridges", [])
+    graph_report = str(summary.get("graph_report", "") or "")
+    graph_report_path = str(summary.get("graph_report_path", "") or "")
+
+    stats = [
+        (
+            "社区",
+            str(community_index.get("community_count", len(communities))),
+            "按强关系边聚合出的主题簇",
+        ),
+        (
+            "文件",
+            str(community_index.get("file_count", 0)),
+            "参与结构图谱的离线文件总数",
+        ),
+        (
+            "关键节点",
+            str(len(god_nodes)),
+            "连接多个上下文的高频枢纽",
+        ),
+        (
+            "跨社区桥",
+            str(len(bridges)),
+            "帮助从一个主题跳到另一个主题",
+        ),
+    ]
+
+    stat_columns = st.columns(len(stats))
+    for column, (label, value, hint) in zip(stat_columns, stats):
+        with column:
+            render_stat_card(label, value, hint)
+
+    with st.expander("查看知识结构摘要", expanded=False):
+        st.caption("这些摘要来自离线生成的 community index 和结构报告，不参与本轮检索排序。")
+        tabs = st.tabs(["核心社区", "关键枢纽", "桥接关系", "结构报告"])
+
+        with tabs[0]:
+            top_communities = [item for item in communities if isinstance(item, dict)][:3]
+            if not top_communities:
+                st.info("当前还没有可展示的社区摘要。")
+            else:
+                community_columns = st.columns(len(top_communities))
+                for column, community in zip(community_columns, top_communities):
+                    label = str(community.get("label") or community.get("id") or "未命名社区")
+                    size = int(community.get("size") or 0)
+                    top_files = ", ".join(
+                        str(item.get("source", ""))
+                        for item in community.get("top_files", [])
+                        if isinstance(item, dict) and item.get("source")
+                    )
+                    top_symbols = [
+                        str(item.get("name", ""))
+                        for item in community.get("top_symbols", [])
+                        if isinstance(item, dict) and item.get("name")
+                    ][:3]
+                    suggested_queries = [
+                        str(item)
+                        for item in community.get("suggested_queries", [])
+                        if isinstance(item, str) and item.strip()
+                    ][:2]
+                    with column:
+                        st.markdown(
+                            f"""<div class="community-card">
+    <div class="community-title">{html.escape(label)}</div>
+    <div class="community-meta">文件数：{size}</div>
+    <div class="community-meta">重点文件：{html.escape(top_files or '暂无')}</div>
+    <div class="community-meta">推荐问题：{html.escape('；'.join(suggested_queries) or '暂无')}</div>
+</div>""",
+                            unsafe_allow_html=True,
+                        )
+                        if top_symbols:
+                            st.markdown(
+                                "".join(
+                                    f'<span class="token-pill">{html.escape(symbol)}</span>'
+                                    for symbol in top_symbols
+                                ),
+                                unsafe_allow_html=True,
+                            )
+
+        with tabs[1]:
+            if not god_nodes:
+                st.info("当前没有识别到关键枢纽节点。")
+            else:
+                for node in god_nodes[:8]:
+                    if not isinstance(node, dict):
+                        continue
+                    label = str(node.get("name") or node.get("source") or "未命名节点")
+                    source = str(node.get("source") or "未知来源")
+                    degree = int(node.get("degree") or 0)
+                    st.markdown(f"- `{label}` 来自 `{source}`，连接度 `{degree}`")
+
+        with tabs[2]:
+            if not bridges:
+                st.info("当前没有跨社区桥接关系。")
+            else:
+                for bridge in bridges[:8]:
+                    if not isinstance(bridge, dict):
+                        continue
+                    source = str(bridge.get("source") or "未知来源")
+                    target = str(bridge.get("target") or "未知目标")
+                    kind = str(bridge.get("kind") or "bridge")
+                    st.markdown(f"- `{source}` -> `{target}` · `{kind}`")
+
+        with tabs[3]:
+            if graph_report:
+                st.caption(f"结构报告路径：{graph_report_path}")
+                st.markdown(graph_report)
+            else:
+                st.info("当前没有可展示的结构报告。")
+
+
 init_session_state()
 cfg = read_runtime_config()
 inject_global_css()
@@ -250,6 +474,11 @@ if current_mtime != _mtime_tracker["last_mtime"]:
     get_search_bundle.clear()
     _mtime_tracker["last_mtime"] = current_mtime
 
+structure_summary = load_structure_summary(
+    persist_dir=cfg["persist_dir"],
+    index_mtime=current_mtime,
+)
+
 search_bundle = get_search_bundle(
     embed_api_key=cfg["embed_api_key"],
     embed_base_url=cfg["embed_base_url"],
@@ -260,6 +489,8 @@ search_bundle = get_search_bundle(
 if search_bundle is None:
     st.error("索引加载失败，请重启应用后重试。")
     st.stop()
+
+render_structure_summary(structure_summary)
 
 for msg in st.session_state.rag_messages:
     with st.chat_message(msg["role"]):
