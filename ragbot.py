@@ -63,6 +63,7 @@ SEARCH_MAX_STEPS_DEFAULT = 2
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 SYMBOL_INDEX_FILENAME = "symbol_index.jsonl"
 DOCUMENT_GRAPH_FILENAME = "document_graph.json"
+ENTITY_GRAPH_FILENAME = "entity_graph.json"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -80,6 +81,7 @@ GRAPH_EDGE_PRIORITY = {
     "shared_symbol": 2,
     "same_series": 3,
 }
+ENTITY_INFERRED_EDGE_TYPES = {"shared_symbol", "same_series"}
 GRAPH_STOPWORDS = {
     "this",
     "that",
@@ -1149,6 +1151,434 @@ def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
     }
 
 
+def _entity_file_node_id(source: str) -> str:
+    return f"file:{_normalize_source_path(source)}"
+
+
+def _entity_section_node_id(source: str, chunk_index: int) -> str:
+    return f"section:{_normalize_source_path(source)}:{chunk_index}"
+
+
+def _entity_symbol_node_id(record: dict[str, Any]) -> str:
+    source = _normalize_source_path(record.get("source", ""))
+    qualified_name = str(record.get("qualified_name") or record.get("name") or "symbol")
+    line_start = int(record.get("line_start") or 0)
+    return f"symbol:{source}:{qualified_name}:{line_start}"
+
+
+def _entity_edge_confidence(kind: str) -> str:
+    return "INFERRED" if kind in ENTITY_INFERRED_EDGE_TYPES else "EXTRACTED"
+
+
+def _add_entity_node(
+    nodes: list[dict[str, Any]],
+    seen: set[str],
+    payload: dict[str, Any],
+) -> None:
+    node_id = str(payload.get("id", "")).strip()
+    if not node_id or node_id in seen:
+        return
+    seen.add(node_id)
+    nodes.append(payload)
+
+
+def _add_entity_edge(
+    edges: dict[tuple[Any, ...], dict[str, Any]],
+    source_id: str,
+    target_id: str,
+    kind: str,
+    evidence_source: str,
+    reason: str = "",
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> None:
+    source_id = str(source_id).strip()
+    target_id = str(target_id).strip()
+    evidence_source = _normalize_source_path(evidence_source)
+    if not source_id or not target_id or source_id == target_id or not evidence_source:
+        return
+
+    key = (source_id, target_id, kind, reason, evidence_source, line_start, line_end)
+    if key in edges:
+        return
+
+    evidence: dict[str, Any] = {"source": evidence_source}
+    if line_start is not None:
+        evidence["line_start"] = line_start
+    if line_end is not None:
+        evidence["line_end"] = line_end
+
+    payload: dict[str, Any] = {
+        "source": source_id,
+        "target": target_id,
+        "type": kind,
+        "confidence": _entity_edge_confidence(kind),
+        "evidence": evidence,
+    }
+    if reason:
+        payload["reason"] = reason
+    edges[key] = payload
+
+
+def _extract_section_reference_tokens(text: str) -> list[str]:
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for raw in CODE_SPAN_RE.findall(text):
+        token = raw.strip()
+        lowered = token.lower()
+        if token and lowered not in seen:
+            seen.add(lowered)
+            tokens.append(token)
+    for raw in CALL_RE.findall(text):
+        token = raw.strip()
+        lowered = token.lower()
+        if token and lowered not in seen:
+            seen.add(lowered)
+            tokens.append(token)
+    return tokens
+
+
+def _build_symbol_reference_lookup(
+    symbol_entries: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    lookup: dict[str, list[dict[str, Any]]] = {}
+    seen_keys: set[tuple[str, str]] = set()
+    for entry in symbol_entries:
+        for raw in (entry.get("name", ""), entry.get("qualified_name", "")):
+            key = str(raw).strip().lower()
+            if not key:
+                continue
+            dedupe_key = (key, str(entry.get("id", "")))
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            lookup.setdefault(key, []).append(entry)
+    return lookup
+
+
+def _resolve_symbol_reference(
+    source: str,
+    token: str,
+    lookup: dict[str, list[dict[str, Any]]],
+) -> str | None:
+    key = token.strip().lower()
+    if not key:
+        return None
+
+    candidates = lookup.get(key, [])
+    if not candidates:
+        return None
+
+    source = _normalize_source_path(source)
+    source_kb = _extract_kb(source)
+
+    def _prefer_specific(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        non_module = [entry for entry in entries if entry.get("symbol_kind") != "module"]
+        return non_module or entries
+
+    same_file = _prefer_specific([entry for entry in candidates if entry.get("source") == source])
+    if len(same_file) == 1:
+        return str(same_file[0]["id"])
+
+    same_kb = _prefer_specific([entry for entry in candidates if entry.get("kb") == source_kb])
+    if len(same_kb) == 1:
+        return str(same_kb[0]["id"])
+
+    candidates = _prefer_specific(candidates)
+    if len(candidates) == 1:
+        return str(candidates[0]["id"])
+    return None
+
+
+def _build_python_module_lookup(indexed_files: list[IndexedFile]) -> dict[str, list[str]]:
+    lookup: dict[str, list[str]] = {}
+    for indexed in indexed_files:
+        if indexed.suffix not in PYTHON_SUFFIXES:
+            continue
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
+        module_path = str(Path(source).with_suffix("")).replace("\\", "/")
+        keys = {module_path.replace("/", "."), Path(source).stem}
+        if Path(source).name == "__init__.py":
+            package_name = posixpath.dirname(module_path).replace("/", ".")
+            if package_name:
+                keys.add(package_name)
+        for key in keys:
+            lowered = key.strip().lower()
+            if not lowered:
+                continue
+            lookup.setdefault(lowered, []).append(source)
+    return lookup
+
+
+def _resolve_import_reference(
+    source: str,
+    qualified_name: str,
+    module_lookup: dict[str, list[str]],
+) -> str | None:
+    qualified_name = qualified_name.strip().lower()
+    if not qualified_name:
+        return None
+
+    source_kb = _extract_kb(source)
+    parts = qualified_name.split(".")
+    for end in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:end])
+        matches = module_lookup.get(candidate, [])
+        if not matches:
+            continue
+        same_kb = [match for match in matches if _extract_kb(match) == source_kb]
+        if len(same_kb) == 1:
+            return same_kb[0]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _build_entity_graph(
+    indexed_files: list[IndexedFile],
+    document_graph: dict[str, Any],
+) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    node_seen: set[str] = set()
+    edges: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    normalized_files: list[tuple[str, IndexedFile]] = []
+    source_lookup: set[str] = set()
+    basename_lookup: dict[str, list[str]] = {}
+    for indexed in indexed_files:
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
+        normalized_files.append((source, indexed))
+        source_lookup.add(source)
+        basename_lookup.setdefault(Path(source).name, []).append(source)
+
+    section_records_by_source: dict[str, list[dict[str, Any]]] = {}
+    symbol_records_by_source: dict[str, list[dict[str, Any]]] = {}
+    all_symbol_entries: list[dict[str, Any]] = []
+
+    for source, indexed in sorted(normalized_files, key=lambda item: item[0]):
+        total_lines = max(1, len(indexed.normalized_text.splitlines()))
+        kb = _extract_kb(source) or indexed.kb
+        _add_entity_node(
+            nodes,
+            node_seen,
+            {
+                "id": _entity_file_node_id(source),
+                "type": "file",
+                "name": Path(source).name,
+                "source": source,
+                "path": source,
+                "kb": kb,
+                "line_start": 1,
+                "line_end": total_lines,
+                "confidence": "EXTRACTED",
+            },
+        )
+
+        section_records: list[dict[str, Any]] = []
+        for chunk_index, chunk in enumerate(indexed.chunks):
+            label = chunk.label or f"chunk {chunk_index + 1}"
+            section_id = _entity_section_node_id(source, chunk_index)
+            section_line_start = chunk.line_start or 1
+            section_line_end = chunk.line_end or section_line_start
+            section_record = {
+                "id": section_id,
+                "type": "section",
+                "name": label,
+                "source": source,
+                "file": source,
+                "kb": kb,
+                "chunk_index": chunk_index,
+                "line_start": section_line_start,
+                "line_end": section_line_end,
+                "confidence": "EXTRACTED",
+            }
+            _add_entity_node(nodes, node_seen, section_record)
+            _add_entity_edge(
+                edges,
+                _entity_file_node_id(source),
+                section_id,
+                "contains",
+                evidence_source=source,
+                reason=label,
+                line_start=section_line_start,
+                line_end=section_line_end,
+            )
+            section_records.append({**section_record, "chunk": chunk})
+        section_records_by_source[source] = section_records
+
+        symbol_records: list[dict[str, Any]] = []
+        for record in indexed.symbols:
+            symbol_source = _normalize_source_path(record.get("source", source)) or source
+            symbol_line_start = int(record.get("line_start") or 1)
+            symbol_line_end = int(record.get("line_end") or symbol_line_start)
+            symbol_record = {
+                "id": _entity_symbol_node_id(record),
+                "type": "symbol",
+                "name": str(record.get("name") or ""),
+                "qualified_name": str(record.get("qualified_name") or record.get("name") or ""),
+                "symbol_kind": str(record.get("kind") or "symbol"),
+                "signature": str(record.get("signature") or ""),
+                "source": symbol_source,
+                "file": symbol_source,
+                "kb": _extract_kb(symbol_source) or kb,
+                "line_start": symbol_line_start,
+                "line_end": symbol_line_end,
+                "confidence": "EXTRACTED",
+            }
+            _add_entity_node(nodes, node_seen, symbol_record)
+            _add_entity_edge(
+                edges,
+                _entity_file_node_id(source),
+                str(symbol_record["id"]),
+                "defines",
+                evidence_source=source,
+                reason=str(symbol_record["qualified_name"]),
+                line_start=symbol_line_start,
+                line_end=symbol_line_end,
+            )
+            symbol_records.append(symbol_record)
+            all_symbol_entries.append(symbol_record)
+        symbol_records_by_source[source] = symbol_records
+
+    for source, section_records in section_records_by_source.items():
+        symbol_records = symbol_records_by_source.get(source, [])
+        for section_record in section_records:
+            section_start = int(section_record["line_start"])
+            section_end = int(section_record["line_end"])
+            for symbol_record in symbol_records:
+                if symbol_record.get("symbol_kind") == "module":
+                    continue
+                symbol_start = int(symbol_record["line_start"])
+                if section_start <= symbol_start <= section_end:
+                    _add_entity_edge(
+                        edges,
+                        str(section_record["id"]),
+                        str(symbol_record["id"]),
+                        "contains",
+                        evidence_source=source,
+                        reason=str(section_record["name"]),
+                        line_start=section_start,
+                        line_end=section_end,
+                    )
+
+    symbol_lookup = _build_symbol_reference_lookup(all_symbol_entries)
+    module_lookup = _build_python_module_lookup(indexed_files)
+
+    for source, section_records in section_records_by_source.items():
+        for section_record in section_records:
+            chunk = section_record["chunk"]
+            section_id = str(section_record["id"])
+            line_start = int(section_record["line_start"])
+            line_end = int(section_record["line_end"])
+            for kind, reference in _iter_local_path_references(chunk.text):
+                target = _resolve_document_reference(
+                    source,
+                    reference,
+                    source_lookup,
+                    basename_lookup,
+                )
+                if target is None:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    section_id,
+                    _entity_file_node_id(target),
+                    kind,
+                    evidence_source=source,
+                    reason=reference,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+
+            for token in _extract_section_reference_tokens(chunk.text):
+                target_symbol_id = _resolve_symbol_reference(source, token, symbol_lookup)
+                if target_symbol_id is None:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    section_id,
+                    target_symbol_id,
+                    "references",
+                    evidence_source=source,
+                    reason=token,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+
+    for symbol_record in all_symbol_entries:
+        if symbol_record.get("symbol_kind") != "import":
+            continue
+        target = _resolve_import_reference(
+            str(symbol_record["source"]),
+            str(symbol_record.get("qualified_name") or ""),
+            module_lookup,
+        )
+        if target is None:
+            continue
+        _add_entity_edge(
+            edges,
+            str(symbol_record["id"]),
+            _entity_file_node_id(target),
+            "imports",
+            evidence_source=str(symbol_record["source"]),
+            reason=str(symbol_record.get("qualified_name") or ""),
+            line_start=int(symbol_record["line_start"]),
+            line_end=int(symbol_record["line_end"]),
+        )
+
+    raw_neighbors = document_graph.get("neighbors", {})
+    if isinstance(raw_neighbors, dict):
+        for source, raw_edges in raw_neighbors.items():
+            normalized_source = _normalize_source_path(source)
+            if not normalized_source or not isinstance(raw_edges, list):
+                continue
+            for edge in raw_edges:
+                if not isinstance(edge, dict):
+                    continue
+                target = _normalize_source_path(edge.get("target", ""))
+                if not target:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    _entity_file_node_id(normalized_source),
+                    _entity_file_node_id(target),
+                    str(edge.get("kind") or ""),
+                    evidence_source=normalized_source,
+                    reason=str(edge.get("reason") or ""),
+                )
+
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda item: (
+            str(item.get("type", "")),
+            str(item.get("source", "")),
+            int(item.get("chunk_index") or 0),
+            int(item.get("line_start") or 0),
+            str(item.get("qualified_name") or item.get("name") or ""),
+        ),
+    )
+    sorted_edges = sorted(
+        edges.values(),
+        key=lambda item: (
+            str(item.get("source", "")),
+            str(item.get("target", "")),
+            str(item.get("type", "")),
+            str(item.get("reason", "")),
+        ),
+    )
+    return {
+        "version": 1,
+        "node_count": len(sorted_nodes),
+        "edge_count": len(sorted_edges),
+        "nodes": sorted_nodes,
+        "edges": sorted_edges,
+    }
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -1174,6 +1604,7 @@ def _write_index_artifacts(
         "normalized_text_dir": NORMALIZED_TEXT_DIRNAME,
         "symbol_index_file": SYMBOL_INDEX_FILENAME,
         "document_graph_file": DOCUMENT_GRAPH_FILENAME,
+        "entity_graph_file": ENTITY_GRAPH_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "files": [],
     }
@@ -1211,6 +1642,13 @@ def _write_index_artifacts(
     document_graph_path = persist_path / DOCUMENT_GRAPH_FILENAME
     document_graph_path.write_text(
         json.dumps(document_graph, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    entity_graph = _build_entity_graph(indexed_files, document_graph=document_graph)
+    entity_graph_path = persist_path / ENTITY_GRAPH_FILENAME
+    entity_graph_path.write_text(
+        json.dumps(entity_graph, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 

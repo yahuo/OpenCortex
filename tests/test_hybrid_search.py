@@ -164,6 +164,32 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
         edge["target"] == "工程/bootstrap_session.py"
         for edge in search_bundle.graph_neighbors["工程/session_playbook.md"]
     )
+    entity_graph_path = search_bundle.persist_dir / "entity_graph.json"
+    assert entity_graph_path.exists()
+    entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["entity_graph_file"] == "entity_graph.json"
+    assert any(
+        node["type"] == "file" and node["source"] == "工程/bootstrap_session.py"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        node["type"] == "section"
+        and node["source"] == "工程/session_playbook.md"
+        and node["name"] == "Session Playbook"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        node["type"] == "symbol"
+        and node["source"] == "工程/bootstrap_session.py"
+        and node["qualified_name"] == "bootstrap_session"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        edge["source"] == "section:工程/session_playbook.md:0"
+        and edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        and edge["type"] == "references"
+        for edge in entity_graph["edges"]
+    )
     wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
     assert wiki_index_path.exists()
     wiki_index = wiki_index_path.read_text(encoding="utf-8")
@@ -442,6 +468,64 @@ def test_document_graph_resolves_relative_links_for_windows_style_sources():
     neighbors = [edge["target"] for edge in graph["neighbors"]["工程/nested/doc.md"]]
     assert "工程/bootstrap_session.py" in neighbors
     assert all("\\" not in source for source in graph["neighbors"])
+
+
+def test_entity_graph_normalizes_windows_style_sources():
+    indexed_files = [
+        ragbot.IndexedFile(
+            rel_path=r"工程\nested\doc.md",
+            suffix=".md",
+            kb="工程",
+            file_path=Path("doc.md"),
+            normalized_text="See [bootstrap](../bootstrap_session.py) for details.",
+            chunks=[
+                ragbot.ChunkSpec(
+                    text="See [bootstrap](../bootstrap_session.py) for details.",
+                    line_start=1,
+                    line_end=1,
+                    label="Doc",
+                )
+            ],
+            symbols=[],
+        ),
+        ragbot.IndexedFile(
+            rel_path=r"工程\bootstrap_session.py",
+            suffix=".py",
+            kb="工程",
+            file_path=Path("bootstrap_session.py"),
+            normalized_text="def bootstrap_session():\n    pass\n",
+            chunks=[
+                ragbot.ChunkSpec(
+                    text="def bootstrap_session():\n    pass",
+                    line_start=1,
+                    line_end=2,
+                    label="def bootstrap_session",
+                )
+            ],
+            symbols=[
+                {
+                    "kind": "function",
+                    "name": "bootstrap_session",
+                    "qualified_name": "bootstrap_session",
+                    "source": r"工程\bootstrap_session.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "signature": "def bootstrap_session()",
+                }
+            ],
+        ),
+    ]
+
+    document_graph = ragbot._build_document_graph(indexed_files)
+    entity_graph = ragbot._build_entity_graph(indexed_files, document_graph=document_graph)
+
+    assert all("\\" not in node["source"] for node in entity_graph["nodes"])
+    assert any(
+        edge["source"] == "section:工程/nested/doc.md:0"
+        and edge["target"] == "file:工程/bootstrap_session.py"
+        and edge["type"] == "links_to"
+        for edge in entity_graph["edges"]
+    )
 
 
 def test_grep_search_prioritizes_exact_config_key(search_bundle):
