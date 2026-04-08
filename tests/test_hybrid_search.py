@@ -171,7 +171,7 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert search_bundle.entity_graph["node_count"] == len(search_bundle.entity_graph["nodes"])
     assert "file:工程/bootstrap_session.py" in search_bundle.entity_nodes_by_id
     assert any(
-        edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
         and edge["type"] == "references"
         for edge in search_bundle.entity_edges_by_source["section:工程/session_playbook.md:0"]
     )
@@ -193,10 +193,16 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     )
     assert any(
         edge["source"] == "section:工程/session_playbook.md:0"
-        and edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        and edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
         and edge["type"] == "references"
         for edge in entity_graph["edges"]
     )
+    community_index_path = search_bundle.persist_dir / "community_index.json"
+    assert community_index_path.exists()
+    community_index = json.loads(community_index_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["community_index_file"] == "community_index.json"
+    assert community_index["community_count"] >= 1
+    assert community_index["file_to_community"]["工程/session_playbook.md"].startswith("community-")
     wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
     assert wiki_index_path.exists()
     wiki_index = wiki_index_path.read_text(encoding="utf-8")
@@ -236,7 +242,7 @@ def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: 
         if (
             duplicated_edge is None
             and edge.get("source") == "section:工程\\session_playbook.md:0"
-            and edge.get("target") == "symbol:工程\\bootstrap_session.py:bootstrap_session:4"
+            and edge.get("target") == "symbol:工程\\bootstrap_session.py:function:bootstrap_session:4"
             and edge.get("type") == "references"
         ):
             duplicated_edge = json.loads(json.dumps(edge, ensure_ascii=False))
@@ -259,7 +265,7 @@ def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: 
     assert sum(
         1
         for edge in section_edges
-        if edge["target"] == "symbol:工程/bootstrap_session.py:bootstrap_session:4"
+        if edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
         and edge["type"] == "references"
     ) == 1
     assert all("\\" not in edge["source"] for edge in reloaded.entity_graph["edges"])
@@ -876,7 +882,7 @@ def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
                     "step": "step1",
                     "graph_bridge_entities": [
                         {
-                            "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                            "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
                             "type": "symbol",
                             "name": "bootstrap_session",
                             "source": "工程/bootstrap_session.py",
@@ -887,7 +893,7 @@ def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
             ],
             "bridge_entities": [
                 {
-                    "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                    "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
                     "type": "symbol",
                     "name": "bootstrap_session",
                     "source": "工程/bootstrap_session.py",
@@ -944,8 +950,8 @@ def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
                 "line_start": 1,
                 "line_end": 3,
             },
-            "symbol:工程/bootstrap_session.py:bootstrap_session:4": {
-                "id": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+            "symbol:工程/bootstrap_session.py:function:bootstrap_session:4": {
+                "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
                 "type": "symbol",
                 "name": "bootstrap_session",
                 "qualified_name": "bootstrap_session",
@@ -972,7 +978,7 @@ def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
             "section:工程/guide.md:0": [
                 {
                     "source": "section:工程/guide.md:0",
-                    "target": "symbol:工程/bootstrap_session.py:bootstrap_session:4",
+                    "target": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
                     "type": "references",
                     "reason": "bootstrap_session",
                 }
