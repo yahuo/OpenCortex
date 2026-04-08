@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import ragbot
+import wiki
 
 
 class FakeEmbeddings:
@@ -163,6 +164,125 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
         edge["target"] == "工程/bootstrap_session.py"
         for edge in search_bundle.graph_neighbors["工程/session_playbook.md"]
     )
+    wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
+    assert wiki_index_path.exists()
+    wiki_index = wiki_index_path.read_text(encoding="utf-8")
+    assert "[工程/session_playbook.md](files/工程/session_playbook.md.md)" in wiki_index
+    wiki_file_path = search_bundle.persist_dir / "wiki" / "files" / "工程" / "session_playbook.md.md"
+    assert wiki_file_path.exists()
+    wiki_file = wiki_file_path.read_text(encoding="utf-8")
+    assert "- 知识库：`工程`" in wiki_file
+    assert "bootstrap_session.py" in wiki_file
+    assert (search_bundle.persist_dir / "wiki" / "log.md").exists()
+
+
+def test_generate_wiki_escapes_markdown_link_metacharacters(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/plan]v2#draft.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Draft\n\nbootstrap session draft notes",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 16:00:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/plan]v2#draft.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 16:00",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    index_text = (persist_dir / "wiki" / "index.md").read_text(encoding="utf-8")
+    assert (
+        r"[工程/plan\]v2#draft.md](files/工程/plan]v2%23draft.md.md)"
+        in index_text
+    )
+    assert (
+        persist_dir / "wiki" / "files" / "工程" / "plan]v2#draft.md.md"
+    ).exists()
+
+
+def test_generate_wiki_wraps_preview_with_safe_outer_fence(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/fenced.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Example\n\n```python\nprint('hi')\n```",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 16:30:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/fenced.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 16:30",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    page_text = (persist_dir / "wiki" / "files" / "工程" / "fenced.md.md").read_text(
+        encoding="utf-8"
+    )
+    assert "\n~~~text\n" in page_text
+    assert "```python" in page_text
+    assert "\n~~~\n\n## 备注\n" in page_text
+
+
+def test_generate_wiki_escapes_backticks_in_file_page_metadata(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/foo`bar.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Title\n\ncontent",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 17:00:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/foo`bar.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 17:00",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    page_text = (persist_dir / "wiki" / "files" / "工程" / "foo`bar.md.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- 标准化文本：``工程/foo`bar.md.txt``" in page_text
+    assert "- 知识库：`工程`" in page_text
 
 
 def test_document_graph_preserves_same_kb_neighbor_under_global_truncation(tmp_path: Path, monkeypatch):

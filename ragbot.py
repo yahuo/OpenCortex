@@ -1246,7 +1246,7 @@ def build_vectorstore(
             f"在 {md_dir} 中未找到可索引文本。支持后缀: {', '.join(sorted(SUPPORTED_TEXT_SUFFIXES))}"
         )
 
-    _cb(0, total + 3, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
+    _cb(0, total + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
     embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
 
     batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", "10")))
@@ -1255,7 +1255,7 @@ def build_vectorstore(
     retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
 
     vectorstore: FAISS | None = None
-    total_steps = total + 3
+    total_steps = total + 4
     for i in range(0, total, batch_size):
         batch = documents[i : i + batch_size]
         for attempt in range(max_retries + 1):
@@ -1292,8 +1292,12 @@ def build_vectorstore(
         source_dir=md_dir,
         total_chunks=total,
     )
+    _cb(total + 2, total_steps, "正在生成离线 wiki 导航...")
+    from wiki import generate_wiki
+
+    generate_wiki(persist_path=persist_path, manifest=manifest)
     _read_cached_text.cache_clear()
-    _cb(total + 2, total_steps, "正在加载检索 bundle...")
+    _cb(total + 3, total_steps, "正在加载检索 bundle...")
 
     bundle = load_search_bundle(
         embed_api_key=embed_api_key,
@@ -1304,7 +1308,7 @@ def build_vectorstore(
     if bundle is None:
         raise RuntimeError("索引文件写入成功，但 SearchBundle 回读失败。")
 
-    _cb(total + 3, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
+    _cb(total + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
     bundle.manifest = manifest
     return bundle
 
