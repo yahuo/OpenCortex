@@ -3,13 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+import threading
 
 import wiki
 
 
-def test_save_query_note_writes_note_and_log(tmp_path: Path) -> None:
-    persist_dir = tmp_path / "index"
-    persist_dir.mkdir(parents=True)
+def _write_manifest_and_normalized_texts(persist_dir: Path) -> dict:
     normalized_dir = persist_dir / "normalized_texts" / "工程"
     normalized_dir.mkdir(parents=True, exist_ok=True)
     (normalized_dir / "bootstrap_session.py.txt").write_text(
@@ -44,6 +43,17 @@ def test_save_query_note_writes_note_and_log(tmp_path: Path) -> None:
             },
         ],
     }
+    (persist_dir / "index_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_save_query_note_writes_note_and_log(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "index"
+    persist_dir.mkdir(parents=True)
+    manifest = _write_manifest_and_normalized_texts(persist_dir)
     wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
 
     result = wiki.save_query_note(
@@ -95,6 +105,7 @@ def test_save_query_note_writes_note_and_log(tmp_path: Path) -> None:
 def test_save_query_note_generates_unique_path_for_same_day_same_question(tmp_path: Path) -> None:
     persist_dir = tmp_path / "index"
     persist_dir.mkdir(parents=True)
+    _write_manifest_and_normalized_texts(persist_dir)
     created_at = datetime(2026, 4, 9, 10, 30, 0)
     payload = {
         "persist_path": persist_dir,
@@ -102,7 +113,7 @@ def test_save_query_note_generates_unique_path_for_same_day_same_question(tmp_pa
         "answer": "第一次保存的答案。",
         "sources": [
             {
-                "source": "工程/repeat.md",
+                "source": "工程/bootstrap_session.py",
                 "line_start": 8,
                 "line_end": 8,
                 "snippet": "repeat snippet",
@@ -119,30 +130,36 @@ def test_save_query_note_generates_unique_path_for_same_day_same_question(tmp_pa
     assert Path(second["note_path"]).name == "2026-04-09-重复问题-2.md"
 
 
-def test_generate_wiki_preserves_query_note_log_section(tmp_path: Path) -> None:
+def test_save_query_note_generates_missing_wiki_pages_from_manifest(tmp_path: Path) -> None:
     persist_dir = tmp_path / "index"
-    normalized_rel = "工程/bootstrap_session.py.txt"
-    normalized_dir = persist_dir / "normalized_texts" / "工程"
-    normalized_dir.mkdir(parents=True, exist_ok=True)
-    (normalized_dir / "bootstrap_session.py.txt").write_text(
-        "def bootstrap_session():\n    return {'status': 'ready'}\n",
-        encoding="utf-8",
-    )
-    manifest = {
-        "build_time": "2026-04-09 11:00:00",
-        "normalized_text_dir": "normalized_texts",
-        "files": [
+    persist_dir.mkdir(parents=True)
+    _write_manifest_and_normalized_texts(persist_dir)
+
+    result = wiki.save_query_note(
+        persist_path=persist_dir,
+        question="旧索引下能否保存？",
+        answer="可以，保存前会先补齐 wiki 页面。",
+        sources=[
             {
-                "name": "工程/bootstrap_session.py",
-                "kb": "工程",
-                "suffix": ".py",
-                "size_kb": 0.1,
-                "mtime": "2026-04-09 11:00",
-                "chunks": 1,
-                "normalized_text": normalized_rel,
+                "source": "工程/bootstrap_session.py",
+                "line_start": 1,
+                "line_end": 2,
+                "snippet": "def bootstrap_session(user_id: str) -> dict:",
             }
         ],
-    }
+        created_at=datetime(2026, 4, 9, 10, 40, 0),
+    )
+
+    assert Path(result["note_path"]).exists()
+    assert (persist_dir / "wiki" / "files" / "工程" / "bootstrap_session.py.md").exists()
+    note_text = Path(result["note_path"]).read_text(encoding="utf-8")
+    assert "../files/工程/bootstrap_session.py.md" in note_text
+
+
+def test_generate_wiki_preserves_query_note_log_section(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "index"
+    persist_dir.mkdir(parents=True)
+    manifest = _write_manifest_and_normalized_texts(persist_dir)
 
     wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
     wiki.save_query_note(
@@ -165,3 +182,46 @@ def test_generate_wiki_preserves_query_note_log_section(tmp_path: Path) -> None:
     log_text = (persist_dir / "wiki" / "log.md").read_text(encoding="utf-8")
     assert "## Query Notes" in log_text
     assert "bootstrap_session 做什么？" in log_text
+
+
+def test_save_query_note_keeps_both_log_entries_under_concurrent_writes(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "index"
+    persist_dir.mkdir(parents=True)
+    _write_manifest_and_normalized_texts(persist_dir)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def worker(question: str) -> None:
+        try:
+            barrier.wait()
+            wiki.save_query_note(
+                persist_path=persist_dir,
+                question=question,
+                answer=f"{question} 的答案。",
+                sources=[
+                    {
+                        "source": "工程/bootstrap_session.py",
+                        "line_start": 1,
+                        "line_end": 2,
+                        "snippet": "def bootstrap_session(user_id: str) -> dict:",
+                    }
+                ],
+                created_at=datetime(2026, 4, 9, 11, 30, 0),
+            )
+        except Exception as exc:  # pragma: no cover - test helper
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=("并发问题 A",)),
+        threading.Thread(target=worker, args=("并发问题 B",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    log_text = (persist_dir / "wiki" / "log.md").read_text(encoding="utf-8")
+    assert "并发问题 A" in log_text
+    assert "并发问题 B" in log_text

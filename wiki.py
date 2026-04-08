@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any
 from urllib.parse import unquote
 
@@ -13,6 +16,9 @@ WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 LINT_REPORT_FILENAME = "lint_report.json"
+WRITE_LOCK_FILENAME = ".write.lock"
+WRITE_LOCK_TIMEOUT_SECONDS = 5.0
+WRITE_LOCK_POLL_SECONDS = 0.05
 MAX_PREVIEW_LINES = 12
 MAX_PREVIEW_CHARS = 1200
 LINK_TEXT_ESCAPES = str.maketrans({
@@ -195,24 +201,9 @@ def _render_query_note(
 
 def _append_query_note_log(log_path: Path, created_at: datetime, question: str, note_relpath: Path) -> None:
     entry = f"- {created_at.isoformat(timespec='seconds')} {_markdown_link(question, note_relpath.as_posix())}"
-    if log_path.exists():
-        content = log_path.read_text(encoding="utf-8").rstrip()
-    else:
-        content = "\n".join(
-            [
-                "# 知识日志",
-                "",
-                "此文件记录构建阶段产物和显式保存的 query notes。",
-            ]
-        ).rstrip()
-
-    if "## Query Notes" not in content:
-        content = content + "\n\n## Query Notes\n"
-    if entry not in content:
-        content = content.rstrip() + "\n" + entry + "\n"
-    else:
-        content = content.rstrip() + "\n"
-    log_path.write_text(content, encoding="utf-8")
+    content = _load_log_content(log_path)
+    content = _merge_query_note_log_entry(content, entry)
+    _write_text_atomically(log_path, content)
 
 
 def _extract_query_notes_section(log_text: str) -> str:
@@ -222,6 +213,122 @@ def _extract_query_notes_section(log_text: str) -> str:
     _, _, tail = log_text.partition(marker)
     section = f"{marker}{tail}".strip()
     return section
+
+
+def _load_log_content(log_path: Path) -> str:
+    if log_path.exists():
+        return log_path.read_text(encoding="utf-8").rstrip()
+    return "\n".join(
+        [
+            "# 知识日志",
+            "",
+            "此文件记录构建阶段产物和显式保存的 query notes。",
+        ]
+    ).rstrip()
+
+
+def _merge_query_note_log_entry(content: str, entry: str) -> str:
+    if "## Query Notes" not in content:
+        content = content + "\n\n## Query Notes\n"
+    if entry not in content:
+        content = content.rstrip() + "\n" + entry + "\n"
+    else:
+        content = content.rstrip() + "\n"
+    return content
+
+
+def _write_text_atomically(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _load_manifest(persist_path: Path) -> dict[str, Any] | None:
+    manifest_path = persist_path / "index_manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _expected_source_page_paths(wiki_dir: Path, sources: list[dict[str, Any]]) -> list[Path]:
+    page_paths: list[Path] = []
+    seen: set[str] = set()
+    for item in sources:
+        source = str(item.get("source", "") or "").strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        page_paths.append(wiki_dir / _page_relpath_for_source(source))
+    return page_paths
+
+
+def _ensure_wiki_artifacts_for_sources(
+    persist_path: Path,
+    manifest: dict[str, Any] | None,
+    sources: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("当前索引缺少 manifest，请先重建索引后再保存为知识。")
+
+    manifest_sources = {
+        str(entry.get("name", "")).strip()
+        for entry in manifest.get("files", [])
+        if isinstance(entry, dict) and str(entry.get("name", "")).strip()
+    }
+    requested_sources = {
+        str(item.get("source", "")).strip()
+        for item in sources
+        if isinstance(item, dict) and str(item.get("source", "")).strip()
+    }
+    missing_sources = sorted(source for source in requested_sources if source not in manifest_sources)
+    if missing_sources:
+        raise ValueError(
+            "当前索引不包含这些来源文件，无法保存为知识："
+            + ", ".join(missing_sources)
+        )
+
+    wiki_dir = persist_path / WIKI_DIRNAME
+    expected_paths = _expected_source_page_paths(wiki_dir, sources)
+    index_path = wiki_dir / "index.md"
+    log_path = wiki_dir / "log.md"
+    missing_paths = [path for path in [index_path, log_path, *expected_paths] if not path.exists()]
+    if missing_paths:
+        generate_wiki(persist_path=persist_path, manifest=manifest)
+    still_missing = [path for path in [index_path, log_path, *expected_paths] if not path.exists()]
+    if still_missing:
+        raise ValueError("当前索引还没有生成完整的 wiki 页面，请先重建索引后再保存为知识。")
+    return manifest
+
+
+@contextmanager
+def _write_lock(wiki_dir: Path):
+    lock_path = wiki_dir / WRITE_LOCK_FILENAME
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+    fd: int | None = None
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time_ns()}\n".encode("utf-8"))
+            break
+        except FileExistsError:
+            if time.monotonic() - start >= WRITE_LOCK_TIMEOUT_SECONDS:
+                raise TimeoutError("等待 wiki 写锁超时，请稍后重试。")
+            time.sleep(WRITE_LOCK_POLL_SECONDS)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _preview_from_normalized_text(normalized_root: Path, normalized_rel: str) -> str:
@@ -534,30 +641,28 @@ def save_query_note(
     wiki_dir = persist_path / WIKI_DIRNAME
     queries_dir = wiki_dir / QUERY_NOTES_DIRNAME
     wiki_dir.mkdir(parents=True, exist_ok=True)
-    queries_dir.mkdir(parents=True, exist_ok=True)
 
-    note_path, note_relpath = _next_query_note_path(
-        queries_dir,
-        note_date=created.date().isoformat(),
-        slug=_slugify_query(question),
-    )
-    note_path.write_text(
-        _render_query_note(question, answer, valid_sources, created, note_relpath, tags=tags),
-        encoding="utf-8",
-    )
+    with _write_lock(wiki_dir):
+        manifest = _load_manifest(persist_path)
+        manifest = _ensure_wiki_artifacts_for_sources(
+            persist_path=persist_path,
+            manifest=manifest,
+            sources=valid_sources,
+        )
+        queries_dir.mkdir(parents=True, exist_ok=True)
+        note_path, note_relpath = _next_query_note_path(
+            queries_dir,
+            note_date=created.date().isoformat(),
+            slug=_slugify_query(question),
+        )
+        note_path.write_text(
+            _render_query_note(question, answer, valid_sources, created, note_relpath, tags=tags),
+            encoding="utf-8",
+        )
 
-    log_path = wiki_dir / "log.md"
-    _append_query_note_log(log_path, created, question, note_relpath)
-    manifest_path = persist_path / "index_manifest.json"
-    manifest = None
-    if manifest_path.exists():
-        try:
-            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            manifest = loaded
-    generate_lint_report(persist_path=persist_path, manifest=manifest, generated_at=created)
+        log_path = wiki_dir / "log.md"
+        _append_query_note_log(log_path, created, question, note_relpath)
+        generate_lint_report(persist_path=persist_path, manifest=manifest, generated_at=created)
     return {
         "note_path": str(note_path),
         "note_relpath": (Path(WIKI_DIRNAME) / note_relpath).as_posix(),
