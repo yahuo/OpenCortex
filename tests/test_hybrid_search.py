@@ -168,6 +168,8 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert entity_graph_path.exists()
     entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
     assert search_bundle.manifest["entity_graph_file"] == "entity_graph.json"
+    assert search_bundle.manifest["semantic_extract_cache_file"] == "semantic_extract_cache.json"
+    assert search_bundle.manifest["semantic_graph_stats"]["enabled"] is False
     assert search_bundle.entity_graph["node_count"] == len(search_bundle.entity_graph["nodes"])
     assert "file:工程/bootstrap_session.py" in search_bundle.entity_nodes_by_id
     assert any(

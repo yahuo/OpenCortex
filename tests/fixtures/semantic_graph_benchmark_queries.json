@@ -1,0 +1,82 @@
+[
+  {
+    "id": "semantic-001",
+    "question": "settlement handoff 的实现入口在哪里？",
+    "seed_source": "产品/settlement_handoff.md",
+    "target_source": "工程/finalize_payments.py",
+    "concept": "settlement handoff",
+    "decision": "immutable ledger snapshots"
+  },
+  {
+    "id": "semantic-002",
+    "question": "tenant hydration 相关逻辑在哪个模块？",
+    "seed_source": "产品/tenant_hydration.md",
+    "target_source": "工程/prepare_workspace.py",
+    "concept": "tenant hydration",
+    "decision": "lazy workspace materialization"
+  },
+  {
+    "id": "semantic-003",
+    "question": "audit sealing 由谁负责？",
+    "seed_source": "产品/audit_sealing.md",
+    "target_source": "工程/seal_audit_trail.py",
+    "concept": "audit sealing",
+    "decision": "append-only event hashes"
+  },
+  {
+    "id": "semantic-004",
+    "question": "release ring rotation 的实现在哪？",
+    "seed_source": "产品/release_ring_rotation.md",
+    "target_source": "工程/rotate_release_ring.py",
+    "concept": "release ring rotation",
+    "decision": "canary-first rollout"
+  },
+  {
+    "id": "semantic-005",
+    "question": "feature gate routing 的代码入口是什么？",
+    "seed_source": "产品/feature_gate_routing.md",
+    "target_source": "工程/route_feature_gate.py",
+    "concept": "feature gate routing",
+    "decision": "policy-driven rollout gates"
+  },
+  {
+    "id": "semantic-006",
+    "question": "snapshot materialization 相关实现在哪？",
+    "seed_source": "产品/snapshot_materialization.md",
+    "target_source": "工程/materialize_snapshot.py",
+    "concept": "snapshot materialization",
+    "decision": "immutable recovery checkpoints"
+  },
+  {
+    "id": "semantic-007",
+    "question": "catalog publishing 的处理逻辑在哪？",
+    "seed_source": "产品/catalog_publishing.md",
+    "target_source": "工程/publish_catalog.py",
+    "concept": "catalog publishing",
+    "decision": "staged catalog promotion"
+  },
+  {
+    "id": "semantic-008",
+    "question": "export scrubbing 是哪个模块做的？",
+    "seed_source": "产品/export_scrubbing.md",
+    "target_source": "工程/scrub_export.py",
+    "concept": "export scrubbing",
+    "decision": "default pii redaction"
+  },
+  {
+    "id": "semantic-009",
+    "question": "payout reconciliation 的实现在哪里？",
+    "seed_source": "产品/payout_reconciliation.md",
+    "target_source": "工程/reconcile_payout.py",
+    "concept": "payout reconciliation",
+    "decision": "double-entry reconciliation"
+  },
+  {
+    "id": "semantic-010",
+    "question": "sla rollup 由哪个实现负责？",
+    "seed_source": "产品/sla_rollup.md",
+    "target_source": "工程/rollup_sla.py",
+    "concept": "sla rollup",
+    "decision": "lag-aware alert thresholds"
+  }
+]

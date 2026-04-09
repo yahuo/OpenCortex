@@ -18,3 +18,9 @@
 - 2026-04-09: 不能把 Unix 上“无害”的进程探测习惯直接搬到 Windows；像 `os.kill(pid, 0)` 在 Windows 回退锁路径里可能走真正的 kill 语义。跨平台锁/进程探测要按平台分支实现，并补一条显式验证“Windows 分支不会调用 Unix 探测 API”的回归测试。
 - 2026-04-09: 调用 Win32 API 的 `ctypes` 边界必须显式声明 `argtypes/restype`；默认 `c_int` 在 64 位 Windows 上会截断句柄，导致“偶发失效”这类高风险并发 bug。对这类 FFI 代码要补一条直接断言签名配置的回归测试，而不是只测上层业务逻辑。
 - 2026-04-09: 读取派生产物的 UI 缓存键不能只绑主索引文件；如果用户动作会更新 `lint_report.json`、`wiki/` 或其他二级产物，而 `index.faiss` 不变，页面就会稳定展示旧摘要。对这类缓存要么把相关产物的 mtime 纳入 key，要么在写入成功后显式清 cache，最好两者都做。
+- 2026-04-09: 如果图边依赖另一类节点的别名/索引，就不能在“边扫描边建索引”的单趟循环里立即连边；像 `rationale_for` 这种依赖 concept alias 的关系，必须先完成节点/alias 建立，再做第二趟关系解析，否则文件顺序一变就会静默丢边。对这类问题要补“反向文件顺序仍能连边”的回归测试。
+- 2026-04-09: 给 runtime graph expansion 新增中间节点类型时，必须同时检查遍历逻辑是否真正穿透到最终文件节点；只把边写进图里但不补 traversal 分支，运行时就会出现“图里有边、检索走不到”的假增益。对这类功能要补至少一条“跨中间节点 hop 成功到文件”的回归测试。
+- 2026-04-09: LLM-assisted 派生产物的缓存键不能只看 prompt 版本和模型名；如果项目允许切换 OpenAI-compatible backend，像 `LLM_BASE_URL` 这样的 provider 身份也必须纳入 cache fingerprint，否则重建会错误复用旧 provider 的抽取结果。对这类缓存要补“同模型、换 backend 必须 miss”的回归测试。
+- 2026-04-09: 语义节点 id 不能只靠“去掉标点后的 slug”；像 `C#`、`C++`、`C` 这类术语会被折叠到同一个节点，污染 alias、attached files 和推理边。可读 slug 可以保留，但必须再拼上基于原始术语的稳定 hash，并补“标点不同但名字相近”的回归测试。
+- 2026-04-09: 如果 community/report 要消费 semantic graph，不能只投影“节点本身带 file/source 字段”的边；`concept -> decision` 这类纯语义边也要先解析 attached files 再投影成 file-level relationship，否则 runtime 能走通的语义桥在 `community_index.json` / `GRAPH_REPORT.md` 里会凭空消失。对这类问题要补“rationale-only bridge 出现在 report”回归测试。
+- 2026-04-09: 语义 alias 索引不能用 last-write-wins 的单值 map；多个 concept 复用同一个 alias 或 rationale 短语时，如果直接覆盖，`rationale_for` 会静默连到最后一个节点，重新引入顺序相关 bug。对这类别名冲突要么显式标记歧义，要么保留一词多节点，并补“重复 alias 仍稳定连边”的回归测试。
