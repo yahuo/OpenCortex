@@ -13,6 +13,7 @@ import ast
 from collections import deque
 import configparser
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -64,6 +65,7 @@ NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 SYMBOL_INDEX_FILENAME = "symbol_index.jsonl"
 DOCUMENT_GRAPH_FILENAME = "document_graph.json"
 ENTITY_GRAPH_FILENAME = "entity_graph.json"
+SEMANTIC_EXTRACT_CACHE_FILENAME = "semantic_extract_cache.json"
 COMMUNITY_INDEX_FILENAME = "community_index.json"
 REPORTS_DIRNAME = "reports"
 GRAPH_REPORT_FILENAME = "GRAPH_REPORT.md"
@@ -90,15 +92,26 @@ ENTITY_EXPANSION_PRIORITY = {
     "imports": 1,
     "links_to": 2,
     "mentions_path": 3,
-    "shared_symbol": 4,
-    "same_series": 5,
+    "rationale_for": 4,
+    "semantically_related": 5,
+    "shared_symbol": 6,
+    "same_series": 7,
 }
-ENTITY_INFERRED_EDGE_TYPES = {"shared_symbol", "same_series"}
+ENTITY_INFERRED_EDGE_TYPES = {
+    "shared_symbol",
+    "same_series",
+    "rationale_for",
+    "semantically_related",
+}
 COMMUNITY_STRONG_EDGE_TYPES = {"links_to", "mentions_path", "references", "imports"}
 COMMUNITY_TOP_FILES = 5
 COMMUNITY_TOP_SYMBOLS = 5
 COMMUNITY_TOP_GOD_NODES = 8
 COMMUNITY_TOP_BRIDGES = 20
+SEMANTIC_PROMPT_VERSION = "phase2b-v1"
+SEMANTIC_SECTION_MAX_CHARS = 2500
+SEMANTIC_GRAPH_DISABLED_VALUES = {"0", "false", "no", "off"}
+SEMANTIC_GRAPH_ENABLED_VALUES = {"1", "true", "yes", "on"}
 GRAPH_STOPWORDS = {
     "this",
     "that",
@@ -1189,6 +1202,13 @@ def _entity_symbol_node_id(record: dict[str, Any]) -> str:
     return f"symbol:{source}:{symbol_kind}:{qualified_name}:{line_start}"
 
 
+def _entity_semantic_node_id(node_type: str, name: str) -> str:
+    normalized_type = str(node_type).strip().lower() or "concept"
+    normalized_name = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    slug = normalized_name or hashlib.sha1(name.strip().encode("utf-8")).hexdigest()[:12]
+    return f"{normalized_type}:{slug}"
+
+
 def _entity_edge_confidence(kind: str) -> str:
     return "INFERRED" if kind in ENTITY_INFERRED_EDGE_TYPES else "EXTRACTED"
 
@@ -1359,12 +1379,366 @@ def _resolve_import_reference(
     return None
 
 
+def _semantic_graph_enabled(
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: str,
+) -> tuple[bool, str]:
+    raw = os.getenv("SEMANTIC_GRAPH_ENABLED", "auto").strip().lower()
+    enabled = bool(llm_api_key.strip() and llm_model.strip() and llm_base_url.strip())
+    if raw in SEMANTIC_GRAPH_DISABLED_VALUES:
+        return False, "disabled_by_env"
+    if raw in SEMANTIC_GRAPH_ENABLED_VALUES:
+        if enabled:
+            return True, ""
+        return False, "missing_llm_config"
+    if enabled:
+        return True, ""
+    return False, "missing_llm_config"
+
+
+def _semantic_section_fingerprint(
+    source: str,
+    chunk_index: int,
+    text: str,
+    llm_model: str,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(source.encode("utf-8"))
+    digest.update(f":{chunk_index}:".encode("utf-8"))
+    digest.update(llm_model.encode("utf-8"))
+    digest.update(SEMANTIC_PROMPT_VERSION.encode("utf-8"))
+    digest.update(text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _semantic_cache_path(persist_path: Path) -> Path:
+    return persist_path / SEMANTIC_EXTRACT_CACHE_FILENAME
+
+
+def _load_semantic_cache(persist_path: Path) -> dict[str, Any]:
+    path = _semantic_cache_path(persist_path)
+    if not path.exists():
+        return {"version": 1, "entries": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "entries": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "entries": {}}
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        payload["entries"] = {}
+    return payload
+
+
+def _write_semantic_cache(persist_path: Path, cache_payload: dict[str, Any]) -> None:
+    _semantic_cache_path(persist_path).write_text(
+        json.dumps(cache_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _semantic_aliases(name: str, aliases: Any) -> list[str]:
+    values = [name]
+    if isinstance(aliases, list):
+        values.extend(str(item).strip() for item in aliases if str(item).strip())
+    return _dedupe_strings(values)
+
+
+def _semantic_alias_map(name: str, aliases: Any) -> dict[str, str]:
+    return {alias.lower(): alias for alias in _semantic_aliases(name, aliases)}
+
+
+def _semantic_extraction_prompt(section: dict[str, Any]) -> str:
+    text = str(section.get("text", "") or "").strip()
+    if len(text) > SEMANTIC_SECTION_MAX_CHARS:
+        text = text[: SEMANTIC_SECTION_MAX_CHARS - 3].rstrip() + "..."
+    source = str(section.get("source", "") or "")
+    label = str(section.get("label", "") or "")
+    return f"""你是知识图谱抽取器。请只根据给定片段抽取明确出现或被明确陈述的语义概念和决策。
+
+只返回一个 JSON 对象，不要输出任何额外说明，结构必须是：
+{{
+  "concepts": [
+    {{
+      "name": "概念名",
+      "summary": "一句话说明",
+      "aliases": ["可选别名"]
+    }}
+  ],
+  "decisions": [
+    {{
+      "name": "决策名",
+      "summary": "一句话说明",
+      "aliases": ["可选别名"],
+      "rationale": ["支撑该决策的概念、理由或依据短语"]
+    }}
+  ]
+}}
+
+要求：
+1. 只有文本里明确表达的抽象概念、业务术语、系统名称、架构决策才能抽取。
+2. `summary` 必须简短，不要重复原文大段句子。
+3. 如果没有可抽取内容，返回空数组。
+4. `rationale` 只保留能直接从文本看出的依据短语。
+
+片段来源：{source}
+片段标签：{label}
+
+片段正文：
+\"\"\"
+{text}
+\"\"\"
+"""
+
+
+def _response_token_usage(response: Any) -> dict[str, int]:
+    usage = getattr(response, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        response_metadata = getattr(response, "response_metadata", None)
+        if isinstance(response_metadata, dict):
+            raw_usage = response_metadata.get("token_usage") or response_metadata.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = raw_usage
+    if not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _normalize_semantic_item(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name", "") or "").strip()
+    if not name:
+        return None
+    aliases = _semantic_aliases(name, item.get("aliases"))
+    payload: dict[str, Any] = {
+        "name": name,
+        "aliases": aliases,
+    }
+    summary = str(item.get("summary", "") or "").strip()
+    if summary:
+        payload["summary"] = summary
+    rationale = item.get("rationale")
+    if isinstance(rationale, list):
+        payload["rationale"] = _dedupe_strings(str(entry) for entry in rationale if str(entry).strip())
+    return payload
+
+
+def _parse_semantic_payload(content: str) -> dict[str, list[dict[str, Any]]]:
+    payload = _extract_json_blob(content)
+    concepts = payload.get("concepts") or []
+    decisions = payload.get("decisions") or []
+    return {
+        "concepts": [item for item in (_normalize_semantic_item(entry) for entry in concepts) if item],
+        "decisions": [item for item in (_normalize_semantic_item(entry) for entry in decisions) if item],
+    }
+
+
+def _upsert_semantic_node(
+    nodes_by_id: dict[str, dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    node_seen: set[str],
+    alias_lookup: dict[str, str],
+    node_type: str,
+    item: dict[str, Any],
+) -> str:
+    name = str(item.get("name", "") or "").strip()
+    node_id = _entity_semantic_node_id(node_type, name)
+    aliases = _semantic_aliases(name, item.get("aliases"))
+    if node_id not in nodes_by_id:
+        payload = {
+            "id": node_id,
+            "type": node_type,
+            "name": name,
+            "aliases": aliases,
+            "summary": str(item.get("summary", "") or "").strip(),
+            "confidence": "INFERRED",
+        }
+        _add_entity_node(nodes, node_seen, payload)
+        nodes_by_id[node_id] = payload
+    else:
+        payload = nodes_by_id[node_id]
+        existing_aliases = payload.get("aliases", [])
+        merged_aliases = _dedupe_strings(existing_aliases if isinstance(existing_aliases, list) else [])
+        for alias in aliases:
+            if alias.lower() not in {item.lower() for item in merged_aliases}:
+                merged_aliases.append(alias)
+        payload["aliases"] = merged_aliases
+        if not str(payload.get("summary", "") or "").strip():
+            summary = str(item.get("summary", "") or "").strip()
+            if summary:
+                payload["summary"] = summary
+    for lowered, _alias in _semantic_alias_map(name, aliases).items():
+        alias_lookup[lowered] = node_id
+    return node_id
+
+
+def _iter_semantic_sections(indexed_files: list[IndexedFile]) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    for indexed in indexed_files:
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
+        for chunk_index, chunk in enumerate(indexed.chunks):
+            text = chunk.text.strip()
+            if not text:
+                continue
+            sections.append(
+                {
+                    "source": source,
+                    "kb": indexed.kb,
+                    "suffix": indexed.suffix,
+                    "chunk_index": chunk_index,
+                    "label": _chunk_location_label(chunk, f"chunk {chunk_index + 1}"),
+                    "line_start": chunk.line_start,
+                    "line_end": chunk.line_end,
+                    "text": text,
+                }
+            )
+    return sections
+
+
+def _extract_semantic_sections(
+    indexed_files: list[IndexedFile],
+    persist_path: Path,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    enabled, disabled_reason = _semantic_graph_enabled(
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
+    stats: dict[str, Any] = {
+        "enabled": enabled,
+        "disabled_reason": disabled_reason,
+        "llm_model": llm_model,
+        "prompt_version": SEMANTIC_PROMPT_VERSION,
+        "sections_total": 0,
+        "cached_sections": 0,
+        "extracted_sections": 0,
+        "failed_sections": 0,
+        "api_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "duration_seconds": 0.0,
+    }
+    sections = _iter_semantic_sections(indexed_files)
+    stats["sections_total"] = len(sections)
+    if not enabled:
+        return [], stats
+
+    started = time.perf_counter()
+    llm = make_llm(
+        api_key=llm_api_key,
+        model=llm_model,
+        base_url=llm_base_url,
+        temperature=0.0,
+    )
+    cache = _load_semantic_cache(persist_path)
+    previous_entries = cache.get("entries", {})
+    if not isinstance(previous_entries, dict):
+        previous_entries = {}
+    next_entries: dict[str, Any] = {}
+    extracted_sections: list[dict[str, Any]] = []
+
+    for section in sections:
+        cache_key = _entity_section_node_id(str(section["source"]), int(section["chunk_index"]))
+        fingerprint = _semantic_section_fingerprint(
+            source=str(section["source"]),
+            chunk_index=int(section["chunk_index"]),
+            text=str(section["text"]),
+            llm_model=llm_model,
+        )
+        cached_entry = previous_entries.get(cache_key)
+        if (
+            isinstance(cached_entry, dict)
+            and cached_entry.get("fingerprint") == fingerprint
+            and cached_entry.get("prompt_version") == SEMANTIC_PROMPT_VERSION
+            and cached_entry.get("llm_model") == llm_model
+            and cached_entry.get("status") == "ok"
+        ):
+            payload = cached_entry.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {"concepts": [], "decisions": []}
+            stats["cached_sections"] += 1
+            next_entries[cache_key] = cached_entry
+        else:
+            try:
+                response = llm.invoke(_semantic_extraction_prompt(section))
+                payload = _parse_semantic_payload(_chunk_to_text(response))
+                usage = _response_token_usage(response)
+                stats["api_calls"] += 1
+                stats["extracted_sections"] += 1
+                stats["prompt_tokens"] += usage["prompt_tokens"]
+                stats["completion_tokens"] += usage["completion_tokens"]
+                stats["total_tokens"] += usage["total_tokens"]
+                next_entries[cache_key] = {
+                    "status": "ok",
+                    "fingerprint": fingerprint,
+                    "prompt_version": SEMANTIC_PROMPT_VERSION,
+                    "llm_model": llm_model,
+                    "payload": payload,
+                    "usage": usage,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            except Exception as exc:
+                payload = {"concepts": [], "decisions": []}
+                stats["failed_sections"] += 1
+                next_entries[cache_key] = {
+                    "status": "error",
+                    "fingerprint": fingerprint,
+                    "prompt_version": SEMANTIC_PROMPT_VERSION,
+                    "llm_model": llm_model,
+                    "payload": payload,
+                    "error": str(exc),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+        if payload.get("concepts") or payload.get("decisions"):
+            extracted_sections.append(
+                {
+                    "source": str(section["source"]),
+                    "chunk_index": int(section["chunk_index"]),
+                    "label": str(section["label"]),
+                    "line_start": section.get("line_start"),
+                    "line_end": section.get("line_end"),
+                    "payload": payload,
+                }
+            )
+
+    stats["duration_seconds"] = round(time.perf_counter() - started, 3)
+    _write_semantic_cache(
+        persist_path,
+        {
+            "version": 1,
+            "prompt_version": SEMANTIC_PROMPT_VERSION,
+            "llm_model": llm_model,
+            "entries": next_entries,
+        },
+    )
+    return extracted_sections, stats
+
+
 def _build_entity_graph(
     indexed_files: list[IndexedFile],
     document_graph: dict[str, Any],
+    semantic_sections: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = []
     node_seen: set[str] = set()
+    nodes_by_id: dict[str, dict[str, Any]] = {}
     edges: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     normalized_files: list[tuple[str, IndexedFile]] = []
@@ -1379,6 +1753,7 @@ def _build_entity_graph(
         basename_lookup.setdefault(Path(source).name, []).append(source)
 
     section_records_by_source: dict[str, list[dict[str, Any]]] = {}
+    section_records_by_id: dict[str, dict[str, Any]] = {}
     symbol_records_by_source: dict[str, list[dict[str, Any]]] = {}
     all_symbol_entries: list[dict[str, Any]] = []
 
@@ -1400,6 +1775,7 @@ def _build_entity_graph(
                 "confidence": "EXTRACTED",
             },
         )
+        nodes_by_id[_entity_file_node_id(source)] = nodes[-1]
 
         section_records: list[dict[str, Any]] = []
         for chunk_index, chunk in enumerate(indexed.chunks):
@@ -1420,6 +1796,7 @@ def _build_entity_graph(
                 "confidence": "EXTRACTED",
             }
             _add_entity_node(nodes, node_seen, section_record)
+            nodes_by_id[section_id] = nodes[-1]
             _add_entity_edge(
                 edges,
                 _entity_file_node_id(source),
@@ -1430,7 +1807,9 @@ def _build_entity_graph(
                 line_start=section_line_start,
                 line_end=section_line_end,
             )
-            section_records.append({**section_record, "chunk": chunk})
+            enriched_section_record = {**section_record, "chunk": chunk}
+            section_records.append(enriched_section_record)
+            section_records_by_id[section_id] = enriched_section_record
         section_records_by_source[source] = section_records
 
         symbol_records: list[dict[str, Any]] = []
@@ -1453,6 +1832,7 @@ def _build_entity_graph(
                 "confidence": "EXTRACTED",
             }
             _add_entity_node(nodes, node_seen, symbol_record)
+            nodes_by_id[str(symbol_record["id"])] = nodes[-1]
             _add_entity_edge(
                 edges,
                 _entity_file_node_id(source),
@@ -1552,6 +1932,128 @@ def _build_entity_graph(
             line_start=int(symbol_record["line_start"]),
             line_end=int(symbol_record["line_end"]),
         )
+
+    concept_alias_lookup: dict[str, str] = {}
+    decision_alias_lookup: dict[str, str] = {}
+    semantic_sections = semantic_sections or []
+    for semantic_section in semantic_sections:
+        source = _normalize_source_path(semantic_section.get("source", ""))
+        chunk_index = int(semantic_section.get("chunk_index") or 0)
+        section_id = _entity_section_node_id(source, chunk_index)
+        section_record = section_records_by_id.get(section_id)
+        if not source or section_record is None:
+            continue
+        file_node_id = _entity_file_node_id(source)
+        line_start = int(section_record.get("line_start") or 1)
+        line_end = int(section_record.get("line_end") or line_start)
+        payload = semantic_section.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        for concept in payload.get("concepts", []):
+            if not isinstance(concept, dict):
+                continue
+            concept_id = _upsert_semantic_node(
+                nodes_by_id=nodes_by_id,
+                nodes=nodes,
+                node_seen=node_seen,
+                alias_lookup=concept_alias_lookup,
+                node_type="concept",
+                item=concept,
+            )
+            reason = str(concept.get("name") or "")
+            _add_entity_edge(
+                edges,
+                section_id,
+                concept_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            _add_entity_edge(
+                edges,
+                file_node_id,
+                concept_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            _add_entity_edge(
+                edges,
+                concept_id,
+                file_node_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+
+        for decision in payload.get("decisions", []):
+            if not isinstance(decision, dict):
+                continue
+            decision_id = _upsert_semantic_node(
+                nodes_by_id=nodes_by_id,
+                nodes=nodes,
+                node_seen=node_seen,
+                alias_lookup=decision_alias_lookup,
+                node_type="decision",
+                item=decision,
+            )
+            reason = str(decision.get("name") or "")
+            _add_entity_edge(
+                edges,
+                section_id,
+                decision_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            _add_entity_edge(
+                edges,
+                file_node_id,
+                decision_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            _add_entity_edge(
+                edges,
+                decision_id,
+                file_node_id,
+                "semantically_related",
+                evidence_source=source,
+                reason=reason,
+                line_start=line_start,
+                line_end=line_end,
+            )
+            rationale_values = decision.get("rationale")
+            if isinstance(rationale_values, list):
+                for rationale in rationale_values:
+                    rationale_key = str(rationale or "").strip().lower()
+                    if not rationale_key:
+                        continue
+                    concept_id = concept_alias_lookup.get(rationale_key)
+                    if concept_id is None:
+                        continue
+                    _add_entity_edge(
+                        edges,
+                        concept_id,
+                        decision_id,
+                        "rationale_for",
+                        evidence_source=source,
+                        reason=str(rationale),
+                        line_start=line_start,
+                        line_end=line_end,
+                    )
 
     raw_neighbors = document_graph.get("neighbors", {})
     if isinstance(raw_neighbors, dict):
@@ -1813,6 +2315,40 @@ def _entity_file_neighbors(
                     reason=str(symbol_edge.get("reason", "") or ""),
                     bridges=[symbol_bridge],
                 )
+            continue
+
+        if target_type in {"concept", "decision"}:
+            semantic_bridge = _entity_bridge_payload(target_node, relation=edge_kind or target_type)
+            for semantic_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
+                semantic_target = target_node_for(semantic_edge)
+                if not semantic_target:
+                    continue
+                semantic_kind = str(semantic_edge.get("type", "") or "")
+                semantic_reason = str(semantic_edge.get("reason", "") or "")
+                semantic_target_type = str(semantic_target.get("type", "") or "")
+                if semantic_target_type == "file":
+                    consider(
+                        target_source=str(semantic_target.get("source", "") or ""),
+                        kind=semantic_kind,
+                        reason=semantic_reason,
+                        bridges=[semantic_bridge],
+                    )
+                elif semantic_target_type == "section":
+                    section_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
+                    consider(
+                        target_source=str(semantic_target.get("source", "") or ""),
+                        kind=semantic_kind,
+                        reason=semantic_reason,
+                        bridges=[semantic_bridge, section_bridge],
+                    )
+                elif semantic_target_type == "symbol":
+                    symbol_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
+                    consider(
+                        target_source=str(semantic_target.get("source", "") or ""),
+                        kind=semantic_kind,
+                        reason=semantic_reason,
+                        bridges=[semantic_bridge, symbol_bridge],
+                    )
 
     return [
         payload
@@ -2262,6 +2798,9 @@ def _write_index_artifacts(
     embed_model: str,
     source_dir: str,
     total_chunks: int,
+    llm_api_key: str = "",
+    llm_model: str = "",
+    llm_base_url: str = "",
 ) -> dict[str, Any]:
     normalized_dir = persist_path / NORMALIZED_TEXT_DIRNAME
     if normalized_dir.exists():
@@ -2279,10 +2818,12 @@ def _write_index_artifacts(
         "symbol_index_file": SYMBOL_INDEX_FILENAME,
         "document_graph_file": DOCUMENT_GRAPH_FILENAME,
         "entity_graph_file": ENTITY_GRAPH_FILENAME,
+        "semantic_extract_cache_file": SEMANTIC_EXTRACT_CACHE_FILENAME,
         "community_index_file": COMMUNITY_INDEX_FILENAME,
         "graph_report_file": f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}",
         "lint_report_file": LINT_REPORT_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
+        "semantic_graph_stats": {},
         "files": [],
     }
 
@@ -2322,7 +2863,20 @@ def _write_index_artifacts(
         encoding="utf-8",
     )
 
-    entity_graph = _build_entity_graph(indexed_files, document_graph=document_graph)
+    semantic_sections, semantic_stats = _extract_semantic_sections(
+        indexed_files=indexed_files,
+        persist_path=persist_path,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
+    manifest["semantic_graph_stats"] = semantic_stats
+
+    entity_graph = _build_entity_graph(
+        indexed_files,
+        document_graph=document_graph,
+        semantic_sections=semantic_sections,
+    )
     entity_graph_path = persist_path / ENTITY_GRAPH_FILENAME
     entity_graph_path.write_text(
         json.dumps(entity_graph, ensure_ascii=False, indent=2),
@@ -2362,6 +2916,9 @@ def build_vectorstore(
     embed_model: str = DEFAULT_EMBED_MODEL,
     persist_dir: str = DEFAULT_FAISS_DIR,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    llm_api_key: str = "",
+    llm_model: str = "",
+    llm_base_url: str = "",
 ) -> SearchBundle:
     """
     构建（或重建）FAISS 向量索引并持久化到本地。
@@ -2425,6 +2982,9 @@ def build_vectorstore(
         embed_model=embed_model,
         source_dir=md_dir,
         total_chunks=total,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
     )
     _cb(total + 2, total_steps, "正在生成离线 wiki 导航...")
     from wiki import generate_wiki

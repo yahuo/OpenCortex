@@ -30,6 +30,12 @@ def read_runtime_config() -> dict[str, str]:
             "EMBED_BASE_URL", "https://api.siliconflow.cn/v1"
         ).strip(),
         "embed_model": os.getenv("EMBED_MODEL", "BAAI/bge-m3").strip(),
+        "llm_api_key": os.getenv("LLM_API_KEY", "").strip(),
+        "llm_base_url": os.getenv(
+            "LLM_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+        ).strip(),
+        "llm_model": os.getenv("LLM_MODEL", "gemini-2.0-flash").strip(),
         "host": host,
         "port": port,
         "api_port": os.getenv("API_PORT", "8502").strip() or "8502",
@@ -81,6 +87,9 @@ def rebuild_index(cfg: dict[str, str]) -> None:
         embed_model=cfg["embed_model"],
         persist_dir=cfg["persist_dir"],
         progress_callback=on_progress,
+        llm_api_key=cfg["llm_api_key"],
+        llm_model=cfg["llm_model"],
+        llm_base_url=cfg["llm_base_url"],
     )
 
 
