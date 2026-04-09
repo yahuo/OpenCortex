@@ -63,11 +63,11 @@ header {visibility: hidden;}
 [data-testid="collapsedControl"] {display: none !important;}
 
 /* ── 输入框 focus 光效 ── */
-[data-testid="stChatInputContainer"] {
+[data-testid="stForm"] {
     transition: box-shadow 0.2s ease, border-color 0.2s ease;
 }
-[data-testid="stChatInput"] textarea:focus,
-[data-testid="stChatInputContainer"]:focus-within {
+[data-testid="stTextArea"] textarea:focus,
+[data-testid="stForm"]:focus-within {
     outline: none;
     box-shadow: 0 0 0 2px rgba(74,222,128,0.4), 0 0 18px rgba(34,211,238,0.15);
     border-color: rgba(74,222,128,0.5) !important; /* 覆盖 Streamlit 框架注入的 inline border-color */
@@ -713,7 +713,21 @@ for msg_index, msg in enumerate(st.session_state.rag_messages):
         if msg.get("role") == "assistant":
             render_query_note_actions(msg_index, msg, cfg["persist_dir"])
 
-if question := st.chat_input("输入问题..."):
+with st.form("chat-prompt-form", clear_on_submit=True):
+    prompt_col, button_col = st.columns([6, 1])
+    with prompt_col:
+        question = st.text_area(
+            "输入问题...",
+            key="chat_prompt_input",
+            placeholder="输入问题...",
+            height=80,
+            label_visibility="collapsed",
+        )
+    with button_col:
+        submitted = st.form_submit_button("Send message", use_container_width=True)
+
+if submitted and question.strip():
+    question = question.strip()
     st.session_state.rag_messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)

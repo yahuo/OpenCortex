@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import shutil
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -236,6 +237,585 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
         for page in search_bundle.wiki_pages
     )
     assert any(page["kind"] == "community" for page in search_bundle.wiki_pages)
+
+
+def test_build_vectorstore_uses_faster_embedding_defaults(tmp_path: Path, monkeypatch) -> None:
+    docs = [
+        ragbot.Document(
+            page_content=f"chunk {index}",
+            metadata={"source": "工程/bootstrap_session.py", "chunk_index": index},
+        )
+        for index in range(ragbot.DEFAULT_EMBED_BATCH_SIZE + 1)
+    ]
+    batch_sizes: list[int] = []
+    sleep_calls: list[float] = []
+
+    class FakeVectorStore:
+        @classmethod
+        def from_documents(cls, batch, _embeddings):
+            batch_sizes.append(len(batch))
+            return cls()
+
+        def add_documents(self, batch):
+            batch_sizes.append(len(batch))
+
+        def save_local(self, _path: str) -> None:
+            return None
+
+    fake_bundle = SimpleNamespace(manifest={})
+
+    monkeypatch.delenv("EMBED_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("EMBED_BATCH_SLEEP_SECONDS", raising=False)
+    monkeypatch.setattr(ragbot, "_build_documents", lambda _source_dir: (docs, []))
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "FAISS", FakeVectorStore)
+    monkeypatch.setattr(
+        ragbot,
+        "_write_index_artifacts",
+        lambda **_kwargs: {"files": [], "normalized_text_dir": ragbot.NORMALIZED_TEXT_DIRNAME},
+    )
+    monkeypatch.setattr(ragbot, "load_search_bundle", lambda **_kwargs: fake_bundle)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(wiki, "generate_wiki", lambda **_kwargs: {"pages": 0, "lint_issues": 0})
+
+    ragbot.build_vectorstore(
+        md_dir=str(tmp_path / "docs"),
+        embed_api_key="fake-key",
+        persist_dir=str(tmp_path / "index"),
+    )
+
+    assert batch_sizes == [ragbot.DEFAULT_EMBED_BATCH_SIZE, 1]
+    assert sleep_calls == []
+
+
+def test_build_vectorstore_still_honors_configured_batch_sleep(tmp_path: Path, monkeypatch) -> None:
+    docs = [
+        ragbot.Document(
+            page_content=f"chunk {index}",
+            metadata={"source": "工程/bootstrap_session.py", "chunk_index": index},
+        )
+        for index in range(3)
+    ]
+    sleep_calls: list[float] = []
+
+    class FakeVectorStore:
+        @classmethod
+        def from_documents(cls, batch, _embeddings):
+            return cls()
+
+        def add_documents(self, batch):
+            return None
+
+        def save_local(self, _path: str) -> None:
+            return None
+
+    fake_bundle = SimpleNamespace(manifest={})
+
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_BATCH_SLEEP_SECONDS", "0.25")
+    monkeypatch.setattr(ragbot, "_build_documents", lambda _source_dir: (docs, []))
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "FAISS", FakeVectorStore)
+    monkeypatch.setattr(
+        ragbot,
+        "_write_index_artifacts",
+        lambda **_kwargs: {"files": [], "normalized_text_dir": ragbot.NORMALIZED_TEXT_DIRNAME},
+    )
+    monkeypatch.setattr(ragbot, "load_search_bundle", lambda **_kwargs: fake_bundle)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(wiki, "generate_wiki", lambda **_kwargs: {"pages": 0, "lint_issues": 0})
+
+    ragbot.build_vectorstore(
+        md_dir=str(tmp_path / "docs"),
+        embed_api_key="fake-key",
+        persist_dir=str(tmp_path / "index"),
+    )
+
+    assert sleep_calls == [0.25, 0.25]
+
+
+def test_build_vectorstore_can_skip_graph_semantic_and_wiki(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(
+        ragbot,
+        "_convert_binary_to_markdown",
+        lambda _path: "# PDF Manual\n\nsession bootstrap manual and startup references",
+    )
+    monkeypatch.setattr(
+        ragbot,
+        "_build_document_graph",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should skip document graph")),
+    )
+    monkeypatch.setattr(
+        ragbot,
+        "_extract_semantic_sections",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should skip semantic extraction")),
+    )
+    monkeypatch.setattr(
+        wiki,
+        "generate_wiki",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should skip wiki generation")),
+    )
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    assert bundle.manifest["build_flags"] == {
+        "skip_graph": True,
+        "skip_semantic": True,
+        "skip_wiki": True,
+    }
+    assert bundle.document_graph["edge_count"] == 0
+    assert all(node["type"] == "file" for node in bundle.entity_graph["nodes"])
+    assert bundle.manifest["semantic_graph_stats"]["reason"] == "skipped_by_graph"
+    assert bundle.wiki_pages == []
+    assert not (index_dir / "wiki" / "index.md").exists()
+
+
+def test_build_vectorstore_can_embed_batches_concurrently(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    for idx in range(3):
+        (docs_dir / f"doc-{idx}.md").write_text(
+            f"# Doc {idx}\n\nchunk {idx}\n",
+            encoding="utf-8",
+        )
+
+    tracker = {
+        "active": 0,
+        "max_active": 0,
+        "lock": threading.Lock(),
+        "overlap_ready": threading.Event(),
+    }
+
+    class BlockingEmbeddings(FakeEmbeddings):
+        def __init__(self, shared_tracker: dict[str, object]):
+            super().__init__()
+            self.shared_tracker = shared_tracker
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            lock = self.shared_tracker["lock"]
+            with lock:
+                self.shared_tracker["active"] += 1
+                self.shared_tracker["max_active"] = max(
+                    self.shared_tracker["max_active"],
+                    self.shared_tracker["active"],
+                )
+                if self.shared_tracker["active"] >= 2:
+                    self.shared_tracker["overlap_ready"].set()
+            self.shared_tracker["overlap_ready"].wait(timeout=0.5)
+            try:
+                return super().embed_documents(texts)
+            finally:
+                with lock:
+                    self.shared_tracker["active"] -= 1
+
+    monkeypatch.setattr(
+        ragbot,
+        "make_embeddings",
+        lambda *args, **kwargs: BlockingEmbeddings(tracker),
+    )
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_CONCURRENCY", "2")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    assert tracker["max_active"] >= 2
+
+
+def test_build_vectorstore_surfaces_rate_limit_progress_in_concurrent_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    for idx in range(2):
+        (docs_dir / f"doc-{idx}.md").write_text(
+            f"# Doc {idx}\n\nchunk {idx}\n",
+            encoding="utf-8",
+        )
+
+    progress_messages: list[str] = []
+
+    class RetryOnceEmbeddings(FakeEmbeddings):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("429 rate limit")
+            return super().embed_documents(texts)
+
+    monkeypatch.setattr(
+        ragbot,
+        "make_embeddings",
+        lambda *args, **kwargs: RetryOnceEmbeddings(),
+    )
+    monkeypatch.setattr(ragbot.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_CONCURRENCY", "2")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        progress_callback=lambda _current, _total, message: progress_messages.append(message),
+    )
+
+    assert any("触发 embedding 限流" in message for message in progress_messages)
+
+
+def test_build_vectorstore_ignores_batch_sleep_in_concurrent_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    for idx in range(2):
+        (docs_dir / f"doc-{idx}.md").write_text(
+            f"# Doc {idx}\n\nchunk {idx}\n",
+            encoding="utf-8",
+        )
+
+    sleep_calls: list[float] = []
+    progress_messages: list[str] = []
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_CONCURRENCY", "2")
+    monkeypatch.setenv("EMBED_BATCH_SLEEP_SECONDS", "0.25")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        progress_callback=lambda _current, _total, message: progress_messages.append(message),
+    )
+
+    assert sleep_calls == []
+    assert any("并发模式下已忽略" in message for message in progress_messages)
+
+
+def test_build_vectorstore_surfaces_worker_failure_in_concurrent_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    for idx in range(3):
+        (docs_dir / f"doc-{idx}.md").write_text(
+            f"# Doc {idx}\n\nchunk content {idx}\n",
+            encoding="utf-8",
+        )
+
+    class FailingEmbeddings(FakeEmbeddings):
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            if any("chunk content 1" in text for text in texts):
+                raise RuntimeError("simulated upstream outage")
+            return super().embed_documents(texts)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FailingEmbeddings())
+    monkeypatch.setattr(ragbot.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_CONCURRENCY", "2")
+    monkeypatch.setenv("EMBED_MAX_RETRIES", "0")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    with pytest.raises(RuntimeError, match="simulated upstream outage"):
+        ragbot.build_vectorstore(
+            md_dir=str(docs_dir),
+            embed_api_key="fake-key",
+            persist_dir=str(index_dir),
+        )
+
+    # 非限流异常必须把构建失败传给调用者，且不允许残留任何已落盘的 FAISS artifact。
+    assert not (index_dir / "index.faiss").exists()
+    assert not (index_dir / "index.pkl").exists()
+    assert not (index_dir / "index_manifest.json").exists()
+    # 临时 staged cache 目录由 TemporaryDirectory 在异常路径上清理，persist_dir 下不应残留。
+    assert not (index_dir / ragbot.NORMALIZED_TEXT_DIRNAME).exists()
+    leftover_staging = [p for p in index_dir.glob(".opencortex-build-*")]
+    assert leftover_staging == []
+
+
+def test_index_source_files_spills_normalized_text_to_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    source_path = docs_dir / "notes.md"
+    source_path.write_text(
+        """
+# Notes
+
+The bootstrap session should load config and then start the assistant.
+""".strip(),
+        encoding="utf-8",
+    )
+
+    cache_root = tmp_path / "build-cache"
+    indexed_files, total_chunks = ragbot._index_source_files(str(docs_dir), cache_root)
+
+    assert total_chunks == 1
+    assert len(indexed_files) == 1
+
+    indexed = indexed_files[0]
+    assert indexed.normalized_text is None
+    assert indexed.chunks is None
+    assert indexed.normalized_text_path is not None and indexed.normalized_text_path.exists()
+    assert indexed.chunk_count == 1
+
+    monkeypatch.setattr(
+        ragbot.IndexedFile,
+        "get_normalized_text",
+        lambda _self: (_ for _ in ()).throw(AssertionError("should not materialize the cached file")),
+    )
+    documents = list(ragbot._iter_documents_for_indexed_files(indexed_files))
+    assert len(documents) == 1
+    assert documents[0].metadata["source"] == "notes.md"
+    assert "bootstrap session" in documents[0].page_content
+
+
+def test_split_lines_into_chunks_uses_env_chunk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHUNK_SIZE", "12")
+    monkeypatch.setenv("CHUNK_OVERLAP_LINES", "1")
+
+    chunks = ragbot._split_lines_into_chunks(["aaaaa", "bbbbb", "ccccc"])
+
+    assert [(chunk.line_start, chunk.line_end) for chunk in chunks] == [(1, 2), (2, 3)]
+
+
+def test_parse_wechat_messages_filters_export_noise() -> None:
+    content = """
+# 聊天记录: Demo
+
+> 导出时间: 2026-04-10 10:00:00
+
+---
+
+**系统提示** `[2024-01-01 10:00:00]`
+*]]></plain><br><template><![CDATA["$username$"邀请你加入了群聊]]></template><br><link_list>
+
+**张三** `[2024-01-01 10:01:00]`
+![图片](../images/demo.png)
+
+**李四** `[2024-01-01 10:02:00]`
+📸 `[加密高级图片: 微信 V2 协议封锁，请前往电脑端原生查看]`
+
+**王五** `[2024-01-01 10:03:00]`
+真实进展：服务已经恢复
+""".strip()
+
+    messages = ragbot._parse_md_messages_text(content)
+
+    assert len(messages) == 1
+    assert messages[0]["sender"] == "王五"
+    assert messages[0]["content"] == "真实进展：服务已经恢复"
+
+
+def test_parse_wechat_messages_drops_system_pattern_without_xml() -> None:
+    messages = ragbot._parse_md_messages_text(
+        """
+**系统提示** `[2024-01-01 10:00:00]`
+张三 撤回了一条消息
+""".strip()
+    )
+
+    assert messages == []
+
+
+def test_iter_chunks_from_cached_file_respects_max_chunks_per_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    path = tmp_path / "wechat.md"
+    path.write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+第一段
+
+**张三** `[2024-01-01 11:00:00]`
+第二段
+
+**张三** `[2024-01-01 12:00:00]`
+第三段
+""".strip(),
+        encoding="utf-8",
+    )
+
+    chunks = list(ragbot._iter_chunks_from_cached_file(path, ".md", "wechat_markdown"))
+
+    assert len(chunks) == 2
+    assert "第一段" not in chunks[0].text
+    assert "第二段" in chunks[0].text
+    assert "第三段" in chunks[1].text
+
+
+def test_iter_chunks_from_cached_file_filters_wechat_image_noise(tmp_path: Path) -> None:
+    path = tmp_path / "wechat-noise.md"
+    path.write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+![图片](../images/demo.png)
+真实内容
+""".strip(),
+        encoding="utf-8",
+    )
+
+    chunks = list(ragbot._iter_chunks_from_cached_file(path, ".md", "wechat_markdown"))
+
+    assert len(chunks) == 1
+    assert ".png" not in chunks[0].text
+    assert "真实内容" in chunks[0].text
+
+
+def test_build_vectorstore_records_truncated_files_in_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    progress_messages: list[str] = []
+    (docs_dir / "wechat.md").write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+第一段
+
+**张三** `[2024-01-01 11:00:00]`
+第二段
+
+**张三** `[2024-01-01 12:00:00]`
+第三段
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        progress_callback=lambda _current, _total, message: progress_messages.append(message),
+    )
+
+    file_entry = bundle.manifest["files"][0]
+    assert file_entry["chunks"] == 2
+    assert file_entry["original_chunks"] == 3
+    assert file_entry["truncated"] is True
+    assert any("MAX_CHUNKS_PER_FILE 被截断" in message for message in progress_messages)
+
+
+def test_markdown_heading_chunker_yields_before_consuming_entire_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+    long_line = "x" * 400
+
+    def fake_iter_text_file_lines(_path: Path):
+        calls["count"] += 1
+        yield "# Huge Section"
+        for index in range(20):
+            if calls["count"] == 2 and index >= 8:
+                raise AssertionError("should yield the first chunk before reading the full section")
+            yield long_line
+
+    monkeypatch.setattr(ragbot, "_iter_text_file_lines", fake_iter_text_file_lines)
+
+    chunk_iter = ragbot._iter_markdown_heading_chunks_from_file(tmp_path / "ignored.md")
+    first_chunk = next(chunk_iter)
+
+    assert first_chunk.label == "Huge Section"
+    assert first_chunk.line_start == 1
+    assert first_chunk.line_end < 10
+
+
+def test_markdown_heading_chunker_reads_no_heading_file_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    def fake_iter_text_file_lines(_path: Path):
+        calls["count"] += 1
+        yield "plain intro"
+        yield "plain body"
+
+    monkeypatch.setattr(ragbot, "_iter_text_file_lines", fake_iter_text_file_lines)
+
+    chunks = list(ragbot._iter_markdown_heading_chunks_from_file(Path("ignored.md")))
+
+    assert calls["count"] == 1
+    assert len(chunks) == 1
+    assert chunks[0].label == "preface"
+
+
+def test_build_vectorstore_stages_cache_under_persist_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    sentinel = SimpleNamespace(manifest={})
+    seen: dict[str, Path] = {}
+
+    def fake_index_source_files(_source_dir: str, cache_root: Path) -> tuple[list[ragbot.IndexedFile], int]:
+        seen["cache_root"] = cache_root
+        return [], 0
+
+    def fake_build_vectorstore_from_document_stream(**kwargs):
+        seen["staged_normalized_dir"] = kwargs["staged_normalized_dir"]
+        return sentinel
+
+    monkeypatch.setattr(ragbot, "_index_source_files", fake_index_source_files)
+    monkeypatch.setattr(ragbot, "_build_vectorstore_from_document_stream", fake_build_vectorstore_from_document_stream)
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    assert index_dir in seen["cache_root"].parents
+    assert seen["staged_normalized_dir"] == seen["cache_root"]
 
 
 def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: pytest.MonkeyPatch):
@@ -1158,9 +1738,27 @@ def test_extract_query_plan_uses_boundaries_for_extension_aliases():
     assert "*.go" in explicit.path_globs
 
 
+def test_extract_query_plan_promotes_non_ascii_filename_to_exact_keyword_and_glob():
+    plan = ragbot._extract_query_plan("创业慧康基础门户系统操作手册.docx")
+
+    assert "创业慧康基础门户系统操作手册.docx" in plan.keywords
+    assert "docx" not in {keyword.lower() for keyword in plan.keywords}
+    assert plan.symbols == []
+    assert "*创业慧康基础门户系统操作手册.docx*" in plan.path_globs
+    assert "*.docx" in plan.path_globs
+
+
 def test_extract_query_plan_promotes_quoted_symbol_tokens():
     plan = ragbot._extract_query_plan("查看 `login` 的定义")
     assert "login" in plan.symbols
+
+
+def test_extract_query_plan_does_not_treat_qualified_symbol_as_path_glob():
+    plan = ragbot._extract_query_plan("查看 `requests.Session.send` 的定义")
+
+    assert "requests.Session.send" in plan.symbols
+    assert all("requests.Session.send" not in path_glob for path_glob in plan.path_globs)
+    assert ragbot._wiki_source_ref_matches_query("工程/http_client.py", plan) is True
 
 
 def test_expand_candidate_sources_requires_stronger_token_overlap(search_bundle, monkeypatch):
@@ -1207,6 +1805,45 @@ def test_rg_grep_uses_single_process_for_multiple_keywords(search_bundle, monkey
     assert len(calls) == 1
     assert calls[0].count("-e") == 3
     assert hits
+
+
+def test_retrieve_prefers_exact_non_ascii_filename_over_other_docx_files(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    (docs_dir / "产品").mkdir(parents=True)
+    (docs_dir / "聊天").mkdir(parents=True)
+
+    (docs_dir / "产品" / "创业慧康基础门户系统操作手册.docx").write_text("placeholder", encoding="utf-8")
+    (docs_dir / "产品" / "华南大区技术协同规范V1.0.docx").write_text("placeholder", encoding="utf-8")
+    (docs_dir / "聊天" / "华南大区群.md").write_text(
+        "请重新查看 Hi-HIS-大区技术协同规范V1.0.docx 的流程说明。",
+        encoding="utf-8",
+    )
+
+    def fake_convert(path: Path) -> str:
+        if path.name == "创业慧康基础门户系统操作手册.docx":
+            return "# 创业慧康基础门户系统操作手册\n\n系统登录与租户管理。"
+        if path.name == "华南大区技术协同规范V1.0.docx":
+            return "# 华南大区技术协同规范\n\n大区分支提交流程。"
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "_convert_binary_to_markdown", fake_convert)
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    result = ragbot.retrieve("创业慧康基础门户系统操作手册.docx", bundle, kb="产品", mode="hybrid")
+    index_hits = [hit for hit in result["search_trace"][0]["wiki_hits"] if hit["kind"] == "index"]
+
+    assert result["search_trace"][0]["query_plan"]["keywords"] == ["创业慧康基础门户系统操作手册.docx"]
+    assert result["search_trace"][0]["wiki_scope"] == ["产品/创业慧康基础门户系统操作手册.docx"]
+    assert index_hits and index_hits[0]["source_refs"] == ["产品/创业慧康基础门户系统操作手册.docx"]
+    assert result["hits"][0].source == "产品/创业慧康基础门户系统操作手册.docx"
+    assert all(hit.source != "聊天/华南大区群.md" for hit in result["hits"][:3])
 
 
 def test_load_wiki_pages_retries_when_rebuild_temporarily_removes_page(

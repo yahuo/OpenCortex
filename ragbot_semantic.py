@@ -381,7 +381,7 @@ def _iter_semantic_sections(indexed_files: list[IndexedFile]) -> list[dict[str, 
         source = core._normalize_source_path(indexed.rel_path)
         if not source:
             continue
-        for chunk_index, chunk in enumerate(indexed.chunks):
+        for chunk_index, chunk in enumerate(indexed.iter_chunks()):
             text = chunk.text.strip()
             if not text:
                 continue
@@ -559,7 +559,7 @@ def _build_entity_graph(
     pending_rationale_edges: list[dict[str, Any]] = []
 
     for source, indexed in sorted(normalized_files, key=lambda item: item[0]):
-        total_lines = max(1, len(indexed.normalized_text.splitlines()))
+        total_lines = indexed.line_count
         kb = core._extract_kb(source) or indexed.kb
         core._add_entity_node(
             nodes,
@@ -579,7 +579,7 @@ def _build_entity_graph(
         nodes_by_id[core._entity_file_node_id(source)] = nodes[-1]
 
         section_records: list[dict[str, Any]] = []
-        for chunk_index, chunk in enumerate(indexed.chunks):
+        for chunk_index, chunk in enumerate(indexed.iter_chunks()):
             label = chunk.label or f"chunk {chunk_index + 1}"
             section_id = core._entity_section_node_id(source, chunk_index)
             section_line_start = chunk.line_start or 1

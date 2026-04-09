@@ -24,18 +24,38 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from ragbot_build import (
+    _add_embedded_batch,
     _build_document_graph,
     _build_documents,
+    _build_vectorstore_from_document_stream,
     _chunk_markdown_by_heading,
+    _chunks_for_indexed_text,
     _chunk_python_code,
     _chunk_structured_text,
+    _clear_generated_wiki_artifacts,
     _convert_binary_to_markdown,
+    _document_batch_ids,
+    _embed_texts_with_retries,
     _extract_python_symbols,
+    _index_source_files,
+    _iter_chunk_specs_from_line_stream,
+    _iter_chunks_from_cached_file,
+    _iter_document_batches,
+    _iter_documents_for_indexed_files,
+    _iter_markdown_heading_chunks_from_file,
+    _iter_text_file_lines,
+    _iter_wechat_markdown_chunks_from_file,
     _iter_supported_files,
+    _normalized_cache_path,
     _normalize_structured_text,
+    _prepare_indexed_content,
     _process_source_file,
+    _process_source_file_to_cache,
+    _read_source_text,
     _should_ignore_relative_path,
     _write_index_artifacts,
     build_vectorstore,
@@ -53,8 +73,11 @@ from ragbot_local_search import (
     _first_non_empty_lines,
     _grep_search_python,
     _grep_search_with_rg,
+    _has_supported_file_suffix,
     _hit_priority,
+    _is_extension_only_glob,
     _keyword_score,
+    _looks_like_explicit_source_term,
     _merge_primary_kind,
     _read_cached_text,
     _search_max_steps,
@@ -102,6 +125,7 @@ from ragbot_retrieval import (
     _vector_hit_from_document,
     _wiki_kind_priority,
     _wiki_query_terms,
+    _wiki_source_ref_matches_query,
     _wiki_search,
     ask_stream,
     retrieve,
@@ -316,9 +340,69 @@ class IndexedFile:
     suffix: str
     kb: str
     file_path: Path
-    normalized_text: str
-    chunks: list[ChunkSpec]
-    symbols: list[dict[str, Any]]
+    normalized_text: str | None = None
+    chunks: list[ChunkSpec] | None = None
+    symbols: list[dict[str, Any]] = field(default_factory=list)
+    normalized_text_path: Path | None = None
+    chunk_strategy: str = ""
+    _chunk_total: int = 0
+    _original_chunk_total: int = 0
+    _line_total: int = 0
+
+    def get_normalized_text(self) -> str:
+        if self.normalized_text is not None:
+            return self.normalized_text
+        if self.normalized_text_path is None:
+            return ""
+        return self.normalized_text_path.read_text(encoding="utf-8")
+
+    def iter_normalized_lines(self) -> Iterable[str]:
+        if self.normalized_text is not None:
+            return iter(self.normalized_text.splitlines())
+        if self.normalized_text_path is None:
+            return iter(())
+        return _iter_text_file_lines(self.normalized_text_path)
+
+    def iter_chunks(self) -> Iterable[ChunkSpec]:
+        if self.chunks is not None:
+            return iter(self.chunks)
+        if self.normalized_text_path is not None and self.normalized_text is None:
+            return _iter_chunks_from_cached_file(
+                self.normalized_text_path,
+                self.suffix,
+                self.chunk_strategy,
+            )
+        return iter(_chunks_for_indexed_text(self.get_normalized_text(), self.suffix, self.chunk_strategy))
+
+    @property
+    def chunk_count(self) -> int:
+        if self._chunk_total > 0:
+            return self._chunk_total
+        if self.chunks is not None:
+            return len(self.chunks)
+        return sum(1 for _ in self.iter_chunks())
+
+    @property
+    def line_count(self) -> int:
+        if self._line_total > 0:
+            return self._line_total
+        return max(1, sum(1 for _ in self.iter_normalized_lines()))
+
+    @property
+    def original_chunk_count(self) -> int:
+        if self._original_chunk_total > 0:
+            return self._original_chunk_total
+        return self.chunk_count
+
+    @property
+    def truncated(self) -> bool:
+        return self.original_chunk_count > self.chunk_count
+
+    def write_normalized_text(self, target_path: Path) -> None:
+        if self.normalized_text_path is not None and self.normalized_text is None:
+            shutil.copyfile(self.normalized_text_path, target_path)
+            return
+        target_path.write_text(self.get_normalized_text(), encoding="utf-8")
 
 
 @dataclass(slots=True)
@@ -370,6 +454,52 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     """粗略识别第三方 embedding 服务的限流错误。"""
     message = str(exc).lower()
     return "429" in message or "rate limit" in message or "tpm limit" in message
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in SEMANTIC_GRAPH_ENABLED_VALUES:
+        return True
+    if value in SEMANTIC_GRAPH_DISABLED_VALUES:
+        return False
+    return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _configured_chunk_size() -> int:
+    return max(1, _env_int("CHUNK_SIZE", GENERIC_CHUNK_SIZE))
+
+
+def _configured_chunk_overlap_lines() -> int:
+    return max(0, _env_int("CHUNK_OVERLAP_LINES", GENERIC_CHUNK_OVERLAP_LINES))
+
+
+def _configured_max_chunks_per_file() -> int | None:
+    value = _env_int("MAX_CHUNKS_PER_FILE", 0)
+    if value <= 0:
+        return None
+    return value
+
+
+def _limit_prefers_tail(chunk_strategy: str) -> bool:
+    return chunk_strategy == "wechat_markdown"
 
 
 def make_embeddings(
@@ -458,12 +588,14 @@ def _load_extra_exclude_globs() -> list[str]:
 def _split_lines_into_chunks(
     lines: list[str],
     start_line: int = 1,
-    chunk_size: int = GENERIC_CHUNK_SIZE,
-    overlap_lines: int = GENERIC_CHUNK_OVERLAP_LINES,
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
     label: str = "",
 ) -> list[ChunkSpec]:
     if not lines:
         return []
+    chunk_size = _configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = _configured_chunk_overlap_lines() if overlap_lines is None else max(0, overlap_lines)
 
     chunks: list[ChunkSpec] = []
     index = 0
@@ -494,10 +626,53 @@ def _split_lines_into_chunks(
     return chunks
 
 
-def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
+def _limit_chunk_specs(
+    chunks: Iterable[ChunkSpec],
+    max_chunks: int | None = None,
+    chunk_strategy: str = "",
+) -> list[ChunkSpec]:
+    limit = _configured_max_chunks_per_file() if max_chunks is None else max_chunks
+    items = list(chunks)
+    if limit is None or len(items) <= limit:
+        return items
+    if _limit_prefers_tail(chunk_strategy):
+        return items[-limit:]
+    return items[:limit]
+
+
+def _iter_limited_chunks(
+    chunks: Iterable[ChunkSpec],
+    max_chunks: int | None = None,
+    chunk_strategy: str = "",
+) -> Iterable[ChunkSpec]:
+    limit = _configured_max_chunks_per_file() if max_chunks is None else max_chunks
+    if limit is None:
+        yield from chunks
+        return
+    if _limit_prefers_tail(chunk_strategy):
+        tail: deque[ChunkSpec] = deque(maxlen=limit)
+        for chunk in chunks:
+            tail.append(chunk)
+        yield from tail
+        return
+    emitted = 0
+    for chunk in chunks:
+        if emitted >= limit:
+            break
+        emitted += 1
+        yield chunk
+
+
+def _ensure_chunk_size(
+    chunks: list[ChunkSpec],
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
+) -> list[ChunkSpec]:
+    chunk_size = _configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = _configured_chunk_overlap_lines() if overlap_lines is None else max(0, overlap_lines)
     results: list[ChunkSpec] = []
     for chunk in chunks:
-        if len(chunk.text) <= GENERIC_CHUNK_SIZE:
+        if len(chunk.text) <= chunk_size:
             results.append(chunk)
             continue
         lines = chunk.text.splitlines()
@@ -506,6 +681,8 @@ def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
             _split_lines_into_chunks(
                 lines=lines,
                 start_line=start_line,
+                chunk_size=chunk_size,
+                overlap_lines=overlap_lines,
                 label=chunk.label,
             )
         )
@@ -518,6 +695,67 @@ def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
 _HEADER_RE = re.compile(
     r"^\*\*(.+?)\*\*\s+`\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]`"
 )
+_WECHAT_IMAGE_LINE_RE = re.compile(r"^!\[[^\]]*\]\([^)]+\.(?:png|jpe?g|gif|webp|bmp)\)$", re.IGNORECASE)
+_WECHAT_SYSTEM_DROP_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"撤回了一条消息",
+        r"邀请你加入了群聊",
+        r"加入了群聊",
+        r"移出了群聊",
+        r"修改群名为",
+        r"更换了群头像",
+        r"拍了拍",
+        r"开启了群待办",
+        r"结束了群待办",
+    )
+]
+
+
+def _sanitize_wechat_message_lines(lines: Iterable[str]) -> list[str]:
+    sanitized: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line == "---" or line.startswith("> 导出时间"):
+            continue
+        if _WECHAT_IMAGE_LINE_RE.fullmatch(line):
+            continue
+        if line.startswith("📸 `") and "加密高级图片" in line:
+            continue
+        if line.startswith("📦 `") and "未知格式内建消息" in line:
+            continue
+        if "<![CDATA[" in line and any(
+            marker in line for marker in ("<template>", "<link_list>", "<memberlist>", "<plain>")
+        ):
+            continue
+        sanitized.append(line)
+    return sanitized
+
+
+def _build_wechat_message(
+    sender: str | None,
+    timestamp: datetime | None,
+    lines: list[str],
+    line_start: int | None,
+    line_end: int | None,
+) -> dict[str, Any] | None:
+    if sender is None or line_start is None:
+        return None
+    cleaned_lines = _sanitize_wechat_message_lines(lines)
+    if not cleaned_lines:
+        return None
+    body = "\n".join(cleaned_lines).strip()
+    if not body:
+        return None
+    if sender == "系统提示" and any(pattern.search(body) for pattern in _WECHAT_SYSTEM_DROP_PATTERNS):
+        return None
+    return {
+        "sender": sender,
+        "timestamp": timestamp,
+        "content": body,
+        "line_start": line_start,
+        "line_end": line_end or line_start,
+    }
 
 
 def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
@@ -529,20 +767,15 @@ def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
     current_end_line: int | None = None
 
     def flush():
-        if current_sender is None or current_start_line is None:
-            return
-        body = "\n".join(current_lines).strip()
-        if not body:
-            return
-        messages.append(
-            {
-                "sender": current_sender,
-                "timestamp": current_ts,
-                "content": body,
-                "line_start": current_start_line,
-                "line_end": current_end_line or current_start_line,
-            }
+        message = _build_wechat_message(
+            current_sender,
+            current_ts,
+            current_lines,
+            current_start_line,
+            current_end_line,
         )
+        if message is not None:
+            messages.append(message)
 
     for lineno, line in enumerate(content.splitlines(), start=1):
         match = _HEADER_RE.match(line)
@@ -562,7 +795,7 @@ def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
             continue
 
         stripped = line.strip()
-        if stripped and stripped not in ("---",) and not stripped.startswith("> 导出时间"):
+        if stripped:
             current_lines.append(stripped)
             current_end_line = lineno
 
@@ -625,13 +858,11 @@ def _flatten_mapping(value: Any, prefix: str = "") -> list[str]:
         lines.append(str(scalar))
     return lines
 
-
 def _extract_kb(rel_path: str) -> str:
     parts = [part for part in _normalize_source_path(rel_path).split("/") if part]
     if len(parts) > 1:
         return parts[0]
     return ""
-
 
 def _normalize_graph_token(token: str) -> str | None:
     clean = token.strip().strip("`\"'").rstrip("()")
@@ -655,27 +886,26 @@ def _extract_shared_tokens(indexed: IndexedFile) -> set[str]:
                 if token:
                     tokens.add(token)
 
-    if indexed.suffix in STRUCTURED_SUFFIXES:
-        for line in indexed.normalized_text.splitlines():
-            if " = " not in line:
-                continue
-            key = line.split(" = ", 1)[0].strip()
-            if re.fullmatch(r"[A-Za-z0-9_.-]{3,}", key):
-                tokens.add(key.lower())
-            for piece in re.split(r"[.\[\]-]+", key):
-                token = _normalize_graph_token(piece)
-                if token:
-                    tokens.add(token)
+    for line in indexed.iter_normalized_lines():
+        if indexed.suffix in STRUCTURED_SUFFIXES:
+            if " = " in line:
+                key = line.split(" = ", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z0-9_.-]{3,}", key):
+                    tokens.add(key.lower())
+                for piece in re.split(r"[.\[\]-]+", key):
+                    token = _normalize_graph_token(piece)
+                    if token:
+                        tokens.add(token)
 
-    for match in CODE_SPAN_RE.findall(indexed.normalized_text):
-        token = _normalize_graph_token(match)
-        if token:
-            tokens.add(token)
+        for match in CODE_SPAN_RE.findall(line):
+            token = _normalize_graph_token(match)
+            if token:
+                tokens.add(token)
 
-    for match in CALL_RE.findall(indexed.normalized_text):
-        token = _normalize_graph_token(match)
-        if token:
-            tokens.add(token)
+        for match in CALL_RE.findall(line):
+            token = _normalize_graph_token(match)
+            if token:
+                tokens.add(token)
 
     return tokens
 
@@ -699,6 +929,29 @@ def _iter_local_path_references(text: str) -> list[tuple[str, str]]:
             seen.add(item)
             refs.append(item)
     return refs
+
+
+def _iter_local_path_references_in_lines(lines: Iterable[str]) -> Iterable[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        for ref in MARKDOWN_LINK_RE.findall(line):
+            item = ("links_to", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
+        for ref in HTML_HREF_RE.findall(line):
+            item = ("links_to", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
+        for ref in PATHISH_RE.findall(line):
+            item = ("mentions_path", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
 
 
 def _resolve_document_reference(
@@ -757,7 +1010,6 @@ def _add_graph_edge(
     current = edges_by_source[source].get(target)
     if current is None or priority < current[0]:
         edges_by_source[source][target] = (priority, payload)
-
 
 def _entity_file_node_id(source: str) -> str:
     return f"file:{_normalize_source_path(source)}"

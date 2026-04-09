@@ -352,18 +352,14 @@ def _wiki_source_ref_matches_query(source: str, query_plan: QueryPlan) -> bool:
     specific_terms = core._dedupe_strings(
         term.lower()
         for term in [*query_plan.keywords, *query_plan.symbols]
-        if isinstance(term, str) and term.strip() and any(marker in term for marker in (".", "/", "\\"))
+        if isinstance(term, str) and core._looks_like_explicit_source_term(term)
     )
     specific_patterns = core._dedupe_strings(
         pattern.lower()
         for pattern in query_plan.path_globs
         if isinstance(pattern, str)
         and pattern.strip()
-        and not (
-            pattern.strip("*").startswith(".")
-            and pattern.strip("*").count(".") == 1
-            and "/" not in pattern.strip("*")
-        )
+        and not core._is_extension_only_glob(pattern)
     )
     if not specific_terms and not specific_patterns:
         return True

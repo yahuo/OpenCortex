@@ -55,6 +55,28 @@ def _bundle_sources(
     return results
 
 
+def _has_supported_file_suffix(token: str) -> bool:
+    core = _core()
+    clean = str(token).strip().lower()
+    return any(clean.endswith(suffix) and len(clean) > len(suffix) for suffix in core.SUPPORTED_TEXT_SUFFIXES)
+
+
+def _looks_like_explicit_source_term(token: str) -> bool:
+    clean = str(token).strip()
+    if not clean:
+        return False
+    if "*" in clean or "/" in clean or "\\" in clean:
+        return True
+    if clean.startswith(".") and clean.count(".") == 1 and len(clean) <= 8:
+        return True
+    return _has_supported_file_suffix(clean)
+
+
+def _is_extension_only_glob(pattern: str) -> bool:
+    stripped = str(pattern).strip().strip("*")
+    return stripped.startswith(".") and stripped.count(".") == 1 and "/" not in stripped and "\\" not in stripped
+
+
 def _extract_query_plan(question: str) -> QueryPlan:
     core = _core()
     quoted = re.findall(r"`([^`]+)`", question)
@@ -80,14 +102,11 @@ def _extract_query_plan(question: str) -> QueryPlan:
         clean = token.strip().strip(".,:;!?()[]{}")
         if not clean:
             continue
-        has_supported_suffix = any(
-            clean.lower().endswith(suffix) and len(clean) > len(suffix)
-            for suffix in core.SUPPORTED_TEXT_SUFFIXES
-        )
+        has_supported_suffix = _has_supported_file_suffix(clean)
         if clean.lower() not in core._EXTENSION_ALIASES:
             keywords.append(clean)
 
-        if core.PATHISH_RE.fullmatch(clean) or has_supported_suffix or "/" in clean or "*" in clean:
+        if _looks_like_explicit_source_term(clean):
             if clean.startswith(".") and clean.count(".") == 1 and "/" not in clean:
                 path_globs.append(f"*{clean}")
             elif "*" in clean:
@@ -502,4 +521,3 @@ def ast_search(
         )
 
     return sorted(hits, key=lambda item: (item.score, -int(item.line_start or 0)), reverse=True)
-
