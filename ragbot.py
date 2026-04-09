@@ -70,6 +70,8 @@ COMMUNITY_INDEX_FILENAME = "community_index.json"
 REPORTS_DIRNAME = "reports"
 GRAPH_REPORT_FILENAME = "GRAPH_REPORT.md"
 LINT_REPORT_FILENAME = "lint_report.json"
+WIKI_DIRNAME = "wiki"
+QUERY_NOTES_DIRNAME = "queries"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -103,9 +105,11 @@ ENTITY_INFERRED_EDGE_TYPES = {
     "rationale_for",
     "semantically_related",
 }
+ENTITY_ATTACHMENT_NODE_TYPES = {"concept", "decision", "query_note"}
 COMMUNITY_STRONG_EDGE_TYPES = {"links_to", "mentions_path", "references", "imports"}
 COMMUNITY_TOP_FILES = 5
 COMMUNITY_TOP_SYMBOLS = 5
+COMMUNITY_TOP_QUERY_NOTES = 3
 COMMUNITY_TOP_GOD_NODES = 8
 COMMUNITY_TOP_BRIDGES = 20
 SEMANTIC_PROMPT_VERSION = "phase2b-v1"
@@ -1211,6 +1215,10 @@ def _entity_semantic_node_id(node_type: str, name: str) -> str:
     return f"{normalized_type}:{slug}:{digest}"
 
 
+def _entity_query_note_node_id(note_relpath: str) -> str:
+    return f"query_note:{_normalize_source_path(note_relpath)}"
+
+
 def _entity_edge_confidence(kind: str) -> str:
     return "INFERRED" if kind in ENTITY_INFERRED_EDGE_TYPES else "EXTRACTED"
 
@@ -1462,6 +1470,361 @@ def _register_semantic_aliases(
         bucket = alias_lookup.setdefault(lowered, [])
         if node_id not in bucket:
             bucket.append(node_id)
+
+
+def _query_notes_dir(persist_path: Path) -> Path:
+    return persist_path / WIKI_DIRNAME / QUERY_NOTES_DIRNAME
+
+
+def _extract_markdown_section(text: str, heading: str) -> str:
+    pattern = re.compile(
+        rf"^## {re.escape(heading)}\s*$\n?(.*?)(?=^## |\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _unescape_markdown_link_text(text: str) -> str:
+    return (
+        text.replace("\\\\", "\\")
+        .replace("\\[", "[")
+        .replace("\\]", "]")
+    )
+
+
+def _parse_query_note_record(note_path: Path, persist_path: Path) -> dict[str, Any] | None:
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    title = ""
+    for line in lines:
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    if not title:
+        return None
+
+    note_relpath = note_path.relative_to(persist_path).as_posix()
+    answer = _extract_markdown_section(text, "结论")
+    sources_section = _extract_markdown_section(text, "来源")
+    sources: list[str] = []
+    for line in sources_section.splitlines():
+        match = re.match(r"^- 来源文件：\[(.*)\]\([^)]+\)\s*$", line.strip())
+        if not match:
+            continue
+        sources.append(_normalize_source_path(_unescape_markdown_link_text(match.group(1))))
+    sources = _dedupe_strings(source for source in sources if source)
+
+    created_at = ""
+    for line in lines:
+        if line.startswith("- 生成时间："):
+            created_at = re.sub(r"^- 生成时间：`?(.*?)`?$", r"\1", line.strip())
+            break
+
+    tags: list[str] = []
+    for line in lines:
+        if not line.startswith("- 标签："):
+            continue
+        tags = re.findall(r"`([^`]+)`", line)
+        break
+
+    return {
+        "id": _entity_query_note_node_id(note_relpath),
+        "type": "query_note",
+        "question": title,
+        "name": title,
+        "note_relpath": note_relpath,
+        "summary": answer[:240].strip(),
+        "created_at": created_at,
+        "tags": tags,
+        "sources": sources,
+    }
+
+
+def _load_query_note_records(persist_path: Path) -> list[dict[str, Any]]:
+    query_dir = _query_notes_dir(persist_path)
+    if not query_dir.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for note_path in sorted(query_dir.rglob("*.md")):
+        record = _parse_query_note_record(note_path, persist_path)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _entity_attachment_files(
+    nodes_by_id: dict[str, dict[str, Any]],
+    normalized_edges: list[dict[str, Any]],
+    attachment_types: set[str] | None = None,
+) -> dict[str, set[str]]:
+    selected_types = attachment_types or ENTITY_ATTACHMENT_NODE_TYPES
+    attachment_node_ids = {
+        node_id
+        for node_id, node in nodes_by_id.items()
+        if str(node.get("type", "") or "") in selected_types
+    }
+    attachment_files: dict[str, set[str]] = {node_id: set() for node_id in attachment_node_ids}
+    for normalized_edge in normalized_edges:
+        source_id = str(normalized_edge.get("source", "") or "")
+        target_id = str(normalized_edge.get("target", "") or "")
+        source_node = nodes_by_id.get(source_id)
+        target_node = nodes_by_id.get(target_id)
+        if not source_node or not target_node:
+            continue
+        if source_id in attachment_node_ids:
+            target_file = _entity_node_file_source(target_node)
+            if target_file:
+                attachment_files.setdefault(source_id, set()).add(target_file)
+        if target_id in attachment_node_ids:
+            source_file = _entity_node_file_source(source_node)
+            if source_file:
+                attachment_files.setdefault(target_id, set()).add(source_file)
+    return attachment_files
+
+
+def _entity_edge_evidence_source(edge: dict[str, Any]) -> str:
+    evidence = edge.get("evidence")
+    if not isinstance(evidence, dict):
+        return ""
+    return _normalize_source_path(str(evidence.get("source", "") or ""))
+
+
+def _build_file_only_entity_graph(
+    file_sources: list[str],
+    document_graph: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_sources = sorted(
+        {
+            _normalize_source_path(source)
+            for source in file_sources
+            if _normalize_source_path(source)
+        }
+    )
+    nodes: list[dict[str, Any]] = []
+    node_seen: set[str] = set()
+    edges: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for source in normalized_sources:
+        _add_entity_node(
+            nodes,
+            node_seen,
+            {
+                "id": _entity_file_node_id(source),
+                "type": "file",
+                "name": Path(source).name,
+                "source": source,
+                "path": source,
+                "kb": _extract_kb(source),
+                "line_start": 1,
+                "line_end": 1,
+                "confidence": "EXTRACTED",
+            },
+        )
+
+    raw_neighbors = document_graph.get("neighbors", {})
+    if isinstance(raw_neighbors, dict):
+        for source, raw_edges in raw_neighbors.items():
+            normalized_source = _normalize_source_path(source)
+            if not normalized_source or not isinstance(raw_edges, list):
+                continue
+            for edge in raw_edges:
+                if not isinstance(edge, dict):
+                    continue
+                target = _normalize_source_path(edge.get("target", ""))
+                if not target:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    _entity_file_node_id(normalized_source),
+                    _entity_file_node_id(target),
+                    str(edge.get("kind") or ""),
+                    evidence_source=normalized_source,
+                    reason=str(edge.get("reason") or ""),
+                )
+
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda item: (
+            str(item.get("type", "")),
+            str(item.get("source", "")),
+            str(item.get("name", "")),
+        ),
+    )
+    sorted_edges = sorted(
+        edges.values(),
+        key=lambda item: (
+            str(item.get("source", "")),
+            str(item.get("target", "")),
+            str(item.get("type", "")),
+            str(item.get("reason", "")),
+        ),
+    )
+    return {
+        "version": 1,
+        "node_count": len(sorted_nodes),
+        "edge_count": len(sorted_edges),
+        "nodes": sorted_nodes,
+        "edges": sorted_edges,
+    }
+
+
+def _merge_query_notes_into_entity_graph(
+    entity_graph: dict[str, Any],
+    query_notes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    node_seen: set[str] = set()
+    nodes_by_id: dict[str, dict[str, Any]] = {}
+    query_note_ids: set[str] = set()
+    for raw_node in entity_graph.get("nodes", []):
+        if not isinstance(raw_node, dict):
+            continue
+        normalized_node = _normalize_entity_node_payload(raw_node)
+        if normalized_node is None:
+            continue
+        if str(normalized_node.get("type", "") or "") == "query_note":
+            query_note_ids.add(str(normalized_node["id"]))
+            continue
+        _add_entity_node(nodes, node_seen, normalized_node)
+        nodes_by_id[str(normalized_node["id"])] = normalized_node
+
+    edges: dict[tuple[Any, ...], dict[str, Any]] = {}
+    normalized_edges: list[dict[str, Any]] = []
+    for raw_edge in entity_graph.get("edges", []):
+        if not isinstance(raw_edge, dict):
+            continue
+        normalized_edge = _normalize_entity_edge_payload(raw_edge)
+        if normalized_edge is None:
+            continue
+        source_id = str(normalized_edge.get("source", "") or "")
+        target_id = str(normalized_edge.get("target", "") or "")
+        if source_id in query_note_ids or target_id in query_note_ids:
+            continue
+        normalized_edges.append(normalized_edge)
+        evidence = normalized_edge.get("evidence")
+        evidence_source = ""
+        line_start = None
+        line_end = None
+        if isinstance(evidence, dict):
+            evidence_source = _normalize_source_path(str(evidence.get("source", "") or ""))
+            line_start = evidence.get("line_start")
+            line_end = evidence.get("line_end")
+        if not evidence_source:
+            evidence_source = _normalize_source_path(str(normalized_edge.get("reason", "") or ""))
+        if not evidence_source:
+            evidence_source = "graph"
+        _add_entity_edge(
+            edges,
+            source_id=source_id,
+            target_id=target_id,
+            kind=str(normalized_edge.get("type", "") or ""),
+            evidence_source=evidence_source,
+            reason=str(normalized_edge.get("reason", "") or ""),
+            line_start=line_start if isinstance(line_start, int) else None,
+            line_end=line_end if isinstance(line_end, int) else None,
+        )
+
+    semantic_attachment_files = _entity_attachment_files(
+        nodes_by_id,
+        normalized_edges,
+        attachment_types={"concept", "decision"},
+    )
+
+    for record in query_notes:
+        note_id = str(record.get("id", "") or "").strip()
+        question = str(record.get("question", "") or "").strip()
+        note_relpath = _normalize_source_path(str(record.get("note_relpath", "") or ""))
+        if not note_id or not question or not note_relpath:
+            continue
+        payload = {
+            "id": note_id,
+            "type": "query_note",
+            "name": question,
+            "summary": str(record.get("summary", "") or "").strip(),
+            "note_relpath": note_relpath,
+            "created_at": str(record.get("created_at", "") or ""),
+            "tags": [str(tag) for tag in record.get("tags", []) if str(tag).strip()],
+            "confidence": "EXTRACTED",
+        }
+        _add_entity_node(nodes, node_seen, payload)
+        nodes_by_id[note_id] = payload
+        for source in record.get("sources", []):
+            normalized_source = _normalize_source_path(source)
+            file_node_id = _entity_file_node_id(normalized_source)
+            if file_node_id not in nodes_by_id:
+                continue
+            _add_entity_edge(
+                edges,
+                source_id=file_node_id,
+                target_id=note_id,
+                kind="semantically_related",
+                evidence_source=note_relpath,
+                reason=question,
+            )
+            _add_entity_edge(
+                edges,
+                source_id=note_id,
+                target_id=file_node_id,
+                kind="semantically_related",
+                evidence_source=note_relpath,
+                reason=question,
+            )
+            for semantic_node_id, attached_files in semantic_attachment_files.items():
+                if normalized_source not in attached_files:
+                    continue
+                semantic_node = nodes_by_id.get(semantic_node_id)
+                if semantic_node is None:
+                    continue
+                relation = str(semantic_node.get("type", "") or "semantically_related")
+                _add_entity_edge(
+                    edges,
+                    source_id=note_id,
+                    target_id=semantic_node_id,
+                    kind="semantically_related",
+                    evidence_source=normalized_source,
+                    reason=question or relation,
+                )
+                _add_entity_edge(
+                    edges,
+                    source_id=semantic_node_id,
+                    target_id=note_id,
+                    kind="semantically_related",
+                    evidence_source=normalized_source,
+                    reason=question or relation,
+                )
+
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda item: (
+            str(item.get("type", "")),
+            str(item.get("source", "")),
+            str(item.get("note_relpath", "")),
+            int(item.get("chunk_index") or 0),
+            int(item.get("line_start") or 0),
+            str(item.get("qualified_name") or item.get("name") or ""),
+        ),
+    )
+    sorted_edges = sorted(
+        edges.values(),
+        key=lambda item: (
+            str(item.get("source", "")),
+            str(item.get("target", "")),
+            str(item.get("type", "")),
+            str(item.get("reason", "")),
+        ),
+    )
+    return {
+        **entity_graph,
+        "nodes": sorted_nodes,
+        "edges": sorted_edges,
+        "node_count": len(sorted_nodes),
+        "edge_count": len(sorted_edges),
+    }
 
 
 def _semantic_extraction_prompt(section: dict[str, Any]) -> str:
@@ -2303,6 +2666,7 @@ def _entity_file_neighbors(
         semantic_node: dict[str, Any],
         bridges: list[dict[str, Any]],
         visited_semantic: set[str],
+        anchor_source: str,
     ) -> None:
         semantic_node_id = str(semantic_node.get("id", "") or "")
         if not semantic_node_id or semantic_node_id in visited_semantic:
@@ -2316,6 +2680,14 @@ def _entity_file_neighbors(
             semantic_kind = str(semantic_edge.get("type", "") or "")
             semantic_reason = str(semantic_edge.get("reason", "") or "")
             semantic_target_type = str(semantic_target.get("type", "") or "")
+            evidence_source = _entity_edge_evidence_source(semantic_edge)
+            if (
+                str(semantic_node.get("type", "") or "") == "query_note"
+                and semantic_target_type in {"concept", "decision", "query_note"}
+                and evidence_source
+                and evidence_source != anchor_source
+            ):
+                continue
             if semantic_target_type == "file":
                 consider(
                     target_source=str(semantic_target.get("source", "") or ""),
@@ -2339,7 +2711,7 @@ def _entity_file_neighbors(
                     reason=semantic_reason,
                     bridges=[*bridges, symbol_bridge],
                 )
-            elif semantic_target_type in {"concept", "decision"}:
+            elif semantic_target_type in {"concept", "decision", "query_note"}:
                 nested_bridge = _entity_bridge_payload(
                     semantic_target,
                     relation=semantic_kind or semantic_target_type,
@@ -2348,6 +2720,7 @@ def _entity_file_neighbors(
                     semantic_target,
                     [*bridges, nested_bridge],
                     next_visited,
+                    anchor_source,
                 )
 
     for edge in bundle.entity_edges_by_source.get(file_node_id, []):
@@ -2407,9 +2780,9 @@ def _entity_file_neighbors(
                 )
             continue
 
-        if target_type in {"concept", "decision"}:
+        if target_type in {"concept", "decision", "query_note"}:
             semantic_bridge = _entity_bridge_payload(target_node, relation=edge_kind or target_type)
-            consider_semantic_neighbors(target_node, [semantic_bridge], set())
+            consider_semantic_neighbors(target_node, [semantic_bridge], set(), source)
 
     return [
         payload
@@ -2421,17 +2794,11 @@ def _entity_file_neighbors(
 
 
 def _project_file_relationships(
-    indexed_files: list[IndexedFile],
+    file_sources: list[str],
     document_graph: dict[str, Any],
     entity_graph: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    file_sources = sorted(
-        {
-            source
-            for indexed in indexed_files
-            if (source := _normalize_source_path(indexed.rel_path))
-        }
-    )
+    file_sources = sorted({_normalize_source_path(source) for source in file_sources if _normalize_source_path(source)})
     valid_sources = set(file_sources)
     relationships: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
@@ -2501,13 +2868,6 @@ def _project_file_relationships(
                 continue
             entity_nodes_by_id[str(normalized_node["id"])] = normalized_node
 
-    semantic_node_ids = {
-        node_id
-        for node_id, node in entity_nodes_by_id.items()
-        if str(node.get("type", "") or "") in {"concept", "decision"}
-    }
-    semantic_attachment_files: dict[str, set[str]] = {node_id: set() for node_id in semantic_node_ids}
-
     normalized_entity_edges: list[dict[str, Any]] = []
     raw_edges = entity_graph.get("edges", [])
     if isinstance(raw_edges, list):
@@ -2518,20 +2878,11 @@ def _project_file_relationships(
             if normalized_edge is None:
                 continue
             normalized_entity_edges.append(normalized_edge)
-            source_id = str(normalized_edge["source"])
-            target_id = str(normalized_edge["target"])
-            source_node = entity_nodes_by_id.get(source_id)
-            target_node = entity_nodes_by_id.get(target_id)
-            if not source_node or not target_node:
-                continue
-            if source_id in semantic_node_ids:
-                target_file = _entity_node_file_source(target_node)
-                if target_file:
-                    semantic_attachment_files.setdefault(source_id, set()).add(target_file)
-            if target_id in semantic_node_ids:
-                source_file = _entity_node_file_source(source_node)
-                if source_file:
-                    semantic_attachment_files.setdefault(target_id, set()).add(source_file)
+    semantic_attachment_files = _entity_attachment_files(
+        entity_nodes_by_id,
+        normalized_entity_edges,
+    )
+    attachment_node_ids = set(semantic_attachment_files.keys())
 
     for normalized_edge in normalized_entity_edges:
         source_id = str(normalized_edge["source"])
@@ -2544,14 +2895,27 @@ def _project_file_relationships(
         target_files = set()
         source_file = _entity_node_file_source(source_node)
         target_file = _entity_node_file_source(target_node)
+        evidence_source = _entity_edge_evidence_source(normalized_edge)
         if source_file:
             source_files.add(source_file)
-        elif source_id in semantic_node_ids:
+        elif source_id in attachment_node_ids:
             source_files |= semantic_attachment_files.get(source_id, set())
+            if (
+                str(source_node.get("type", "") or "") == "query_note"
+                and evidence_source
+                and evidence_source in source_files
+            ):
+                source_files = {evidence_source}
         if target_file:
             target_files.add(target_file)
-        elif target_id in semantic_node_ids:
+        elif target_id in attachment_node_ids:
             target_files |= semantic_attachment_files.get(target_id, set())
+            if (
+                str(target_node.get("type", "") or "") == "query_note"
+                and evidence_source
+                and evidence_source in target_files
+            ):
+                target_files = {evidence_source}
         if not source_files or not target_files:
             continue
         bridges: list[dict[str, Any]] = []
@@ -2586,19 +2950,13 @@ def _project_file_relationships(
 
 
 def _build_community_index(
-    indexed_files: list[IndexedFile],
+    file_sources: list[str],
     document_graph: dict[str, Any],
     entity_graph: dict[str, Any],
     semantic_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    file_sources = sorted(
-        {
-            source
-            for indexed in indexed_files
-            if (source := _normalize_source_path(indexed.rel_path))
-        }
-    )
-    relationships = _project_file_relationships(indexed_files, document_graph, entity_graph)
+    file_sources = sorted({_normalize_source_path(source) for source in file_sources if _normalize_source_path(source)})
+    relationships = _project_file_relationships(file_sources, document_graph, entity_graph)
 
     strong_adjacency: dict[str, set[str]] = {source: set() for source in file_sources}
     all_adjacency: dict[str, set[str]] = {source: set() for source in file_sources}
@@ -2648,26 +3006,24 @@ def _build_community_index(
         for edge in entity_graph.get("edges", [])
         if isinstance(edge, dict)
     ]
-    semantic_attachment_files: dict[str, set[str]] = {}
     semantic_edge_counts: dict[str, int] = {}
-    semantic_node_ids = {
-        node_id
-        for node_id, node in entity_nodes.items()
-        if node.get("type") in {"concept", "decision"}
-    }
-    for edge in entity_edges:
+    normalized_entity_edges = [
+        normalized_edge
+        for edge in entity_edges
+        if (normalized_edge := _normalize_entity_edge_payload(edge)) is not None
+    ]
+    semantic_attachment_files = _entity_attachment_files(
+        entity_nodes,
+        normalized_entity_edges,
+    )
+    attachment_node_ids = set(semantic_attachment_files.keys())
+    for edge in normalized_entity_edges:
         source_id = str(edge.get("source", "") or "")
         target_id = str(edge.get("target", "") or "")
-        if source_id in semantic_node_ids:
+        if source_id in attachment_node_ids:
             semantic_edge_counts[source_id] = semantic_edge_counts.get(source_id, 0) + 1
-            target_file = _entity_node_file_source(entity_nodes.get(target_id, {}))
-            if target_file:
-                semantic_attachment_files.setdefault(source_id, set()).add(target_file)
-        if target_id in semantic_node_ids:
+        if target_id in attachment_node_ids:
             semantic_edge_counts[target_id] = semantic_edge_counts.get(target_id, 0) + 1
-            source_file = _entity_node_file_source(entity_nodes.get(source_id, {}))
-            if source_file:
-                semantic_attachment_files.setdefault(target_id, set()).add(source_file)
 
     communities: list[dict[str, Any]] = []
     for community_id, files in zip(community_ids, communities_raw):
@@ -2745,12 +3101,31 @@ def _build_community_index(
             top_decisions,
             key=lambda item: (-int(item["file_count"]), -int(item["score"]), str(item["name"])),
         )[:COMMUNITY_TOP_SYMBOLS]
+        top_query_notes = [
+            {
+                "id": node_id,
+                "name": str(node.get("name") or ""),
+                "file_count": len(attached_files & file_set),
+                "score": len(attached_files & file_set) * 100 + semantic_edge_counts.get(node_id, 0),
+                "note_relpath": str(node.get("note_relpath") or ""),
+            }
+            for node_id, node in entity_nodes.items()
+            if node.get("type") == "query_note"
+            and (attached_files := semantic_attachment_files.get(node_id, set()))
+            and attached_files & file_set
+        ]
+        top_query_notes = sorted(
+            top_query_notes,
+            key=lambda item: (-int(item["file_count"]), -int(item["score"]), str(item["name"])),
+        )[:COMMUNITY_TOP_QUERY_NOTES]
 
         label = (
             top_symbols[0]["name"]
             if top_symbols
             else top_concepts[0]["name"]
             if top_concepts
+            else top_query_notes[0]["name"]
+            if top_query_notes
             else Path(top_files[0]["source"]).stem if top_files else community_id
         )
         suggested_queries: list[str] = []
@@ -2760,6 +3135,8 @@ def _build_community_index(
             suggested_queries.append(f"{top_concepts[0]['name']} 在哪些文件里被讨论？")
         if top_decisions:
             suggested_queries.append(f"为什么采用 {top_decisions[0]['name']}？")
+        if top_query_notes:
+            suggested_queries.append(f"已保存问题“{top_query_notes[0]['name']}”涉及哪些文件？")
         if top_files:
             suggested_queries.append(f"{Path(top_files[0]['source']).stem} 相关流程是什么？")
         if kbs:
@@ -2776,6 +3153,7 @@ def _build_community_index(
                 "top_symbols": top_symbols,
                 "top_concepts": top_concepts,
                 "top_decisions": top_decisions,
+                "top_query_notes": top_query_notes,
                 "suggested_queries": suggested_queries[:3],
             }
         )
@@ -2828,11 +3206,13 @@ def _build_community_index(
     )
     concept_count = sum(1 for node in entity_nodes.values() if node.get("type") == "concept")
     decision_count = sum(1 for node in entity_nodes.values() if node.get("type") == "decision")
+    query_note_count = sum(1 for node in entity_nodes.values() if node.get("type") == "query_note")
     semantic_summary = {
         "enabled": bool((semantic_stats or {}).get("enabled")),
         "disabled_reason": str((semantic_stats or {}).get("disabled_reason", "") or ""),
         "concept_count": concept_count,
         "decision_count": decision_count,
+        "query_note_count": query_note_count,
         "semantic_node_count": concept_count + decision_count,
         "semantic_edge_count": sum(
             1
@@ -2906,6 +3286,7 @@ def _render_graph_report(
         f"- 语义节点：{int(semantic_summary.get('semantic_node_count') or 0)}",
         f"- Concepts：{int(semantic_summary.get('concept_count') or 0)}",
         f"- Decisions：{int(semantic_summary.get('decision_count') or 0)}",
+        f"- Query Notes：{int(semantic_summary.get('query_note_count') or 0)}",
         f"- 语义边：{int(semantic_summary.get('semantic_edge_count') or 0)}",
         f"- API 调用：{int(semantic_summary.get('api_calls') or 0)}",
         f"- 缓存命中 section：{int(semantic_summary.get('cached_sections') or 0)}",
@@ -2972,6 +3353,13 @@ def _render_graph_report(
                 if isinstance(item, dict) and item.get("name")
             ]
             lines.extend(_format_report_list(top_decision_lines, "暂无语义决策"))
+            lines.append("- Top Query Notes:")
+            top_query_note_lines = [
+                f"{item.get('name', '')} (files={item.get('file_count', 0)}, path={item.get('note_relpath', '')})"
+                for item in community.get("top_query_notes", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            lines.extend(_format_report_list(top_query_note_lines, "暂无知识笔记"))
             lines.append("- Suggested Questions:")
             suggested_query_lines = [
                 str(item)
@@ -3099,14 +3487,19 @@ def _write_index_artifacts(
         document_graph=document_graph,
         semantic_sections=semantic_sections,
     )
+    entity_graph = _merge_query_notes_into_entity_graph(
+        entity_graph,
+        _load_query_note_records(persist_path),
+    )
     entity_graph_path = persist_path / ENTITY_GRAPH_FILENAME
     entity_graph_path.write_text(
         json.dumps(entity_graph, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
+    file_sources = [_normalize_source_path(indexed.rel_path) for indexed in indexed_files]
     community_index = _build_community_index(
-        indexed_files=indexed_files,
+        file_sources=file_sources,
         document_graph=document_graph,
         entity_graph=entity_graph,
         semantic_stats=semantic_stats,
@@ -3130,6 +3523,78 @@ def _write_index_artifacts(
         encoding="utf-8",
     )
     return manifest
+
+
+def refresh_query_note_graph_artifacts(persist_path: Path) -> None:
+    manifest_path = persist_path / "index_manifest.json"
+    document_graph_path = persist_path / DOCUMENT_GRAPH_FILENAME
+    entity_graph_path = persist_path / ENTITY_GRAPH_FILENAME
+    if not manifest_path.exists():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    document_graph: dict[str, Any] = {"version": 1, "edge_count": 0, "neighbors": {}}
+    if document_graph_path.exists():
+        try:
+            loaded_document_graph = json.loads(document_graph_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_document_graph, dict):
+                document_graph = loaded_document_graph
+        except (OSError, json.JSONDecodeError):
+            document_graph = {"version": 1, "edge_count": 0, "neighbors": {}}
+
+    file_sources = [
+        _normalize_source_path(str(entry.get("name", "") or ""))
+        for entry in manifest.get("files", [])
+        if isinstance(entry, dict)
+    ]
+
+    entity_graph: dict[str, Any]
+    if entity_graph_path.exists():
+        try:
+            loaded_entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+            entity_graph = (
+                loaded_entity_graph
+                if isinstance(loaded_entity_graph, dict)
+                else _build_file_only_entity_graph(file_sources, document_graph)
+            )
+        except (OSError, json.JSONDecodeError):
+            entity_graph = _build_file_only_entity_graph(file_sources, document_graph)
+    else:
+        entity_graph = _build_file_only_entity_graph(file_sources, document_graph)
+
+    entity_graph = _merge_query_notes_into_entity_graph(
+        entity_graph,
+        _load_query_note_records(persist_path),
+    )
+    entity_graph_path.write_text(
+        json.dumps(entity_graph, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    community_index = _build_community_index(
+        file_sources=file_sources,
+        document_graph=document_graph,
+        entity_graph=entity_graph,
+        semantic_stats=manifest.get("semantic_graph_stats", {}),
+    )
+    community_index_path = persist_path / COMMUNITY_INDEX_FILENAME
+    community_index_path.write_text(
+        json.dumps(community_index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    reports_dir = persist_path / REPORTS_DIRNAME
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    graph_report_path = reports_dir / GRAPH_REPORT_FILENAME
+    graph_report_path.write_text(
+        _render_graph_report(community_index, manifest),
+        encoding="utf-8",
+    )
 
 
 def build_vectorstore(

@@ -859,6 +859,9 @@ def save_query_note(
         log_path = wiki_dir / "log.md"
         _append_query_note_log(log_path, created, question, note_relpath)
         generate_lint_report(persist_path=persist_path, manifest=manifest, generated_at=created)
+        from ragbot import refresh_query_note_graph_artifacts
+
+        refresh_query_note_graph_artifacts(persist_path)
     return {
         "note_path": str(note_path),
         "note_relpath": (Path(WIKI_DIRNAME) / note_relpath).as_posix(),

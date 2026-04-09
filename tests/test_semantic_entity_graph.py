@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import ragbot
+import wiki
 
 
 class FakeEmbeddings:
@@ -200,6 +201,49 @@ class AmbiguousAliasSemanticLLM:
         return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
 
 
+class QueryNoteSemanticLLM:
+    def __init__(self, call_log: list[str]):
+        self.call_log = call_log
+
+    def invoke(self, prompt: str) -> FakeMessage:
+        self.call_log.append(prompt)
+        lowered = prompt.lower()
+        if "note concept marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [
+                            {
+                                "name": "billing chain",
+                                "summary": "A shared concept reused across billing docs.",
+                                "aliases": ["handoff chain"],
+                            }
+                        ],
+                        "decisions": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "note decision marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [],
+                        "decisions": [
+                            {
+                                "name": "snapshot export policy",
+                                "summary": "Exports are reviewed from immutable snapshots.",
+                                "aliases": [],
+                                "rationale": ["billing chain"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
+
+
 def _write_semantic_corpus(root: Path) -> None:
     (root / "产品").mkdir(parents=True)
     (root / "工程").mkdir(parents=True)
@@ -253,6 +297,69 @@ def _write_punctuation_semantic_corpus(root: Path) -> None:
 
 punctuation marker
 This note mentions C#, C++, and C as distinct concepts.
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_query_note_bridge_corpus(root: Path) -> None:
+    (root / "产品").mkdir(parents=True)
+    (root / "报告").mkdir(parents=True)
+    (root / "产品" / "billing_handoff.md").write_text(
+        """
+# Billing Handoff
+
+This page explains the billing handoff checklist.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "报告" / "audit_export.md").write_text(
+        """
+# Audit Export
+
+This page explains how audit exports are verified.
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_query_note_semantic_corpus(root: Path) -> None:
+    (root / "产品").mkdir(parents=True)
+    (root / "工程").mkdir(parents=True)
+    (root / "报告").mkdir(parents=True)
+    (root / "运营").mkdir(parents=True)
+    (root / "产品" / "concept_anchor.md").write_text(
+        """
+# Concept Anchor
+
+note concept marker
+This file introduces the shared billing chain concept.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "工程" / "concept_consumer.md").write_text(
+        """
+# Concept Consumer
+
+note concept marker
+This file reuses the shared billing chain concept in engineering.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "报告" / "decision_playbook.md").write_text(
+        """
+# Decision Playbook
+
+note decision marker
+This file records the snapshot export policy used in reporting.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "运营" / "faq_bridge.md").write_text(
+        """
+# FAQ Bridge
+
+This page captures the saved question but contains no semantic marker by itself.
 """.strip(),
         encoding="utf-8",
     )
@@ -601,4 +708,173 @@ def test_semantic_rationale_edges_cover_all_matching_alias_concepts(tmp_path: Pa
     }
     assert ("Alpha settlement", "Use settlement policy") in rationale_edges
     assert ("Beta settlement", "Use settlement policy") in rationale_edges
+    assert semantic_calls
+
+
+def test_save_query_note_refreshes_entity_graph_and_runtime_expansion(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_query_note_bridge_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+    )
+
+    before_bundle = ragbot.load_search_bundle(
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+    )
+    assert before_bundle is not None
+    before_expansion = ragbot._expand_candidate_sources_detailed(
+        before_bundle,
+        ["产品/billing_handoff.md"],
+        max_hops=1,
+        max_extra_sources=8,
+    )
+    assert "报告/audit_export.md" not in before_expansion.sources
+
+    wiki.save_query_note(
+        persist_path=index_dir,
+        question="billing handoff 和 audit export 的关系是什么？",
+        answer="这两个文件描述的是同一条交付链路的不同环节。",
+        sources=[
+            {
+                "source": "产品/billing_handoff.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This page explains the billing handoff checklist.",
+            },
+            {
+                "source": "报告/audit_export.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This page explains how audit exports are verified.",
+            },
+        ],
+    )
+
+    entity_graph = json.loads((index_dir / "entity_graph.json").read_text(encoding="utf-8"))
+    query_note_nodes = [
+        node
+        for node in entity_graph["nodes"]
+        if isinstance(node, dict) and node.get("type") == "query_note"
+    ]
+    assert any(node.get("name") == "billing handoff 和 audit export 的关系是什么？" for node in query_note_nodes)
+
+    after_bundle = ragbot.load_search_bundle(
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+    )
+    assert after_bundle is not None
+    after_expansion = ragbot._expand_candidate_sources_detailed(
+        after_bundle,
+        ["产品/billing_handoff.md"],
+        max_hops=1,
+        max_extra_sources=8,
+    )
+    assert "报告/audit_export.md" in after_expansion.sources
+    assert any(item.get("type") == "query_note" for item in after_expansion.bridge_entities)
+
+
+def test_save_query_note_links_into_semantic_nodes(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    semantic_calls: list[str] = []
+    _write_query_note_semantic_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(
+        ragbot,
+        "make_llm",
+        lambda *args, **kwargs: QueryNoteSemanticLLM(semantic_calls),
+    )
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    before_bundle = ragbot.load_search_bundle(
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+    )
+    assert before_bundle is not None
+    before_expansion = ragbot._expand_candidate_sources_detailed(
+        before_bundle,
+        ["运营/faq_bridge.md"],
+        max_hops=1,
+        max_extra_sources=8,
+    )
+    assert "工程/concept_consumer.md" not in before_expansion.sources
+
+    wiki.save_query_note(
+        persist_path=index_dir,
+        question="billing chain FAQ 关联哪些实现和决策？",
+        answer="它关联了共享概念和 export snapshot 决策。",
+        sources=[
+            {
+                "source": "运营/faq_bridge.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This page captures the saved question but contains no semantic marker by itself.",
+            },
+            {
+                "source": "产品/concept_anchor.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This file introduces the shared billing chain concept.",
+            },
+            {
+                "source": "报告/decision_playbook.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This file records the snapshot export policy used in reporting.",
+            },
+        ],
+    )
+
+    entity_graph = json.loads((index_dir / "entity_graph.json").read_text(encoding="utf-8"))
+    node_ids_by_name = {
+        str(node.get("name") or ""): str(node.get("id") or "")
+        for node in entity_graph["nodes"]
+        if isinstance(node, dict) and node.get("id")
+    }
+    query_note_id = node_ids_by_name["billing chain FAQ 关联哪些实现和决策？"]
+    concept_id = node_ids_by_name["billing chain"]
+    decision_id = node_ids_by_name["snapshot export policy"]
+    semantic_edges = {
+        (
+            str(edge.get("source", "")),
+            str(edge.get("target", "")),
+            str(edge.get("type", "")),
+        )
+        for edge in entity_graph["edges"]
+        if isinstance(edge, dict)
+    }
+    assert (query_note_id, concept_id, "semantically_related") in semantic_edges
+    assert (query_note_id, decision_id, "semantically_related") in semantic_edges
+
+    after_bundle = ragbot.load_search_bundle(
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+    )
+    assert after_bundle is not None
+    after_expansion = ragbot._expand_candidate_sources_detailed(
+        after_bundle,
+        ["运营/faq_bridge.md"],
+        max_hops=1,
+        max_extra_sources=8,
+    )
+    assert "产品/concept_anchor.md" in after_expansion.sources
+    assert "报告/decision_playbook.md" in after_expansion.sources
+    assert "工程/concept_consumer.md" not in after_expansion.sources
+    bridge_types = {str(item.get("type", "")) for item in after_expansion.bridge_entities}
+    assert "query_note" in bridge_types
+    assert "concept" not in bridge_types
     assert semantic_calls
