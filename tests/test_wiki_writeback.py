@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import threading
+import time
 
 import wiki
 
@@ -225,3 +226,42 @@ def test_save_query_note_keeps_both_log_entries_under_concurrent_writes(tmp_path
     log_text = (persist_dir / "wiki" / "log.md").read_text(encoding="utf-8")
     assert "并发问题 A" in log_text
     assert "并发问题 B" in log_text
+
+
+def test_generate_wiki_waits_for_shared_write_lock(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "index"
+    persist_dir.mkdir(parents=True)
+    manifest = _write_manifest_and_normalized_texts(persist_dir)
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    wiki_dir = persist_dir / "wiki"
+    log_path = wiki_dir / "log.md"
+    finished = threading.Event()
+    errors: list[Exception] = []
+
+    def rebuild() -> None:
+        try:
+            wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+        except Exception as exc:  # pragma: no cover - test helper
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    with wiki._write_lock(wiki_dir):
+        thread = threading.Thread(target=rebuild)
+        thread.start()
+        time.sleep(wiki.WRITE_LOCK_POLL_SECONDS * 3)
+        assert not finished.is_set()
+        wiki._append_query_note_log(
+            log_path,
+            datetime(2026, 4, 9, 12, 0, 0),
+            "锁内追加的问题",
+            Path("queries/locked.md"),
+        )
+
+    thread.join()
+
+    assert not errors
+    assert finished.is_set()
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "锁内追加的问题" in log_text

@@ -298,7 +298,7 @@ def _ensure_wiki_artifacts_for_sources(
     log_path = wiki_dir / "log.md"
     missing_paths = [path for path in [index_path, log_path, *expected_paths] if not path.exists()]
     if missing_paths:
-        generate_wiki(persist_path=persist_path, manifest=manifest)
+        _generate_wiki_unlocked(persist_path=persist_path, manifest=manifest)
     still_missing = [path for path in [index_path, log_path, *expected_paths] if not path.exists()]
     if still_missing:
         raise ValueError("当前索引还没有生成完整的 wiki 页面，请先重建索引后再保存为知识。")
@@ -586,7 +586,7 @@ def generate_lint_report(
     return report
 
 
-def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int]:
+def _generate_wiki_unlocked(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int]:
     entries = _iter_file_entries(manifest)
     build_time = str(manifest.get("build_time", "") or "unknown")
     normalized_root = persist_path / str(
@@ -617,6 +617,12 @@ def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int
     )
     lint_report = generate_lint_report(persist_path=persist_path, manifest=manifest)
     return {"pages": len(entries), "lint_issues": sum(int(count) for count in lint_report["summary"].values())}
+
+
+def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int]:
+    wiki_dir = persist_path / WIKI_DIRNAME
+    with _write_lock(wiki_dir):
+        return _generate_wiki_unlocked(persist_path=persist_path, manifest=manifest)
 
 
 def save_query_note(
