@@ -1204,9 +1204,11 @@ def _entity_symbol_node_id(record: dict[str, Any]) -> str:
 
 def _entity_semantic_node_id(node_type: str, name: str) -> str:
     normalized_type = str(node_type).strip().lower() or "concept"
-    normalized_name = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    slug = normalized_name or hashlib.sha1(name.strip().encode("utf-8")).hexdigest()[:12]
-    return f"{normalized_type}:{slug}"
+    normalized_raw_name = name.strip().lower()
+    normalized_name = re.sub(r"[^a-z0-9]+", "-", normalized_raw_name).strip("-")
+    slug = normalized_name or "node"
+    digest = hashlib.sha1(normalized_raw_name.encode("utf-8")).hexdigest()[:12]
+    return f"{normalized_type}:{slug}:{digest}"
 
 
 def _entity_edge_confidence(kind: str) -> str:
@@ -1402,11 +1404,13 @@ def _semantic_section_fingerprint(
     chunk_index: int,
     text: str,
     llm_model: str,
+    llm_base_url: str,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(source.encode("utf-8"))
     digest.update(f":{chunk_index}:".encode("utf-8"))
     digest.update(llm_model.encode("utf-8"))
+    digest.update(llm_base_url.strip().rstrip("/").encode("utf-8"))
     digest.update(SEMANTIC_PROMPT_VERSION.encode("utf-8"))
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
@@ -1446,8 +1450,18 @@ def _semantic_aliases(name: str, aliases: Any) -> list[str]:
     return _dedupe_strings(values)
 
 
-def _semantic_alias_map(name: str, aliases: Any) -> dict[str, str]:
-    return {alias.lower(): alias for alias in _semantic_aliases(name, aliases)}
+def _register_semantic_aliases(
+    alias_lookup: dict[str, list[str]],
+    aliases: Iterable[str],
+    node_id: str,
+) -> None:
+    for alias in aliases:
+        lowered = str(alias).strip().lower()
+        if not lowered:
+            continue
+        bucket = alias_lookup.setdefault(lowered, [])
+        if node_id not in bucket:
+            bucket.append(node_id)
 
 
 def _semantic_extraction_prompt(section: dict[str, Any]) -> str:
@@ -1548,7 +1562,7 @@ def _upsert_semantic_node(
     nodes_by_id: dict[str, dict[str, Any]],
     nodes: list[dict[str, Any]],
     node_seen: set[str],
-    alias_lookup: dict[str, str],
+    alias_lookup: dict[str, list[str]],
     node_type: str,
     item: dict[str, Any],
 ) -> str:
@@ -1578,8 +1592,7 @@ def _upsert_semantic_node(
             summary = str(item.get("summary", "") or "").strip()
             if summary:
                 payload["summary"] = summary
-    for lowered, _alias in _semantic_alias_map(name, aliases).items():
-        alias_lookup[lowered] = node_id
+    _register_semantic_aliases(alias_lookup, aliases, node_id)
     return node_id
 
 
@@ -1615,6 +1628,7 @@ def _extract_semantic_sections(
     llm_model: str,
     llm_base_url: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_llm_base_url = llm_base_url.strip().rstrip("/")
     enabled, disabled_reason = _semantic_graph_enabled(
         llm_api_key=llm_api_key,
         llm_model=llm_model,
@@ -1661,6 +1675,7 @@ def _extract_semantic_sections(
             chunk_index=int(section["chunk_index"]),
             text=str(section["text"]),
             llm_model=llm_model,
+            llm_base_url=normalized_llm_base_url,
         )
         cached_entry = previous_entries.get(cache_key)
         if (
@@ -1668,6 +1683,7 @@ def _extract_semantic_sections(
             and cached_entry.get("fingerprint") == fingerprint
             and cached_entry.get("prompt_version") == SEMANTIC_PROMPT_VERSION
             and cached_entry.get("llm_model") == llm_model
+            and str(cached_entry.get("llm_base_url", "") or "") == normalized_llm_base_url
             and cached_entry.get("status") == "ok"
         ):
             payload = cached_entry.get("payload", {})
@@ -1690,6 +1706,7 @@ def _extract_semantic_sections(
                     "fingerprint": fingerprint,
                     "prompt_version": SEMANTIC_PROMPT_VERSION,
                     "llm_model": llm_model,
+                    "llm_base_url": normalized_llm_base_url,
                     "payload": payload,
                     "usage": usage,
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1702,6 +1719,7 @@ def _extract_semantic_sections(
                     "fingerprint": fingerprint,
                     "prompt_version": SEMANTIC_PROMPT_VERSION,
                     "llm_model": llm_model,
+                    "llm_base_url": normalized_llm_base_url,
                     "payload": payload,
                     "error": str(exc),
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1725,6 +1743,7 @@ def _extract_semantic_sections(
             "version": 1,
             "prompt_version": SEMANTIC_PROMPT_VERSION,
             "llm_model": llm_model,
+            "llm_base_url": normalized_llm_base_url,
             "entries": next_entries,
         },
     )
@@ -1756,6 +1775,7 @@ def _build_entity_graph(
     section_records_by_id: dict[str, dict[str, Any]] = {}
     symbol_records_by_source: dict[str, list[dict[str, Any]]] = {}
     all_symbol_entries: list[dict[str, Any]] = []
+    pending_rationale_edges: list[dict[str, Any]] = []
 
     for source, indexed in sorted(normalized_files, key=lambda item: item[0]):
         total_lines = max(1, len(indexed.normalized_text.splitlines()))
@@ -1933,8 +1953,8 @@ def _build_entity_graph(
             line_end=int(symbol_record["line_end"]),
         )
 
-    concept_alias_lookup: dict[str, str] = {}
-    decision_alias_lookup: dict[str, str] = {}
+    concept_alias_lookup: dict[str, list[str]] = {}
+    decision_alias_lookup: dict[str, list[str]] = {}
     semantic_sections = semantic_sections or []
     for semantic_section in semantic_sections:
         source = _normalize_source_path(semantic_section.get("source", ""))
@@ -2037,23 +2057,42 @@ def _build_entity_graph(
             )
             rationale_values = decision.get("rationale")
             if isinstance(rationale_values, list):
-                for rationale in rationale_values:
-                    rationale_key = str(rationale or "").strip().lower()
-                    if not rationale_key:
-                        continue
-                    concept_id = concept_alias_lookup.get(rationale_key)
-                    if concept_id is None:
-                        continue
-                    _add_entity_edge(
-                        edges,
-                        concept_id,
-                        decision_id,
-                        "rationale_for",
-                        evidence_source=source,
-                        reason=str(rationale),
-                        line_start=line_start,
-                        line_end=line_end,
-                    )
+                pending_rationale_edges.append(
+                    {
+                        "decision_id": decision_id,
+                        "rationale": list(rationale_values),
+                        "source": source,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                    }
+                )
+
+    for pending_edge in pending_rationale_edges:
+        decision_id = str(pending_edge.get("decision_id", "") or "")
+        source = str(pending_edge.get("source", "") or "")
+        line_start = int(pending_edge.get("line_start") or 1)
+        line_end = int(pending_edge.get("line_end") or line_start)
+        rationale_values = pending_edge.get("rationale")
+        if not decision_id or not isinstance(rationale_values, list):
+            continue
+        for rationale in rationale_values:
+            rationale_key = str(rationale or "").strip().lower()
+            if not rationale_key:
+                continue
+            concept_ids = concept_alias_lookup.get(rationale_key, [])
+            if not concept_ids:
+                continue
+            for concept_id in sorted(set(concept_ids)):
+                _add_entity_edge(
+                    edges,
+                    concept_id,
+                    decision_id,
+                    "rationale_for",
+                    evidence_source=source,
+                    reason=str(rationale),
+                    line_start=line_start,
+                    line_end=line_end,
+                )
 
     raw_neighbors = document_graph.get("neighbors", {})
     if isinstance(raw_neighbors, dict):
@@ -2260,6 +2299,57 @@ def _entity_file_neighbors(
         target_id = str(edge.get("target", "") or "")
         return bundle.entity_nodes_by_id.get(target_id)
 
+    def consider_semantic_neighbors(
+        semantic_node: dict[str, Any],
+        bridges: list[dict[str, Any]],
+        visited_semantic: set[str],
+    ) -> None:
+        semantic_node_id = str(semantic_node.get("id", "") or "")
+        if not semantic_node_id or semantic_node_id in visited_semantic:
+            return
+        next_visited = set(visited_semantic)
+        next_visited.add(semantic_node_id)
+        for semantic_edge in bundle.entity_edges_by_source.get(semantic_node_id, []):
+            semantic_target = target_node_for(semantic_edge)
+            if not semantic_target:
+                continue
+            semantic_kind = str(semantic_edge.get("type", "") or "")
+            semantic_reason = str(semantic_edge.get("reason", "") or "")
+            semantic_target_type = str(semantic_target.get("type", "") or "")
+            if semantic_target_type == "file":
+                consider(
+                    target_source=str(semantic_target.get("source", "") or ""),
+                    kind=semantic_kind,
+                    reason=semantic_reason,
+                    bridges=bridges,
+                )
+            elif semantic_target_type == "section":
+                section_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
+                consider(
+                    target_source=str(semantic_target.get("source", "") or ""),
+                    kind=semantic_kind,
+                    reason=semantic_reason,
+                    bridges=[*bridges, section_bridge],
+                )
+            elif semantic_target_type == "symbol":
+                symbol_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
+                consider(
+                    target_source=str(semantic_target.get("source", "") or ""),
+                    kind=semantic_kind,
+                    reason=semantic_reason,
+                    bridges=[*bridges, symbol_bridge],
+                )
+            elif semantic_target_type in {"concept", "decision"}:
+                nested_bridge = _entity_bridge_payload(
+                    semantic_target,
+                    relation=semantic_kind or semantic_target_type,
+                )
+                consider_semantic_neighbors(
+                    semantic_target,
+                    [*bridges, nested_bridge],
+                    next_visited,
+                )
+
     for edge in bundle.entity_edges_by_source.get(file_node_id, []):
         target_node = target_node_for(edge)
         if not target_node:
@@ -2319,36 +2409,7 @@ def _entity_file_neighbors(
 
         if target_type in {"concept", "decision"}:
             semantic_bridge = _entity_bridge_payload(target_node, relation=edge_kind or target_type)
-            for semantic_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
-                semantic_target = target_node_for(semantic_edge)
-                if not semantic_target:
-                    continue
-                semantic_kind = str(semantic_edge.get("type", "") or "")
-                semantic_reason = str(semantic_edge.get("reason", "") or "")
-                semantic_target_type = str(semantic_target.get("type", "") or "")
-                if semantic_target_type == "file":
-                    consider(
-                        target_source=str(semantic_target.get("source", "") or ""),
-                        kind=semantic_kind,
-                        reason=semantic_reason,
-                        bridges=[semantic_bridge],
-                    )
-                elif semantic_target_type == "section":
-                    section_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
-                    consider(
-                        target_source=str(semantic_target.get("source", "") or ""),
-                        kind=semantic_kind,
-                        reason=semantic_reason,
-                        bridges=[semantic_bridge, section_bridge],
-                    )
-                elif semantic_target_type == "symbol":
-                    symbol_bridge = _entity_bridge_payload(semantic_target, relation=semantic_kind)
-                    consider(
-                        target_source=str(semantic_target.get("source", "") or ""),
-                        kind=semantic_kind,
-                        reason=semantic_reason,
-                        bridges=[semantic_bridge, symbol_bridge],
-                    )
+            consider_semantic_neighbors(target_node, [semantic_bridge], set())
 
     return [
         payload
@@ -2440,6 +2501,14 @@ def _project_file_relationships(
                 continue
             entity_nodes_by_id[str(normalized_node["id"])] = normalized_node
 
+    semantic_node_ids = {
+        node_id
+        for node_id, node in entity_nodes_by_id.items()
+        if str(node.get("type", "") or "") in {"concept", "decision"}
+    }
+    semantic_attachment_files: dict[str, set[str]] = {node_id: set() for node_id in semantic_node_ids}
+
+    normalized_entity_edges: list[dict[str, Any]] = []
     raw_edges = entity_graph.get("edges", [])
     if isinstance(raw_edges, list):
         for raw_edge in raw_edges:
@@ -2448,37 +2517,70 @@ def _project_file_relationships(
             normalized_edge = _normalize_entity_edge_payload(raw_edge)
             if normalized_edge is None:
                 continue
-            source_node = entity_nodes_by_id.get(str(normalized_edge["source"]))
-            target_node = entity_nodes_by_id.get(str(normalized_edge["target"]))
+            normalized_entity_edges.append(normalized_edge)
+            source_id = str(normalized_edge["source"])
+            target_id = str(normalized_edge["target"])
+            source_node = entity_nodes_by_id.get(source_id)
+            target_node = entity_nodes_by_id.get(target_id)
             if not source_node or not target_node:
                 continue
-            source_file = _entity_node_file_source(source_node)
-            target_file = _entity_node_file_source(target_node)
-            if not source_file or not target_file or source_file == target_file:
-                continue
-            bridges: list[dict[str, Any]] = []
-            if source_node.get("type") != "file":
-                bridges.append(
-                    _entity_bridge_payload(
-                        source_node,
-                        relation=str(normalized_edge.get("type", "") or ""),
-                    )
+            if source_id in semantic_node_ids:
+                target_file = _entity_node_file_source(target_node)
+                if target_file:
+                    semantic_attachment_files.setdefault(source_id, set()).add(target_file)
+            if target_id in semantic_node_ids:
+                source_file = _entity_node_file_source(source_node)
+                if source_file:
+                    semantic_attachment_files.setdefault(target_id, set()).add(source_file)
+
+    for normalized_edge in normalized_entity_edges:
+        source_id = str(normalized_edge["source"])
+        target_id = str(normalized_edge["target"])
+        source_node = entity_nodes_by_id.get(source_id)
+        target_node = entity_nodes_by_id.get(target_id)
+        if not source_node or not target_node:
+            continue
+        source_files = set()
+        target_files = set()
+        source_file = _entity_node_file_source(source_node)
+        target_file = _entity_node_file_source(target_node)
+        if source_file:
+            source_files.add(source_file)
+        elif source_id in semantic_node_ids:
+            source_files |= semantic_attachment_files.get(source_id, set())
+        if target_file:
+            target_files.add(target_file)
+        elif target_id in semantic_node_ids:
+            target_files |= semantic_attachment_files.get(target_id, set())
+        if not source_files or not target_files:
+            continue
+        bridges: list[dict[str, Any]] = []
+        if source_node.get("type") != "file":
+            bridges.append(
+                _entity_bridge_payload(
+                    source_node,
+                    relation=str(normalized_edge.get("type", "") or ""),
                 )
-            if target_node.get("type") != "file":
-                bridges.append(
-                    _entity_bridge_payload(
-                        target_node,
-                        relation=str(normalized_edge.get("type", "") or ""),
-                    )
-                )
-            add(
-                source=source_file,
-                target=target_file,
-                kind=str(normalized_edge.get("type", "") or ""),
-                reason=str(normalized_edge.get("reason", "") or ""),
-                origin="entity_graph",
-                bridges=bridges,
             )
+        if target_node.get("type") != "file":
+            bridges.append(
+                _entity_bridge_payload(
+                    target_node,
+                    relation=str(normalized_edge.get("type", "") or ""),
+                )
+            )
+        for projected_source in sorted(source_files):
+            for projected_target in sorted(target_files):
+                if projected_source == projected_target:
+                    continue
+                add(
+                    source=projected_source,
+                    target=projected_target,
+                    kind=str(normalized_edge.get("type", "") or ""),
+                    reason=str(normalized_edge.get("reason", "") or ""),
+                    origin="entity_graph",
+                    bridges=bridges,
+                )
 
     return relationships
 

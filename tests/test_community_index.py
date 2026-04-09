@@ -68,6 +68,45 @@ class FakeSemanticLLM:
         return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
 
 
+class SplitCommunitySemanticLLM:
+    def invoke(self, prompt: str):
+        lowered = prompt.lower()
+        if "concept bridge marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [
+                            {
+                                "name": "shared semantic bridge",
+                                "summary": "A concept documented in one file and referenced elsewhere.",
+                                "aliases": [],
+                            }
+                        ],
+                        "decisions": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "decision bridge marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [],
+                        "decisions": [
+                            {
+                                "name": "bridge rollout policy",
+                                "summary": "A decision that depends on the shared bridge concept.",
+                                "aliases": [],
+                                "rationale": ["shared semantic bridge"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
+
+
 def _write_community_corpus(root: Path) -> None:
     (root / "工程").mkdir(parents=True)
     (root / "报告").mkdir(parents=True)
@@ -101,6 +140,30 @@ def archive_report(report_id: str) -> dict:
 
 归档报告使用 `archive_report()`，也会经过 `orchestration` 阶段。
 这里只描述职责，不直接给源码路径。
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_split_community_semantic_corpus(root: Path) -> None:
+    (root / "产品").mkdir(parents=True)
+    (root / "报告").mkdir(parents=True)
+
+    (root / "产品" / "concept_bridge.md").write_text(
+        """
+# Concept Bridge
+
+concept bridge marker
+This document introduces the shared semantic bridge concept.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "报告" / "decision_bridge.md").write_text(
+        """
+# Decision Bridge
+
+    decision bridge marker
+This report records the rollout policy but does not repeat the concept page path.
 """.strip(),
         encoding="utf-8",
     )
@@ -193,3 +256,36 @@ def test_build_vectorstore_surfaces_semantic_summary_in_community_outputs(
     assert "## 语义抽取" in graph_report
     assert "orchestration phase" in graph_report
     assert "deferred report archival" in graph_report
+
+
+def test_build_vectorstore_projects_rationale_only_semantic_bridges_into_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_split_community_semantic_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: SplitCommunitySemanticLLM())
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    community_index = json.loads((bundle.persist_dir / "community_index.json").read_text(encoding="utf-8"))
+    assert community_index["community_count"] == 2
+    assert any(
+        bridge["kind"] == "rationale_for"
+        and bridge["source"] == "产品/concept_bridge.md"
+        and bridge["target"] == "报告/decision_bridge.md"
+        for bridge in community_index["bridges"]
+    )
+
+    graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "rationale_for | 产品/concept_bridge.md -> 报告/decision_bridge.md" in graph_report
