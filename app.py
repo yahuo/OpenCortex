@@ -206,9 +206,11 @@ def render_sources(sources: list) -> None:
 def load_structure_summary(
     persist_dir: str,
     index_mtime: float,
+    artifact_mtimes: tuple[float, float, float],
 ) -> dict[str, Any]:
-    """读取离线结构产物。index_mtime 仅用于缓存失效。"""
+    """读取离线结构产物。mtime 参数仅用于缓存失效。"""
     del index_mtime
+    del artifact_mtimes
 
     persist_path = Path(persist_dir)
     community_index_path = persist_path / "community_index.json"
@@ -249,6 +251,22 @@ def load_structure_summary(
         "lint_report_path": str(lint_report_path),
         "graph_report_path": str(graph_report_path),
     }
+
+
+def get_structure_artifact_mtimes(persist_dir: str) -> tuple[float, float, float]:
+    persist_path = Path(persist_dir)
+    paths = (
+        persist_path / "community_index.json",
+        persist_path / "lint_report.json",
+        persist_path / "reports" / "GRAPH_REPORT.md",
+    )
+    mtimes: list[float] = []
+    for path in paths:
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except FileNotFoundError:
+            mtimes.append(0.0)
+    return tuple(mtimes)
 
 
 @st.cache_resource(show_spinner=False)
@@ -351,6 +369,7 @@ def render_query_note_actions(message_index: int, message: dict[str, Any], persi
 
     st.session_state.rag_messages[message_index]["query_note_relpath"] = result["note_relpath"]
     st.session_state.rag_messages[message_index]["query_note_error"] = ""
+    load_structure_summary.clear()
     st.rerun()
 
 
@@ -569,11 +588,14 @@ except FileNotFoundError:
 _mtime_tracker = _get_mtime_tracker()
 if current_mtime != _mtime_tracker["last_mtime"]:
     get_search_bundle.clear()
+    load_structure_summary.clear()
     _mtime_tracker["last_mtime"] = current_mtime
 
+structure_artifact_mtimes = get_structure_artifact_mtimes(cfg["persist_dir"])
 structure_summary = load_structure_summary(
     persist_dir=cfg["persist_dir"],
     index_mtime=current_mtime,
+    artifact_mtimes=structure_artifact_mtimes,
 )
 
 search_bundle = get_search_bundle(
