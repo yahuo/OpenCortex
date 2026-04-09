@@ -280,3 +280,23 @@ def test_write_lock_recovers_from_stale_lock_file(tmp_path: Path) -> None:
         assert lock_path.exists()
 
     assert lock_path.exists()
+
+
+def test_lock_owner_alive_uses_windows_safe_probe(monkeypatch, tmp_path: Path) -> None:
+    lock_path = tmp_path / ".write.lock"
+    lock_path.write_text("4321 987654321 123\n", encoding="utf-8")
+    seen: dict[str, tuple[int, int | None]] = {}
+
+    def fake_windows_probe(pid: int, token: int | None) -> bool:
+        seen["args"] = (pid, token)
+        return True
+
+    def unexpected_kill(*_args, **_kwargs):
+        raise AssertionError("Windows fallback should not call os.kill(pid, 0)")
+
+    monkeypatch.setattr(wiki.os, "name", "nt")
+    monkeypatch.setattr(wiki, "_lock_owner_alive_windows", fake_windows_probe)
+    monkeypatch.setattr(wiki.os, "kill", unexpected_kill)
+
+    assert wiki._lock_owner_alive(lock_path) is True
+    assert seen["args"] == (4321, 987654321)

@@ -20,6 +20,16 @@ except ImportError:
     fcntl = None
     _FCNTL_AVAILABLE = False
 
+try:
+    import ctypes
+    from ctypes import wintypes
+
+    _CTYPES_AVAILABLE = True
+except ImportError:
+    ctypes = None
+    wintypes = None
+    _CTYPES_AVAILABLE = False
+
 WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
@@ -253,6 +263,30 @@ def _write_text_atomically(path: Path, content: str) -> None:
     tmp_path.replace(path)
 
 
+def _current_process_identity_token() -> int:
+    if os.name != "nt":
+        return 0
+    token = _windows_process_identity_token(os.getpid())
+    return token or 0
+
+
+def _lock_file_payload() -> str:
+    return f"{os.getpid()} {_current_process_identity_token()} {time.time_ns()}\n"
+
+
+def _parse_lock_metadata(content: str) -> tuple[int | None, int | None]:
+    parts = content.split()
+    if not parts:
+        return None, None
+    if not parts[0].isdigit():
+        return None, None
+    pid = int(parts[0])
+    token: int | None = None
+    if len(parts) >= 3 and parts[1].isdigit():
+        token = int(parts[1])
+    return pid, token
+
+
 def _load_manifest(persist_path: Path) -> dict[str, Any] | None:
     manifest_path = persist_path / "index_manifest.json"
     if not manifest_path.exists():
@@ -337,7 +371,7 @@ def _posix_write_lock(lock_path: Path):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 os.ftruncate(fd, 0)
-                os.write(fd, f"{os.getpid()} {time.time_ns()}\n".encode("utf-8"))
+                os.write(fd, _lock_file_payload().encode("utf-8"))
                 os.fsync(fd)
                 break
             except BlockingIOError:
@@ -352,6 +386,52 @@ def _posix_write_lock(lock_path: Path):
         os.close(fd)
 
 
+def _windows_process_identity_token(pid: int) -> int | None:
+    if os.name != "nt" or not _CTYPES_AVAILABLE:
+        return None
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    creation = FILETIME()
+    exit_time = FILETIME()
+    kernel_time = FILETIME()
+    user_time = FILETIME()
+    try:
+        success = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        )
+        if not success:
+            return None
+        return (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _lock_owner_alive_windows(pid: int, expected_token: int | None) -> bool:
+    if pid <= 0:
+        return False
+    token = _windows_process_identity_token(pid)
+    if token is None:
+        return False
+    if expected_token not in (None, 0):
+        return token == expected_token
+    return True
+
+
 def _lock_owner_alive(lock_path: Path) -> bool:
     try:
         content = lock_path.read_text(encoding="utf-8").strip()
@@ -359,12 +439,13 @@ def _lock_owner_alive(lock_path: Path) -> bool:
         return False
     if not content:
         return False
-    pid_text = content.split()[0]
-    if not pid_text.isdigit():
+    pid, token = _parse_lock_metadata(content)
+    if pid is None:
         return False
-    pid = int(pid_text)
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _lock_owner_alive_windows(pid, token)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -393,7 +474,7 @@ def _portable_write_lock(lock_path: Path):
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()} {time.time_ns()}\n".encode("utf-8"))
+            os.write(fd, _lock_file_payload().encode("utf-8"))
             break
         except FileExistsError:
             if _lock_is_stale(lock_path):
