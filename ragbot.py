@@ -63,6 +63,11 @@ SEARCH_MAX_STEPS_DEFAULT = 2
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 SYMBOL_INDEX_FILENAME = "symbol_index.jsonl"
 DOCUMENT_GRAPH_FILENAME = "document_graph.json"
+ENTITY_GRAPH_FILENAME = "entity_graph.json"
+COMMUNITY_INDEX_FILENAME = "community_index.json"
+REPORTS_DIRNAME = "reports"
+GRAPH_REPORT_FILENAME = "GRAPH_REPORT.md"
+LINT_REPORT_FILENAME = "lint_report.json"
 PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
@@ -80,6 +85,20 @@ GRAPH_EDGE_PRIORITY = {
     "shared_symbol": 2,
     "same_series": 3,
 }
+ENTITY_EXPANSION_PRIORITY = {
+    "references": 0,
+    "imports": 1,
+    "links_to": 2,
+    "mentions_path": 3,
+    "shared_symbol": 4,
+    "same_series": 5,
+}
+ENTITY_INFERRED_EDGE_TYPES = {"shared_symbol", "same_series"}
+COMMUNITY_STRONG_EDGE_TYPES = {"links_to", "mentions_path", "references", "imports"}
+COMMUNITY_TOP_FILES = 5
+COMMUNITY_TOP_SYMBOLS = 5
+COMMUNITY_TOP_GOD_NODES = 8
+COMMUNITY_TOP_BRIDGES = 20
 GRAPH_STOPWORDS = {
     "this",
     "that",
@@ -214,6 +233,8 @@ class GraphExpansionResult:
     expanded_sources: list[str]
     edge_reasons: list[dict[str, Any]]
     hops: int = 0
+    strategy: str = "heuristic"
+    bridge_entities: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -243,6 +264,9 @@ class SearchBundle:
     symbol_index: list[dict[str, Any]]
     document_graph: dict[str, Any]
     graph_neighbors: dict[str, list[dict[str, Any]]]
+    entity_graph: dict[str, Any]
+    entity_nodes_by_id: dict[str, dict[str, Any]]
+    entity_edges_by_source: dict[str, list[dict[str, Any]]]
 
     def cache_path_for(self, source: str) -> Path | None:
         entry = self.files_by_source.get(source)
@@ -1149,6 +1173,1086 @@ def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
     }
 
 
+def _entity_file_node_id(source: str) -> str:
+    return f"file:{_normalize_source_path(source)}"
+
+
+def _entity_section_node_id(source: str, chunk_index: int) -> str:
+    return f"section:{_normalize_source_path(source)}:{chunk_index}"
+
+
+def _entity_symbol_node_id(record: dict[str, Any]) -> str:
+    source = _normalize_source_path(record.get("source", ""))
+    qualified_name = str(record.get("qualified_name") or record.get("name") or "symbol")
+    symbol_kind = str(record.get("kind") or "symbol")
+    line_start = int(record.get("line_start") or 0)
+    return f"symbol:{source}:{symbol_kind}:{qualified_name}:{line_start}"
+
+
+def _entity_edge_confidence(kind: str) -> str:
+    return "INFERRED" if kind in ENTITY_INFERRED_EDGE_TYPES else "EXTRACTED"
+
+
+def _add_entity_node(
+    nodes: list[dict[str, Any]],
+    seen: set[str],
+    payload: dict[str, Any],
+) -> None:
+    node_id = str(payload.get("id", "")).strip()
+    if not node_id or node_id in seen:
+        return
+    seen.add(node_id)
+    nodes.append(payload)
+
+
+def _add_entity_edge(
+    edges: dict[tuple[Any, ...], dict[str, Any]],
+    source_id: str,
+    target_id: str,
+    kind: str,
+    evidence_source: str,
+    reason: str = "",
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> None:
+    source_id = str(source_id).strip()
+    target_id = str(target_id).strip()
+    evidence_source = _normalize_source_path(evidence_source)
+    if not source_id or not target_id or source_id == target_id or not evidence_source:
+        return
+
+    key = (source_id, target_id, kind, reason, evidence_source, line_start, line_end)
+    if key in edges:
+        return
+
+    evidence: dict[str, Any] = {"source": evidence_source}
+    if line_start is not None:
+        evidence["line_start"] = line_start
+    if line_end is not None:
+        evidence["line_end"] = line_end
+
+    payload: dict[str, Any] = {
+        "source": source_id,
+        "target": target_id,
+        "type": kind,
+        "confidence": _entity_edge_confidence(kind),
+        "evidence": evidence,
+    }
+    if reason:
+        payload["reason"] = reason
+    edges[key] = payload
+
+
+def _extract_section_reference_tokens(text: str) -> list[str]:
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for raw in CODE_SPAN_RE.findall(text):
+        token = raw.strip()
+        lowered = token.lower()
+        if token and lowered not in seen:
+            seen.add(lowered)
+            tokens.append(token)
+    for raw in CALL_RE.findall(text):
+        token = raw.strip()
+        lowered = token.lower()
+        if token and lowered not in seen:
+            seen.add(lowered)
+            tokens.append(token)
+    return tokens
+
+
+def _build_symbol_reference_lookup(
+    symbol_entries: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    lookup: dict[str, list[dict[str, Any]]] = {}
+    seen_keys: set[tuple[str, str]] = set()
+    for entry in symbol_entries:
+        for raw in (entry.get("name", ""), entry.get("qualified_name", "")):
+            key = str(raw).strip().lower()
+            if not key:
+                continue
+            dedupe_key = (key, str(entry.get("id", "")))
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            lookup.setdefault(key, []).append(entry)
+    return lookup
+
+
+def _resolve_symbol_reference(
+    source: str,
+    token: str,
+    lookup: dict[str, list[dict[str, Any]]],
+) -> str | None:
+    key = token.strip().lower()
+    if not key:
+        return None
+
+    candidates = lookup.get(key, [])
+    if not candidates:
+        return None
+
+    source = _normalize_source_path(source)
+    source_kb = _extract_kb(source)
+
+    def _prefer_specific(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        non_module = [entry for entry in entries if entry.get("symbol_kind") != "module"]
+        return non_module or entries
+
+    same_file = _prefer_specific([entry for entry in candidates if entry.get("source") == source])
+    if len(same_file) == 1:
+        return str(same_file[0]["id"])
+
+    same_kb = _prefer_specific([entry for entry in candidates if entry.get("kb") == source_kb])
+    if len(same_kb) == 1:
+        return str(same_kb[0]["id"])
+
+    candidates = _prefer_specific(candidates)
+    if len(candidates) == 1:
+        return str(candidates[0]["id"])
+    return None
+
+
+def _build_python_module_lookup(indexed_files: list[IndexedFile]) -> dict[str, list[str]]:
+    lookup: dict[str, list[str]] = {}
+    for indexed in indexed_files:
+        if indexed.suffix not in PYTHON_SUFFIXES:
+            continue
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
+        module_path = str(Path(source).with_suffix("")).replace("\\", "/")
+        keys = {module_path.replace("/", "."), Path(source).stem}
+        if Path(source).name == "__init__.py":
+            package_name = posixpath.dirname(module_path).replace("/", ".")
+            if package_name:
+                keys.add(package_name)
+        for key in keys:
+            lowered = key.strip().lower()
+            if not lowered:
+                continue
+            lookup.setdefault(lowered, []).append(source)
+    return lookup
+
+
+def _resolve_import_reference(
+    source: str,
+    qualified_name: str,
+    module_lookup: dict[str, list[str]],
+) -> str | None:
+    qualified_name = qualified_name.strip().lower()
+    if not qualified_name:
+        return None
+
+    source_kb = _extract_kb(source)
+    parts = qualified_name.split(".")
+    for end in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:end])
+        matches = module_lookup.get(candidate, [])
+        if not matches:
+            continue
+        same_kb = [match for match in matches if _extract_kb(match) == source_kb]
+        if len(same_kb) == 1:
+            return same_kb[0]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _build_entity_graph(
+    indexed_files: list[IndexedFile],
+    document_graph: dict[str, Any],
+) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    node_seen: set[str] = set()
+    edges: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    normalized_files: list[tuple[str, IndexedFile]] = []
+    source_lookup: set[str] = set()
+    basename_lookup: dict[str, list[str]] = {}
+    for indexed in indexed_files:
+        source = _normalize_source_path(indexed.rel_path)
+        if not source:
+            continue
+        normalized_files.append((source, indexed))
+        source_lookup.add(source)
+        basename_lookup.setdefault(Path(source).name, []).append(source)
+
+    section_records_by_source: dict[str, list[dict[str, Any]]] = {}
+    symbol_records_by_source: dict[str, list[dict[str, Any]]] = {}
+    all_symbol_entries: list[dict[str, Any]] = []
+
+    for source, indexed in sorted(normalized_files, key=lambda item: item[0]):
+        total_lines = max(1, len(indexed.normalized_text.splitlines()))
+        kb = _extract_kb(source) or indexed.kb
+        _add_entity_node(
+            nodes,
+            node_seen,
+            {
+                "id": _entity_file_node_id(source),
+                "type": "file",
+                "name": Path(source).name,
+                "source": source,
+                "path": source,
+                "kb": kb,
+                "line_start": 1,
+                "line_end": total_lines,
+                "confidence": "EXTRACTED",
+            },
+        )
+
+        section_records: list[dict[str, Any]] = []
+        for chunk_index, chunk in enumerate(indexed.chunks):
+            label = chunk.label or f"chunk {chunk_index + 1}"
+            section_id = _entity_section_node_id(source, chunk_index)
+            section_line_start = chunk.line_start or 1
+            section_line_end = chunk.line_end or section_line_start
+            section_record = {
+                "id": section_id,
+                "type": "section",
+                "name": label,
+                "source": source,
+                "file": source,
+                "kb": kb,
+                "chunk_index": chunk_index,
+                "line_start": section_line_start,
+                "line_end": section_line_end,
+                "confidence": "EXTRACTED",
+            }
+            _add_entity_node(nodes, node_seen, section_record)
+            _add_entity_edge(
+                edges,
+                _entity_file_node_id(source),
+                section_id,
+                "contains",
+                evidence_source=source,
+                reason=label,
+                line_start=section_line_start,
+                line_end=section_line_end,
+            )
+            section_records.append({**section_record, "chunk": chunk})
+        section_records_by_source[source] = section_records
+
+        symbol_records: list[dict[str, Any]] = []
+        for record in indexed.symbols:
+            symbol_source = _normalize_source_path(record.get("source", source)) or source
+            symbol_line_start = int(record.get("line_start") or 1)
+            symbol_line_end = int(record.get("line_end") or symbol_line_start)
+            symbol_record = {
+                "id": _entity_symbol_node_id(record),
+                "type": "symbol",
+                "name": str(record.get("name") or ""),
+                "qualified_name": str(record.get("qualified_name") or record.get("name") or ""),
+                "symbol_kind": str(record.get("kind") or "symbol"),
+                "signature": str(record.get("signature") or ""),
+                "source": symbol_source,
+                "file": symbol_source,
+                "kb": _extract_kb(symbol_source) or kb,
+                "line_start": symbol_line_start,
+                "line_end": symbol_line_end,
+                "confidence": "EXTRACTED",
+            }
+            _add_entity_node(nodes, node_seen, symbol_record)
+            _add_entity_edge(
+                edges,
+                _entity_file_node_id(source),
+                str(symbol_record["id"]),
+                "defines",
+                evidence_source=source,
+                reason=str(symbol_record["qualified_name"]),
+                line_start=symbol_line_start,
+                line_end=symbol_line_end,
+            )
+            symbol_records.append(symbol_record)
+            all_symbol_entries.append(symbol_record)
+        symbol_records_by_source[source] = symbol_records
+
+    for source, section_records in section_records_by_source.items():
+        symbol_records = symbol_records_by_source.get(source, [])
+        for section_record in section_records:
+            section_start = int(section_record["line_start"])
+            section_end = int(section_record["line_end"])
+            for symbol_record in symbol_records:
+                if symbol_record.get("symbol_kind") == "module":
+                    continue
+                symbol_start = int(symbol_record["line_start"])
+                if section_start <= symbol_start <= section_end:
+                    _add_entity_edge(
+                        edges,
+                        str(section_record["id"]),
+                        str(symbol_record["id"]),
+                        "contains",
+                        evidence_source=source,
+                        reason=str(section_record["name"]),
+                        line_start=section_start,
+                        line_end=section_end,
+                    )
+
+    symbol_lookup = _build_symbol_reference_lookup(all_symbol_entries)
+    module_lookup = _build_python_module_lookup(indexed_files)
+
+    for source, section_records in section_records_by_source.items():
+        for section_record in section_records:
+            chunk = section_record["chunk"]
+            section_id = str(section_record["id"])
+            line_start = int(section_record["line_start"])
+            line_end = int(section_record["line_end"])
+            for kind, reference in _iter_local_path_references(chunk.text):
+                target = _resolve_document_reference(
+                    source,
+                    reference,
+                    source_lookup,
+                    basename_lookup,
+                )
+                if target is None:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    section_id,
+                    _entity_file_node_id(target),
+                    kind,
+                    evidence_source=source,
+                    reason=reference,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+
+            for token in _extract_section_reference_tokens(chunk.text):
+                target_symbol_id = _resolve_symbol_reference(source, token, symbol_lookup)
+                if target_symbol_id is None:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    section_id,
+                    target_symbol_id,
+                    "references",
+                    evidence_source=source,
+                    reason=token,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+
+    for symbol_record in all_symbol_entries:
+        if symbol_record.get("symbol_kind") != "import":
+            continue
+        target = _resolve_import_reference(
+            str(symbol_record["source"]),
+            str(symbol_record.get("qualified_name") or ""),
+            module_lookup,
+        )
+        if target is None:
+            continue
+        _add_entity_edge(
+            edges,
+            str(symbol_record["id"]),
+            _entity_file_node_id(target),
+            "imports",
+            evidence_source=str(symbol_record["source"]),
+            reason=str(symbol_record.get("qualified_name") or ""),
+            line_start=int(symbol_record["line_start"]),
+            line_end=int(symbol_record["line_end"]),
+        )
+
+    raw_neighbors = document_graph.get("neighbors", {})
+    if isinstance(raw_neighbors, dict):
+        for source, raw_edges in raw_neighbors.items():
+            normalized_source = _normalize_source_path(source)
+            if not normalized_source or not isinstance(raw_edges, list):
+                continue
+            for edge in raw_edges:
+                if not isinstance(edge, dict):
+                    continue
+                target = _normalize_source_path(edge.get("target", ""))
+                if not target:
+                    continue
+                _add_entity_edge(
+                    edges,
+                    _entity_file_node_id(normalized_source),
+                    _entity_file_node_id(target),
+                    str(edge.get("kind") or ""),
+                    evidence_source=normalized_source,
+                    reason=str(edge.get("reason") or ""),
+                )
+
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda item: (
+            str(item.get("type", "")),
+            str(item.get("source", "")),
+            int(item.get("chunk_index") or 0),
+            int(item.get("line_start") or 0),
+            str(item.get("qualified_name") or item.get("name") or ""),
+        ),
+    )
+    sorted_edges = sorted(
+        edges.values(),
+        key=lambda item: (
+            str(item.get("source", "")),
+            str(item.get("target", "")),
+            str(item.get("type", "")),
+            str(item.get("reason", "")),
+        ),
+    )
+    return {
+        "version": 1,
+        "node_count": len(sorted_nodes),
+        "edge_count": len(sorted_edges),
+        "nodes": sorted_nodes,
+        "edges": sorted_edges,
+    }
+
+
+def _normalize_entity_node_id(node_id: str) -> str:
+    text = str(node_id).strip()
+    if not text:
+        return ""
+    if text.startswith("file:"):
+        return f"file:{_normalize_source_path(text[5:])}"
+    if text.startswith("section:"):
+        body = text[8:]
+        source, sep, chunk_index = body.rpartition(":")
+        if sep and source:
+            return f"section:{_normalize_source_path(source)}:{chunk_index}"
+    if text.startswith("symbol:"):
+        body = text[7:]
+        parts = body.rsplit(":", 3)
+        if len(parts) == 4:
+            source, symbol_kind, qualified_name, line_start = parts
+            return f"symbol:{_normalize_source_path(source)}:{symbol_kind}:{qualified_name}:{line_start}"
+        if len(parts) == 3:
+            source, qualified_name, line_start = parts
+            return f"symbol:{_normalize_source_path(source)}:{qualified_name}:{line_start}"
+    return text
+
+
+def _normalize_entity_node_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    node_id = _normalize_entity_node_id(str(payload.get("id", "")))
+    if not node_id:
+        return None
+
+    normalized = dict(payload)
+    normalized["id"] = node_id
+    for key in ("source", "file", "path"):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            clean = _normalize_source_path(value)
+            if clean:
+                normalized[key] = clean
+            elif key in normalized:
+                normalized.pop(key)
+
+    source = str(normalized.get("source", "") or "")
+    if source and not normalized.get("kb"):
+        normalized["kb"] = _extract_kb(source)
+    return normalized
+
+
+def _normalize_entity_edge_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    source = _normalize_entity_node_id(str(payload.get("source", "")))
+    target = _normalize_entity_node_id(str(payload.get("target", "")))
+    if not source or not target or source == target:
+        return None
+
+    normalized = dict(payload)
+    normalized["source"] = source
+    normalized["target"] = target
+
+    evidence = normalized.get("evidence")
+    if isinstance(evidence, dict):
+        normalized_evidence = dict(evidence)
+        evidence_source = normalized_evidence.get("source")
+        if isinstance(evidence_source, str):
+            clean = _normalize_source_path(evidence_source)
+            if clean:
+                normalized_evidence["source"] = clean
+            else:
+                normalized_evidence.pop("source", None)
+        normalized["evidence"] = normalized_evidence
+    return normalized
+
+
+def _entity_bridge_payload(node: dict[str, Any], relation: str = "") -> dict[str, Any]:
+    payload = {
+        "id": str(node.get("id", "")),
+        "type": str(node.get("type", "")),
+        "name": str(node.get("qualified_name") or node.get("name") or ""),
+        "source": str(node.get("source", "") or ""),
+    }
+    if node.get("line_start") is not None:
+        payload["line_start"] = node.get("line_start")
+    if node.get("line_end") is not None:
+        payload["line_end"] = node.get("line_end")
+    if relation:
+        payload["relation"] = relation
+    return payload
+
+
+def _add_bridge_entity(
+    bridge_entities: list[dict[str, Any]],
+    seen: set[tuple[str, str]],
+    payload: dict[str, Any],
+) -> None:
+    entity_id = str(payload.get("id", ""))
+    relation = str(payload.get("relation", ""))
+    key = (entity_id, relation)
+    if not entity_id or key in seen:
+        return
+    seen.add(key)
+    bridge_entities.append(payload)
+
+
+def _entity_expansion_priority(kind: str) -> int:
+    return ENTITY_EXPANSION_PRIORITY.get(kind, len(ENTITY_EXPANSION_PRIORITY) + 10)
+
+
+def _entity_node_file_source(node: dict[str, Any]) -> str:
+    for key in ("file", "source", "path"):
+        value = node.get(key)
+        if isinstance(value, str):
+            clean = _normalize_source_path(value)
+            if clean:
+                return clean
+    return ""
+
+
+def _entity_file_neighbors(
+    bundle: SearchBundle,
+    source: str,
+    valid_sources: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    source = _normalize_source_path(source)
+    file_node_id = _entity_file_node_id(source)
+    if not source or file_node_id not in bundle.entity_nodes_by_id:
+        return []
+
+    source_kb = _extract_kb(source)
+    best_by_target: dict[str, tuple[tuple[int, int, str], dict[str, Any]]] = {}
+
+    def consider(
+        target_source: str,
+        kind: str,
+        reason: str,
+        bridges: list[dict[str, Any]],
+    ) -> None:
+        target_source = _normalize_source_path(target_source)
+        if not target_source or target_source == source:
+            return
+        if valid_sources is not None and target_source not in valid_sources:
+            return
+        priority = (
+            _entity_expansion_priority(kind),
+            0 if _extract_kb(target_source) == source_kb else 1,
+            target_source,
+        )
+        payload = {
+            "to": target_source,
+            "kind": kind,
+            "reason": reason,
+            "bridges": bridges,
+        }
+        current = best_by_target.get(target_source)
+        if current is None or priority < current[0]:
+            best_by_target[target_source] = (priority, payload)
+
+    def target_node_for(edge: dict[str, Any]) -> dict[str, Any] | None:
+        target_id = str(edge.get("target", "") or "")
+        return bundle.entity_nodes_by_id.get(target_id)
+
+    for edge in bundle.entity_edges_by_source.get(file_node_id, []):
+        target_node = target_node_for(edge)
+        if not target_node:
+            continue
+        edge_kind = str(edge.get("type", "") or "")
+        edge_reason = str(edge.get("reason", "") or "")
+        target_type = str(target_node.get("type", "") or "")
+
+        if target_type == "file":
+            consider(
+                target_source=str(target_node.get("source", "") or ""),
+                kind=edge_kind,
+                reason=edge_reason,
+                bridges=[],
+            )
+            continue
+
+        if target_type == "section":
+            section_bridge = _entity_bridge_payload(target_node, relation=edge_kind or "contains")
+            for section_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
+                section_target = target_node_for(section_edge)
+                if not section_target:
+                    continue
+                section_kind = str(section_edge.get("type", "") or "")
+                section_reason = str(section_edge.get("reason", "") or "")
+                section_target_type = str(section_target.get("type", "") or "")
+                if section_target_type == "file":
+                    consider(
+                        target_source=str(section_target.get("source", "") or ""),
+                        kind=section_kind,
+                        reason=section_reason,
+                        bridges=[section_bridge],
+                    )
+                elif section_target_type == "symbol":
+                    symbol_bridge = _entity_bridge_payload(section_target, relation=section_kind)
+                    consider(
+                        target_source=str(section_target.get("source", "") or ""),
+                        kind=section_kind,
+                        reason=section_reason,
+                        bridges=[section_bridge, symbol_bridge],
+                    )
+            continue
+
+        if target_type == "symbol":
+            symbol_bridge = _entity_bridge_payload(target_node, relation=edge_kind or "defines")
+            for symbol_edge in bundle.entity_edges_by_source.get(str(target_node["id"]), []):
+                symbol_target = target_node_for(symbol_edge)
+                if not symbol_target or str(symbol_target.get("type", "") or "") != "file":
+                    continue
+                consider(
+                    target_source=str(symbol_target.get("source", "") or ""),
+                    kind=str(symbol_edge.get("type", "") or ""),
+                    reason=str(symbol_edge.get("reason", "") or ""),
+                    bridges=[symbol_bridge],
+                )
+
+    return [
+        payload
+        for _, payload in sorted(
+            best_by_target.values(),
+            key=lambda item: item[0],
+        )
+    ]
+
+
+def _project_file_relationships(
+    indexed_files: list[IndexedFile],
+    document_graph: dict[str, Any],
+    entity_graph: dict[str, Any],
+) -> list[dict[str, Any]]:
+    file_sources = sorted(
+        {
+            source
+            for indexed in indexed_files
+            if (source := _normalize_source_path(indexed.rel_path))
+        }
+    )
+    valid_sources = set(file_sources)
+    relationships: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(
+        source: str,
+        target: str,
+        kind: str,
+        reason: str,
+        origin: str,
+        bridges: list[dict[str, Any]] | None = None,
+    ) -> None:
+        source = _normalize_source_path(source)
+        target = _normalize_source_path(target)
+        if not source or not target or source == target:
+            return
+        if source not in valid_sources or target not in valid_sources:
+            return
+        bridge_entities = bridges or []
+        key = (
+            source,
+            target,
+            kind,
+            reason,
+            origin,
+            tuple((item.get("id", ""), item.get("relation", "")) for item in bridge_entities),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        relationships.append(
+            {
+                "source": source,
+                "target": target,
+                "kind": kind,
+                "reason": reason,
+                "origin": origin,
+                "bridges": bridge_entities,
+            }
+        )
+
+    raw_neighbors = document_graph.get("neighbors", {})
+    if isinstance(raw_neighbors, dict):
+        for source, edges in raw_neighbors.items():
+            normalized_source = _normalize_source_path(source)
+            if not normalized_source or not isinstance(edges, list):
+                continue
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                add(
+                    source=normalized_source,
+                    target=str(edge.get("target", "") or ""),
+                    kind=str(edge.get("kind", "") or ""),
+                    reason=str(edge.get("reason", "") or ""),
+                    origin="document_graph",
+                )
+
+    entity_nodes_by_id: dict[str, dict[str, Any]] = {}
+    raw_nodes = entity_graph.get("nodes", [])
+    if isinstance(raw_nodes, list):
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            normalized_node = _normalize_entity_node_payload(raw_node)
+            if normalized_node is None:
+                continue
+            entity_nodes_by_id[str(normalized_node["id"])] = normalized_node
+
+    raw_edges = entity_graph.get("edges", [])
+    if isinstance(raw_edges, list):
+        for raw_edge in raw_edges:
+            if not isinstance(raw_edge, dict):
+                continue
+            normalized_edge = _normalize_entity_edge_payload(raw_edge)
+            if normalized_edge is None:
+                continue
+            source_node = entity_nodes_by_id.get(str(normalized_edge["source"]))
+            target_node = entity_nodes_by_id.get(str(normalized_edge["target"]))
+            if not source_node or not target_node:
+                continue
+            source_file = _entity_node_file_source(source_node)
+            target_file = _entity_node_file_source(target_node)
+            if not source_file or not target_file or source_file == target_file:
+                continue
+            bridges: list[dict[str, Any]] = []
+            if source_node.get("type") != "file":
+                bridges.append(
+                    _entity_bridge_payload(
+                        source_node,
+                        relation=str(normalized_edge.get("type", "") or ""),
+                    )
+                )
+            if target_node.get("type") != "file":
+                bridges.append(
+                    _entity_bridge_payload(
+                        target_node,
+                        relation=str(normalized_edge.get("type", "") or ""),
+                    )
+                )
+            add(
+                source=source_file,
+                target=target_file,
+                kind=str(normalized_edge.get("type", "") or ""),
+                reason=str(normalized_edge.get("reason", "") or ""),
+                origin="entity_graph",
+                bridges=bridges,
+            )
+
+    return relationships
+
+
+def _build_community_index(
+    indexed_files: list[IndexedFile],
+    document_graph: dict[str, Any],
+    entity_graph: dict[str, Any],
+) -> dict[str, Any]:
+    file_sources = sorted(
+        {
+            source
+            for indexed in indexed_files
+            if (source := _normalize_source_path(indexed.rel_path))
+        }
+    )
+    relationships = _project_file_relationships(indexed_files, document_graph, entity_graph)
+
+    strong_adjacency: dict[str, set[str]] = {source: set() for source in file_sources}
+    all_adjacency: dict[str, set[str]] = {source: set() for source in file_sources}
+    for relation in relationships:
+        source = relation["source"]
+        target = relation["target"]
+        all_adjacency.setdefault(source, set()).add(target)
+        all_adjacency.setdefault(target, set()).add(source)
+        if relation["kind"] in COMMUNITY_STRONG_EDGE_TYPES:
+            strong_adjacency.setdefault(source, set()).add(target)
+            strong_adjacency.setdefault(target, set()).add(source)
+
+    communities_raw: list[list[str]] = []
+    seen_sources: set[str] = set()
+    for source in file_sources:
+        if source in seen_sources:
+            continue
+        queue = deque([source])
+        component: list[str] = []
+        seen_sources.add(source)
+        while queue:
+            current = queue.popleft()
+            component.append(current)
+            for neighbor in sorted(strong_adjacency.get(current, set())):
+                if neighbor in seen_sources:
+                    continue
+                seen_sources.add(neighbor)
+                queue.append(neighbor)
+        communities_raw.append(sorted(component))
+
+    communities_raw.sort(key=lambda items: (-len(items), items[0] if items else ""))
+    file_to_community: dict[str, str] = {}
+    community_ids: list[str] = []
+    for index, files in enumerate(communities_raw, start=1):
+        community_id = f"community-{index:03d}"
+        community_ids.append(community_id)
+        for source in files:
+            file_to_community[source] = community_id
+
+    entity_nodes = {
+        str(node.get("id", "")): node
+        for node in entity_graph.get("nodes", [])
+        if isinstance(node, dict) and node.get("id")
+    }
+    entity_edges = [
+        edge
+        for edge in entity_graph.get("edges", [])
+        if isinstance(edge, dict)
+    ]
+
+    communities: list[dict[str, Any]] = []
+    for community_id, files in zip(community_ids, communities_raw):
+        file_set = set(files)
+        kbs = sorted({_extract_kb(source) for source in files if _extract_kb(source)})
+        file_degrees = {
+            source: len({neighbor for neighbor in all_adjacency.get(source, set()) if neighbor in file_set})
+            for source in files
+        }
+        top_files = [
+            {
+                "source": source,
+                "degree": file_degrees[source],
+                "kb": _extract_kb(source),
+            }
+            for source in sorted(files, key=lambda item: (-file_degrees[item], item))
+        ][:COMMUNITY_TOP_FILES]
+
+        symbol_scores: dict[str, tuple[dict[str, Any], int]] = {}
+        for node_id, node in entity_nodes.items():
+            if node.get("type") != "symbol":
+                continue
+            if node.get("symbol_kind") in {"module", "import"}:
+                continue
+            source = _entity_node_file_source(node)
+            if source not in file_set:
+                continue
+            score = 0
+            for edge in entity_edges:
+                if edge.get("source") == node_id or edge.get("target") == node_id:
+                    score += 1
+            symbol_scores[node_id] = (node, score)
+
+        top_symbols = [
+            {
+                "id": str(node.get("id", "")),
+                "name": str(node.get("qualified_name") or node.get("name") or ""),
+                "source": _entity_node_file_source(node),
+                "score": score,
+            }
+            for node, score in sorted(
+                symbol_scores.values(),
+                key=lambda item: (-item[1], str(item[0].get("qualified_name") or item[0].get("name") or "")),
+            )
+        ][:COMMUNITY_TOP_SYMBOLS]
+
+        label = (
+            top_symbols[0]["name"]
+            if top_symbols
+            else Path(top_files[0]["source"]).stem if top_files else community_id
+        )
+        suggested_queries: list[str] = []
+        if top_symbols:
+            suggested_queries.append(f"{top_symbols[0]['name']} 在哪里实现？")
+        if top_files:
+            suggested_queries.append(f"{Path(top_files[0]['source']).stem} 相关流程是什么？")
+        if kbs:
+            suggested_queries.append(f"{kbs[0]} 这个社区主要关注什么？")
+
+        communities.append(
+            {
+                "id": community_id,
+                "label": label,
+                "size": len(files),
+                "files": files,
+                "kbs": kbs,
+                "top_files": top_files,
+                "top_symbols": top_symbols,
+                "suggested_queries": suggested_queries,
+            }
+        )
+
+    file_degree_overall = {
+        source: len(neighbors)
+        for source, neighbors in all_adjacency.items()
+    }
+    god_nodes: list[dict[str, Any]] = [
+        {
+            "id": _entity_file_node_id(source),
+            "type": "file",
+            "name": Path(source).name,
+            "source": source,
+            "degree": file_degree_overall.get(source, 0),
+        }
+        for source in sorted(file_sources, key=lambda item: (-file_degree_overall.get(item, 0), item))
+    ][:COMMUNITY_TOP_GOD_NODES]
+
+    bridges: list[dict[str, Any]] = []
+    for relation in relationships:
+        source = relation["source"]
+        target = relation["target"]
+        source_community = file_to_community.get(source)
+        target_community = file_to_community.get(target)
+        if not source_community or not target_community or source_community == target_community:
+            continue
+        bridges.append(
+            {
+                "source_community": source_community,
+                "target_community": target_community,
+                "source": source,
+                "target": target,
+                "kind": relation["kind"],
+                "reason": relation["reason"],
+                "origin": relation["origin"],
+                "bridges": relation["bridges"],
+            }
+        )
+
+    bridges.sort(
+        key=lambda item: (
+            0 if item["origin"] == "entity_graph" else 1,
+            _entity_expansion_priority(item["kind"]),
+            item["source_community"],
+            item["target_community"],
+            item["source"],
+            item["target"],
+        )
+    )
+
+    return {
+        "version": 1,
+        "file_count": len(file_sources),
+        "relationship_count": len(relationships),
+        "community_count": len(communities),
+        "communities": communities,
+        "file_to_community": file_to_community,
+        "god_nodes": god_nodes,
+        "bridges": bridges[:COMMUNITY_TOP_BRIDGES],
+    }
+
+
+def _format_report_list(items: list[str], empty_text: str) -> list[str]:
+    if not items:
+        return [f"- {empty_text}"]
+    return [f"- {item}" for item in items]
+
+
+def _render_graph_report(
+    community_index: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    build_time = str(manifest.get("build_time", "") or "unknown")
+    source_dir = str(manifest.get("source_dir", "") or "unknown")
+    file_count = int(community_index.get("file_count") or 0)
+    relationship_count = int(community_index.get("relationship_count") or 0)
+    community_count = int(community_index.get("community_count") or 0)
+    communities = community_index.get("communities", [])
+    god_nodes = community_index.get("god_nodes", [])
+    bridges = community_index.get("bridges", [])
+
+    lines = [
+        "# 图谱报告",
+        "",
+        "此报告由构建阶段自动生成，当前用于帮助理解知识库结构。",
+        "",
+        f"- 最近构建：{build_time}",
+        f"- 源目录：{source_dir}",
+        f"- 文件总数：{file_count}",
+        f"- 社区数量：{community_count}",
+        f"- 关系总数：{relationship_count}",
+        "",
+        "## God Nodes",
+        "",
+    ]
+
+    god_node_lines = [
+        f"{item.get('source', '')} (degree={item.get('degree', 0)})"
+        for item in god_nodes
+        if isinstance(item, dict) and item.get("source")
+    ]
+    lines.extend(_format_report_list(god_node_lines, "暂无显著 hub 节点"))
+    lines.extend(["", "## 社区概览", ""])
+
+    if not isinstance(communities, list) or not communities:
+        lines.extend(["- 暂无社区数据", ""])
+    else:
+        for community in communities:
+            if not isinstance(community, dict):
+                continue
+            community_id = str(community.get("id", "") or "community")
+            label = str(community.get("label", "") or community_id)
+            size = int(community.get("size") or 0)
+            kbs = ", ".join(str(item) for item in community.get("kbs", []) if item) or "未分类"
+            lines.extend(
+                [
+                    f"### {community_id}: {label}",
+                    "",
+                    f"- 文件数：{size}",
+                    f"- 知识库：{kbs}",
+                    "- Top Files:",
+                ]
+            )
+            top_file_lines = [
+                f"{item.get('source', '')} (degree={item.get('degree', 0)})"
+                for item in community.get("top_files", [])
+                if isinstance(item, dict) and item.get("source")
+            ]
+            lines.extend(_format_report_list(top_file_lines, "暂无文件摘要"))
+            lines.append("- Top Symbols:")
+            top_symbol_lines = [
+                f"{item.get('name', '')} @ {item.get('source', '')} (score={item.get('score', 0)})"
+                for item in community.get("top_symbols", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            lines.extend(_format_report_list(top_symbol_lines, "暂无符号摘要"))
+            lines.append("- Suggested Questions:")
+            suggested_query_lines = [
+                str(item)
+                for item in community.get("suggested_queries", [])
+                if isinstance(item, str) and item
+            ]
+            lines.extend(_format_report_list(suggested_query_lines, "暂无建议问题"))
+            lines.append("")
+
+    lines.extend(["## 跨社区连接", ""])
+    bridge_lines: list[str] = []
+    if isinstance(bridges, list):
+        for bridge in bridges:
+            if not isinstance(bridge, dict):
+                continue
+            source_community = str(bridge.get("source_community", "") or "?")
+            target_community = str(bridge.get("target_community", "") or "?")
+            kind = str(bridge.get("kind", "") or "unknown")
+            source = str(bridge.get("source", "") or "")
+            target = str(bridge.get("target", "") or "")
+            reason = str(bridge.get("reason", "") or "")
+            origin = str(bridge.get("origin", "") or "")
+            bridge_summary = ""
+            raw_bridge_entities = bridge.get("bridges", [])
+            if isinstance(raw_bridge_entities, list) and raw_bridge_entities:
+                names = [
+                    str(item.get("name", "") or item.get("id", ""))
+                    for item in raw_bridge_entities
+                    if isinstance(item, dict)
+                ]
+                bridge_summary = f" | bridges: {', '.join(name for name in names if name)}" if names else ""
+            bridge_lines.append(
+                f"{source_community} -> {target_community} | {kind} | {source} -> {target} | reason: {reason} | origin: {origin}{bridge_summary}"
+            )
+    lines.extend(_format_report_list(bridge_lines, "暂无跨社区连接"))
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
@@ -1174,6 +2278,10 @@ def _write_index_artifacts(
         "normalized_text_dir": NORMALIZED_TEXT_DIRNAME,
         "symbol_index_file": SYMBOL_INDEX_FILENAME,
         "document_graph_file": DOCUMENT_GRAPH_FILENAME,
+        "entity_graph_file": ENTITY_GRAPH_FILENAME,
+        "community_index_file": COMMUNITY_INDEX_FILENAME,
+        "graph_report_file": f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}",
+        "lint_report_file": LINT_REPORT_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "files": [],
     }
@@ -1214,6 +2322,32 @@ def _write_index_artifacts(
         encoding="utf-8",
     )
 
+    entity_graph = _build_entity_graph(indexed_files, document_graph=document_graph)
+    entity_graph_path = persist_path / ENTITY_GRAPH_FILENAME
+    entity_graph_path.write_text(
+        json.dumps(entity_graph, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    community_index = _build_community_index(
+        indexed_files=indexed_files,
+        document_graph=document_graph,
+        entity_graph=entity_graph,
+    )
+    community_index_path = persist_path / COMMUNITY_INDEX_FILENAME
+    community_index_path.write_text(
+        json.dumps(community_index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    reports_dir = persist_path / REPORTS_DIRNAME
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    graph_report_path = reports_dir / GRAPH_REPORT_FILENAME
+    graph_report_path.write_text(
+        _render_graph_report(community_index, manifest),
+        encoding="utf-8",
+    )
+
     (persist_path / "index_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1246,7 +2380,7 @@ def build_vectorstore(
             f"在 {md_dir} 中未找到可索引文本。支持后缀: {', '.join(sorted(SUPPORTED_TEXT_SUFFIXES))}"
         )
 
-    _cb(0, total + 3, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
+    _cb(0, total + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
     embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
 
     batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", "10")))
@@ -1255,7 +2389,7 @@ def build_vectorstore(
     retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
 
     vectorstore: FAISS | None = None
-    total_steps = total + 3
+    total_steps = total + 4
     for i in range(0, total, batch_size):
         batch = documents[i : i + batch_size]
         for attempt in range(max_retries + 1):
@@ -1292,8 +2426,12 @@ def build_vectorstore(
         source_dir=md_dir,
         total_chunks=total,
     )
+    _cb(total + 2, total_steps, "正在生成离线 wiki 导航...")
+    from wiki import generate_wiki
+
+    generate_wiki(persist_path=persist_path, manifest=manifest)
     _read_cached_text.cache_clear()
-    _cb(total + 2, total_steps, "正在加载检索 bundle...")
+    _cb(total + 3, total_steps, "正在加载检索 bundle...")
 
     bundle = load_search_bundle(
         embed_api_key=embed_api_key,
@@ -1304,7 +2442,7 @@ def build_vectorstore(
     if bundle is None:
         raise RuntimeError("索引文件写入成功，但 SearchBundle 回读失败。")
 
-    _cb(total + 3, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
+    _cb(total + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
     bundle.manifest = manifest
     return bundle
 
@@ -1352,6 +2490,7 @@ def load_search_bundle(
     normalized_text_dir = Path(persist_dir) / manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME)
     symbol_index_path = Path(persist_dir) / manifest.get("symbol_index_file", SYMBOL_INDEX_FILENAME)
     document_graph_path = Path(persist_dir) / manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME)
+    entity_graph_path = Path(persist_dir) / manifest.get("entity_graph_file", ENTITY_GRAPH_FILENAME)
 
     symbol_index: list[dict[str, Any]] = []
     if symbol_index_path.exists():
@@ -1410,6 +2549,71 @@ def load_search_bundle(
         "edge_count": sum(len(edges) for edges in graph_neighbors.values()),
     }
 
+    raw_entity_graph: dict[str, Any] = {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []}
+    if entity_graph_path.exists():
+        try:
+            raw_entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raw_entity_graph = {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []}
+
+    entity_nodes: list[dict[str, Any]] = []
+    entity_nodes_by_id: dict[str, dict[str, Any]] = {}
+    raw_nodes = raw_entity_graph.get("nodes", [])
+    if isinstance(raw_nodes, list):
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            normalized_node = _normalize_entity_node_payload(raw_node)
+            if normalized_node is None:
+                continue
+            node_id = str(normalized_node["id"])
+            if node_id in entity_nodes_by_id:
+                continue
+            entity_nodes_by_id[node_id] = normalized_node
+            entity_nodes.append(normalized_node)
+
+    entity_edges: list[dict[str, Any]] = []
+    entity_edges_by_source: dict[str, list[dict[str, Any]]] = {}
+    seen_entity_edges: set[tuple[Any, ...]] = set()
+    raw_edges = raw_entity_graph.get("edges", [])
+    if isinstance(raw_edges, list):
+        for raw_edge in raw_edges:
+            if not isinstance(raw_edge, dict):
+                continue
+            normalized_edge = _normalize_entity_edge_payload(raw_edge)
+            if normalized_edge is None:
+                continue
+            evidence = normalized_edge.get("evidence")
+            evidence_source = ""
+            evidence_line_start = None
+            evidence_line_end = None
+            if isinstance(evidence, dict):
+                evidence_source = str(evidence.get("source", "") or "")
+                evidence_line_start = evidence.get("line_start")
+                evidence_line_end = evidence.get("line_end")
+            dedupe_key = (
+                normalized_edge["source"],
+                normalized_edge["target"],
+                normalized_edge.get("type", ""),
+                normalized_edge.get("reason", ""),
+                evidence_source,
+                evidence_line_start,
+                evidence_line_end,
+            )
+            if dedupe_key in seen_entity_edges:
+                continue
+            seen_entity_edges.add(dedupe_key)
+            entity_edges.append(normalized_edge)
+            entity_edges_by_source.setdefault(str(normalized_edge["source"]), []).append(normalized_edge)
+
+    entity_graph = {
+        **raw_entity_graph,
+        "nodes": entity_nodes,
+        "edges": entity_edges,
+        "node_count": len(entity_nodes),
+        "edge_count": len(entity_edges),
+    }
+
     source_dir = manifest.get("source_dir")
     return SearchBundle(
         vectorstore=vectorstore,
@@ -1422,6 +2626,9 @@ def load_search_bundle(
         symbol_index=symbol_index,
         document_graph=document_graph,
         graph_neighbors=graph_neighbors,
+        entity_graph=entity_graph,
+        entity_nodes_by_id=entity_nodes_by_id,
+        entity_edges_by_source=entity_edges_by_source,
     )
 
 
@@ -2057,38 +3264,17 @@ def _heuristic_expand_candidate_sources(
         expanded_sources=[source for source in expanded if source not in seed_sources],
         edge_reasons=edge_reasons,
         hops=1 if edge_reasons else 0,
+        strategy="heuristic",
     )
 
 
-def _expand_candidate_sources_detailed(
+def _document_graph_expand_candidate_sources(
     bundle: SearchBundle,
-    seed_sources: Iterable[str],
-    kb: str | None = None,
-    allowed_sources: set[str] | None = None,
-    max_hops: int = 1,
-    max_extra_sources: int = 12,
+    ordered_seeds: list[str],
+    valid_sources: set[str] | None,
+    max_hops: int,
+    max_extra_sources: int,
 ) -> GraphExpansionResult:
-    valid_sources = (
-        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
-        if kb is not None or allowed_sources is not None
-        else None
-    )
-    ordered_seeds = [
-        source
-        for source in _dedupe_strings(seed_sources)
-        if valid_sources is None or source in valid_sources
-    ]
-    if not ordered_seeds:
-        return GraphExpansionResult(set(), [], [], [], 0)
-
-    if not bundle.graph_neighbors:
-        return _heuristic_expand_candidate_sources(
-            bundle,
-            ordered_seeds,
-            kb=kb,
-            allowed_sources=allowed_sources,
-        )
-
     seen = set(ordered_seeds)
     expanded_sources: list[str] = []
     edge_reasons: list[dict[str, Any]] = []
@@ -2123,15 +3309,58 @@ def _expand_candidate_sources_detailed(
                 break
             queue.append((target, hop))
 
-    if not expanded_sources:
-        heuristic = _heuristic_expand_candidate_sources(
-            bundle,
-            ordered_seeds,
-            kb=kb,
-            allowed_sources=allowed_sources,
-        )
-        if heuristic.expanded_sources:
-            return heuristic
+    return GraphExpansionResult(
+        sources=seen,
+        seed_sources=ordered_seeds,
+        expanded_sources=expanded_sources,
+        edge_reasons=edge_reasons,
+        hops=max((item["hop"] for item in edge_reasons), default=0),
+        strategy="document_graph",
+    )
+
+
+def _entity_graph_expand_candidate_sources(
+    bundle: SearchBundle,
+    ordered_seeds: list[str],
+    valid_sources: set[str] | None,
+    max_hops: int,
+    max_extra_sources: int,
+) -> GraphExpansionResult:
+    seen = set(ordered_seeds)
+    expanded_sources: list[str] = []
+    edge_reasons: list[dict[str, Any]] = []
+    bridge_entities: list[dict[str, Any]] = []
+    seen_bridges: set[tuple[str, str]] = set()
+    queue: deque[tuple[str, int]] = deque((source, 0) for source in ordered_seeds)
+    max_seen = len(ordered_seeds) + max_extra_sources
+
+    while queue and len(seen) < max_seen:
+        current, depth = queue.popleft()
+        if depth >= max_hops:
+            continue
+        for neighbor in _entity_file_neighbors(bundle, current, valid_sources=valid_sources):
+            target = str(neighbor.get("to", "")).strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            expanded_sources.append(target)
+            hop = depth + 1
+            bridges = list(neighbor.get("bridges") or [])
+            for bridge in bridges:
+                _add_bridge_entity(bridge_entities, seen_bridges, bridge)
+            edge_reasons.append(
+                {
+                    "from": current,
+                    "to": target,
+                    "kind": neighbor.get("kind", ""),
+                    "reason": neighbor.get("reason", ""),
+                    "hop": hop,
+                    "bridges": bridges,
+                }
+            )
+            if len(seen) >= max_seen:
+                break
+            queue.append((target, hop))
 
     return GraphExpansionResult(
         sources=seen,
@@ -2139,6 +3368,59 @@ def _expand_candidate_sources_detailed(
         expanded_sources=expanded_sources,
         edge_reasons=edge_reasons,
         hops=max((item["hop"] for item in edge_reasons), default=0),
+        strategy="entity_graph",
+        bridge_entities=bridge_entities,
+    )
+
+
+def _expand_candidate_sources_detailed(
+    bundle: SearchBundle,
+    seed_sources: Iterable[str],
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    max_hops: int = 1,
+    max_extra_sources: int = 12,
+) -> GraphExpansionResult:
+    valid_sources = (
+        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
+        if kb is not None or allowed_sources is not None
+        else None
+    )
+    ordered_seeds = [
+        source
+        for source in _dedupe_strings(seed_sources)
+        if valid_sources is None or source in valid_sources
+    ]
+    if not ordered_seeds:
+        return GraphExpansionResult(set(), [], [], [], 0)
+
+    if bundle.entity_edges_by_source and bundle.entity_nodes_by_id:
+        entity_result = _entity_graph_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            valid_sources=valid_sources,
+            max_hops=max_hops,
+            max_extra_sources=max_extra_sources,
+        )
+        if entity_result.expanded_sources:
+            return entity_result
+
+    if bundle.graph_neighbors:
+        document_result = _document_graph_expand_candidate_sources(
+            bundle,
+            ordered_seeds,
+            valid_sources=valid_sources,
+            max_hops=max_hops,
+            max_extra_sources=max_extra_sources,
+        )
+        if document_result.expanded_sources:
+            return document_result
+
+    return _heuristic_expand_candidate_sources(
+        bundle,
+        ordered_seeds,
+        kb=kb,
+        allowed_sources=allowed_sources,
     )
 
 
@@ -2214,9 +3496,11 @@ def _run_search_step(
         "retrievers": {name: len(hits) for name, hits in grouped.items()},
         "candidate_scope": sorted(narrowed_vector_scope) if narrowed_vector_scope else [],
         "grep_fallback_used": grep_fallback_used,
+        "graph_strategy": graph_expansion.strategy,
         "graph_seed_sources": graph_expansion.seed_sources,
         "graph_expanded_sources": graph_expansion.expanded_sources,
         "graph_edge_reasons": graph_expansion.edge_reasons,
+        "graph_bridge_entities": graph_expansion.bridge_entities,
         "graph_hops": graph_expansion.hops,
         "top_sources": [hit.source for hit in fused[:3]],
     }
@@ -2380,6 +3664,20 @@ def _sources_from_hits(results: list[SearchHit]) -> list[dict[str, Any]]:
     return sources
 
 
+def _collect_bridge_entities(search_trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bridge_entities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for step in search_trace:
+        raw_entities = step.get("graph_bridge_entities", [])
+        if not isinstance(raw_entities, list):
+            continue
+        for raw_entity in raw_entities:
+            if not isinstance(raw_entity, dict):
+                continue
+            _add_bridge_entity(bridge_entities, seen, raw_entity)
+    return bridge_entities
+
+
 def _build_context_and_sources(results: list[SearchHit]) -> tuple[str, list[dict[str, Any]]]:
     context_parts = []
     for index, hit in enumerate(results, start=1):
@@ -2420,11 +3718,19 @@ def retrieve(
                 "retrievers": {"vector": len(vector_hits)},
                 "candidate_scope": [],
                 "top_sources": [hit.source for hit in vector_hits[:3]],
+                "graph_strategy": "disabled",
+                "graph_bridge_entities": [],
                 "stopped": True,
                 "stop_reason": "vector_mode",
             }
         )
-        return {"hits": vector_hits, "context": context, "sources": sources, "search_trace": trace}
+        return {
+            "hits": vector_hits,
+            "context": context,
+            "sources": sources,
+            "search_trace": trace,
+            "bridge_entities": [],
+        }
 
     step1_result = _run_search_step(
         question=question,
@@ -2472,6 +3778,8 @@ def retrieve(
         step2_result.trace["prefilter_graph_seed_sources"] = prefilter_expansion.seed_sources
         step2_result.trace["prefilter_graph_expanded_sources"] = prefilter_expansion.expanded_sources
         step2_result.trace["prefilter_graph_edge_reasons"] = prefilter_expansion.edge_reasons
+        step2_result.trace["prefilter_graph_strategy"] = prefilter_expansion.strategy
+        step2_result.trace["prefilter_graph_bridge_entities"] = prefilter_expansion.bridge_entities
         step2_result.trace["prefilter_graph_hops"] = prefilter_expansion.hops
         step2_result.trace["stopped"] = True
         step2_result.trace["stop_reason"] = "bounded_agentic_complete"
@@ -2482,11 +3790,13 @@ def retrieve(
         )
 
     context, sources = _build_context_and_sources(final_hits)
+    bridge_entities = _collect_bridge_entities(trace)
     return {
         "hits": final_hits,
         "context": context,
         "sources": sources,
         "search_trace": trace,
+        "bridge_entities": bridge_entities,
     }
 
 
@@ -2561,4 +3871,5 @@ def ask_stream(
     }
     if debug:
         result["search_trace"] = retrieval["search_trace"]
+        result["bridge_entities"] = retrieval.get("bridge_entities", [])
     return result

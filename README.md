@@ -23,6 +23,7 @@
 - **HTTP API** — FastAPI endpoints (`/api/ask`, `/api/kbs`, `/api/health`) with `search_mode` and SSE streaming support
 - **Hot-reload** — update your docs and trigger re-indexing without restarting the server
 - **Docker deployment** — serve the same knowledge base to multiple users on a LAN
+- **Offline knowledge artifacts** — build `wiki/`, `community_index.json`, `GRAPH_REPORT.md`, `query notes`, and `lint_report.json` for navigation and maintenance
 
 ---
 
@@ -72,6 +73,17 @@ Key implementation details:
 2. `ragbot.py` persists more than FAISS alone: `index_manifest.json`, `normalized_texts/`, and `symbol_index.jsonl` are also written for hybrid / agentic retrieval.
 3. `app.py` only exposes global search, but watches the `index.faiss` mtime and clears its cached `SearchBundle` when the index changes.
 4. `api.py` loads the same `SearchBundle` during FastAPI lifespan startup and exposes `kb`, `search_mode`, `stream`, and `debug` controls.
+
+### Offline Knowledge Artifacts
+
+In addition to the FAISS index, OpenCortex now writes a small set of offline artifacts to make the corpus easier to navigate and maintain:
+
+- `wiki/index.md` and `wiki/files/*.md` for human-readable file navigation
+- `wiki/queries/*.md` for explicitly accepted “save as knowledge” notes from the UI
+- `community_index.json` and `reports/GRAPH_REPORT.md` for structure summaries
+- `lint_report.json` for wiki health checks (`stale_pages`, `orphan_pages`, `missing_links`)
+
+These artifacts are secondary knowledge, not the primary source of truth. Runtime answers should still be grounded in raw source citations first; query notes and wiki pages are there to help navigation, curation, and reuse.
 
 ### Request Flow
 

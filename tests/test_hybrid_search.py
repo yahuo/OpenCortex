@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import ragbot
+import wiki
 
 
 class FakeEmbeddings:
@@ -163,6 +164,235 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
         edge["target"] == "工程/bootstrap_session.py"
         for edge in search_bundle.graph_neighbors["工程/session_playbook.md"]
     )
+    entity_graph_path = search_bundle.persist_dir / "entity_graph.json"
+    assert entity_graph_path.exists()
+    entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["entity_graph_file"] == "entity_graph.json"
+    assert search_bundle.entity_graph["node_count"] == len(search_bundle.entity_graph["nodes"])
+    assert "file:工程/bootstrap_session.py" in search_bundle.entity_nodes_by_id
+    assert any(
+        edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
+        and edge["type"] == "references"
+        for edge in search_bundle.entity_edges_by_source["section:工程/session_playbook.md:0"]
+    )
+    assert any(
+        node["type"] == "file" and node["source"] == "工程/bootstrap_session.py"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        node["type"] == "section"
+        and node["source"] == "工程/session_playbook.md"
+        and node["name"] == "Session Playbook"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        node["type"] == "symbol"
+        and node["source"] == "工程/bootstrap_session.py"
+        and node["qualified_name"] == "bootstrap_session"
+        for node in entity_graph["nodes"]
+    )
+    assert any(
+        edge["source"] == "section:工程/session_playbook.md:0"
+        and edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
+        and edge["type"] == "references"
+        for edge in entity_graph["edges"]
+    )
+    community_index_path = search_bundle.persist_dir / "community_index.json"
+    assert community_index_path.exists()
+    community_index = json.loads(community_index_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["community_index_file"] == "community_index.json"
+    assert community_index["community_count"] >= 1
+    assert community_index["file_to_community"]["工程/session_playbook.md"].startswith("community-")
+    graph_report_path = search_bundle.persist_dir / "reports" / "GRAPH_REPORT.md"
+    assert graph_report_path.exists()
+    graph_report = graph_report_path.read_text(encoding="utf-8")
+    assert search_bundle.manifest["graph_report_file"] == "reports/GRAPH_REPORT.md"
+    assert "# 图谱报告" in graph_report
+    lint_report_path = search_bundle.persist_dir / "lint_report.json"
+    assert lint_report_path.exists()
+    lint_report = json.loads(lint_report_path.read_text(encoding="utf-8"))
+    assert search_bundle.manifest["lint_report_file"] == "lint_report.json"
+    assert lint_report["summary"] == {
+        "stale_pages": 0,
+        "orphan_pages": 0,
+        "missing_links": 0,
+    }
+    wiki_index_path = search_bundle.persist_dir / "wiki" / "index.md"
+    assert wiki_index_path.exists()
+    wiki_index = wiki_index_path.read_text(encoding="utf-8")
+    assert "[工程/session_playbook.md](files/工程/session_playbook.md.md)" in wiki_index
+    wiki_file_path = search_bundle.persist_dir / "wiki" / "files" / "工程" / "session_playbook.md.md"
+    assert wiki_file_path.exists()
+    wiki_file = wiki_file_path.read_text(encoding="utf-8")
+    assert "- 知识库：`工程`" in wiki_file
+    assert "bootstrap_session.py" in wiki_file
+    assert (search_bundle.persist_dir / "wiki" / "log.md").exists()
+
+
+def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: pytest.MonkeyPatch):
+    entity_graph_path = search_bundle.persist_dir / "entity_graph.json"
+    entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+
+    def rewrite_node_id(node_id: str) -> str:
+        return node_id.replace("/", "\\")
+
+    for node in entity_graph["nodes"]:
+        if isinstance(node.get("id"), str):
+            node["id"] = rewrite_node_id(node["id"])
+        for key in ("source", "file", "path"):
+            value = node.get(key)
+            if isinstance(value, str):
+                node[key] = value.replace("/", "\\")
+
+    duplicated_edge = None
+    for edge in entity_graph["edges"]:
+        if isinstance(edge.get("source"), str):
+            edge["source"] = rewrite_node_id(edge["source"])
+        if isinstance(edge.get("target"), str):
+            edge["target"] = rewrite_node_id(edge["target"])
+        evidence = edge.get("evidence")
+        if isinstance(evidence, dict) and isinstance(evidence.get("source"), str):
+            evidence["source"] = evidence["source"].replace("/", "\\")
+        if (
+            duplicated_edge is None
+            and edge.get("source") == "section:工程\\session_playbook.md:0"
+            and edge.get("target") == "symbol:工程\\bootstrap_session.py:function:bootstrap_session:4"
+            and edge.get("type") == "references"
+        ):
+            duplicated_edge = json.loads(json.dumps(edge, ensure_ascii=False))
+
+    assert duplicated_edge is not None
+    entity_graph["edges"].append(duplicated_edge)
+    entity_graph_path.write_text(json.dumps(entity_graph, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    reloaded = ragbot.load_search_bundle(
+        embed_api_key="fake-key",
+        persist_dir=str(search_bundle.persist_dir),
+    )
+
+    assert reloaded is not None
+    assert "file:工程/bootstrap_session.py" in reloaded.entity_nodes_by_id
+    assert all("\\" not in node["id"] for node in reloaded.entity_graph["nodes"])
+    assert all("\\" not in node.get("source", "") for node in reloaded.entity_graph["nodes"])
+    section_edges = reloaded.entity_edges_by_source["section:工程/session_playbook.md:0"]
+    assert sum(
+        1
+        for edge in section_edges
+        if edge["target"] == "symbol:工程/bootstrap_session.py:function:bootstrap_session:4"
+        and edge["type"] == "references"
+    ) == 1
+    assert all("\\" not in edge["source"] for edge in reloaded.entity_graph["edges"])
+    assert all("\\" not in edge["target"] for edge in reloaded.entity_graph["edges"])
+
+
+def test_generate_wiki_escapes_markdown_link_metacharacters(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/plan]v2#draft.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Draft\n\nbootstrap session draft notes",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 16:00:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/plan]v2#draft.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 16:00",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    index_text = (persist_dir / "wiki" / "index.md").read_text(encoding="utf-8")
+    assert (
+        r"[工程/plan\]v2#draft.md](files/工程/plan]v2%23draft.md.md)"
+        in index_text
+    )
+    assert (
+        persist_dir / "wiki" / "files" / "工程" / "plan]v2#draft.md.md"
+    ).exists()
+
+
+def test_generate_wiki_wraps_preview_with_safe_outer_fence(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/fenced.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Example\n\n```python\nprint('hi')\n```",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 16:30:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/fenced.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 16:30",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    page_text = (persist_dir / "wiki" / "files" / "工程" / "fenced.md.md").read_text(
+        encoding="utf-8"
+    )
+    assert "\n~~~text\n" in page_text
+    assert "```python" in page_text
+    assert "\n~~~\n\n## 备注\n" in page_text
+
+
+def test_generate_wiki_escapes_backticks_in_file_page_metadata(tmp_path: Path):
+    persist_dir = tmp_path / "index"
+    normalized_dir = persist_dir / "normalized_texts" / "工程"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_rel = "工程/foo`bar.md.txt"
+    (persist_dir / "normalized_texts" / normalized_rel).write_text(
+        "# Title\n\ncontent",
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "build_time": "2026-04-08 17:00:00",
+        "normalized_text_dir": "normalized_texts",
+        "files": [
+            {
+                "name": "工程/foo`bar.md",
+                "kb": "工程",
+                "suffix": ".md",
+                "size_kb": 0.1,
+                "mtime": "2026-04-08 17:00",
+                "chunks": 1,
+                "normalized_text": normalized_rel,
+            }
+        ],
+    }
+
+    wiki.generate_wiki(persist_path=persist_dir, manifest=manifest)
+
+    page_text = (persist_dir / "wiki" / "files" / "工程" / "foo`bar.md.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- 标准化文本：``工程/foo`bar.md.txt``" in page_text
+    assert "- 知识库：`工程`" in page_text
 
 
 def test_document_graph_preserves_same_kb_neighbor_under_global_truncation(tmp_path: Path, monkeypatch):
@@ -322,6 +552,64 @@ def test_document_graph_resolves_relative_links_for_windows_style_sources():
     neighbors = [edge["target"] for edge in graph["neighbors"]["工程/nested/doc.md"]]
     assert "工程/bootstrap_session.py" in neighbors
     assert all("\\" not in source for source in graph["neighbors"])
+
+
+def test_entity_graph_normalizes_windows_style_sources():
+    indexed_files = [
+        ragbot.IndexedFile(
+            rel_path=r"工程\nested\doc.md",
+            suffix=".md",
+            kb="工程",
+            file_path=Path("doc.md"),
+            normalized_text="See [bootstrap](../bootstrap_session.py) for details.",
+            chunks=[
+                ragbot.ChunkSpec(
+                    text="See [bootstrap](../bootstrap_session.py) for details.",
+                    line_start=1,
+                    line_end=1,
+                    label="Doc",
+                )
+            ],
+            symbols=[],
+        ),
+        ragbot.IndexedFile(
+            rel_path=r"工程\bootstrap_session.py",
+            suffix=".py",
+            kb="工程",
+            file_path=Path("bootstrap_session.py"),
+            normalized_text="def bootstrap_session():\n    pass\n",
+            chunks=[
+                ragbot.ChunkSpec(
+                    text="def bootstrap_session():\n    pass",
+                    line_start=1,
+                    line_end=2,
+                    label="def bootstrap_session",
+                )
+            ],
+            symbols=[
+                {
+                    "kind": "function",
+                    "name": "bootstrap_session",
+                    "qualified_name": "bootstrap_session",
+                    "source": r"工程\bootstrap_session.py",
+                    "line_start": 1,
+                    "line_end": 2,
+                    "signature": "def bootstrap_session()",
+                }
+            ],
+        ),
+    ]
+
+    document_graph = ragbot._build_document_graph(indexed_files)
+    entity_graph = ragbot._build_entity_graph(indexed_files, document_graph=document_graph)
+
+    assert all("\\" not in node["source"] for node in entity_graph["nodes"])
+    assert any(
+        edge["source"] == "section:工程/nested/doc.md:0"
+        and edge["target"] == "file:工程/bootstrap_session.py"
+        and edge["type"] == "links_to"
+        for edge in entity_graph["edges"]
+    )
 
 
 def test_grep_search_prioritizes_exact_config_key(search_bundle):
@@ -594,6 +882,133 @@ def test_ask_stream_debug_includes_trace(search_bundle, monkeypatch):
     assert "".join(result["answer_stream"]) == "mock answer"
 
 
+def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeLLM(*args, **kwargs))
+    monkeypatch.setattr(
+        ragbot,
+        "retrieve",
+        lambda *args, **kwargs: {
+            "hits": [],
+            "context": "ctx",
+            "sources": [],
+            "search_trace": [
+                {
+                    "step": "step1",
+                    "graph_bridge_entities": [
+                        {
+                            "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
+                            "type": "symbol",
+                            "name": "bootstrap_session",
+                            "source": "工程/bootstrap_session.py",
+                            "relation": "references",
+                        }
+                    ],
+                }
+            ],
+            "bridge_entities": [
+                {
+                    "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
+                    "type": "symbol",
+                    "name": "bootstrap_session",
+                    "source": "工程/bootstrap_session.py",
+                    "relation": "references",
+                }
+            ],
+        },
+    )
+
+    result = ragbot.ask_stream(
+        question="bootstrap_session 在哪",
+        search_bundle=search_bundle,
+        llm_api_key="fake-key",
+        llm_model="fake-model",
+        llm_base_url="https://example.com",
+        search_mode="agentic",
+        debug=True,
+    )
+
+    assert "bridge_entities" in result
+    assert result["bridge_entities"][0]["name"] == "bootstrap_session"
+
+
+def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
+    fake_vectorstore = SimpleNamespace(index=SimpleNamespace(ntotal=0))
+    files = [
+        {"name": "工程/guide.md", "kb": "工程", "normalized_text": "工程/guide.md.txt"},
+        {"name": "工程/bootstrap_session.py", "kb": "工程", "normalized_text": "工程/bootstrap_session.py.txt"},
+    ]
+    bundle = ragbot.SearchBundle(
+        vectorstore=fake_vectorstore,
+        persist_dir=tmp_path,
+        source_dir=None,
+        manifest={"files": files},
+        files=files,
+        files_by_source={entry["name"]: entry for entry in files},
+        normalized_text_dir=tmp_path,
+        symbol_index=[],
+        document_graph={"version": 1, "edge_count": 0, "neighbors": {}},
+        graph_neighbors={},
+        entity_graph={"version": 1, "node_count": 4, "edge_count": 2, "nodes": [], "edges": []},
+        entity_nodes_by_id={
+            "file:工程/guide.md": {
+                "id": "file:工程/guide.md",
+                "type": "file",
+                "name": "guide.md",
+                "source": "工程/guide.md",
+            },
+            "section:工程/guide.md:0": {
+                "id": "section:工程/guide.md:0",
+                "type": "section",
+                "name": "Guide",
+                "source": "工程/guide.md",
+                "line_start": 1,
+                "line_end": 3,
+            },
+            "symbol:工程/bootstrap_session.py:function:bootstrap_session:4": {
+                "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
+                "type": "symbol",
+                "name": "bootstrap_session",
+                "qualified_name": "bootstrap_session",
+                "source": "工程/bootstrap_session.py",
+                "line_start": 4,
+                "line_end": 7,
+            },
+            "file:工程/bootstrap_session.py": {
+                "id": "file:工程/bootstrap_session.py",
+                "type": "file",
+                "name": "bootstrap_session.py",
+                "source": "工程/bootstrap_session.py",
+            },
+        },
+        entity_edges_by_source={
+            "file:工程/guide.md": [
+                {
+                    "source": "file:工程/guide.md",
+                    "target": "section:工程/guide.md:0",
+                    "type": "contains",
+                    "reason": "Guide",
+                }
+            ],
+            "section:工程/guide.md:0": [
+                {
+                    "source": "section:工程/guide.md:0",
+                    "target": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
+                    "type": "references",
+                    "reason": "bootstrap_session",
+                }
+            ],
+        },
+    )
+
+    expansion = ragbot._expand_candidate_sources_detailed(bundle, ["工程/guide.md"])
+
+    assert expansion.strategy == "entity_graph"
+    assert "工程/bootstrap_session.py" in expansion.sources
+    assert expansion.expanded_sources == ["工程/bootstrap_session.py"]
+    assert any(entity["name"] == "bootstrap_session" for entity in expansion.bridge_entities)
+    assert expansion.edge_reasons[0]["bridges"]
+
+
 def test_grep_scope_falls_back_to_broader_allowed_sources(search_bundle):
     query_plan = ragbot.QueryPlan(
         symbols=[],
@@ -674,6 +1089,9 @@ def test_expand_candidate_sources_requires_stronger_token_overlap(search_bundle,
         ],
     )
     monkeypatch.setattr(search_bundle, "graph_neighbors", {})
+    monkeypatch.setattr(search_bundle, "entity_graph", {"version": 1, "node_count": 0, "edge_count": 0, "nodes": [], "edges": []})
+    monkeypatch.setattr(search_bundle, "entity_nodes_by_id", {})
+    monkeypatch.setattr(search_bundle, "entity_edges_by_source", {})
 
     expanded = ragbot._expand_candidate_sources(search_bundle, {"工程/bootstrap_session.py"})
 

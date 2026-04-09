@@ -1,0 +1,142 @@
+[
+  {
+    "id": "session-01",
+    "question": "哪里处理新用户会话预热步骤？",
+    "seed_source": "手册/session_alpha_01.md",
+    "target_source": "工程/bootstrap_session.py",
+    "symbol": "bootstrap_session"
+  },
+  {
+    "id": "session-02",
+    "question": "会话初始化入口函数在哪？",
+    "seed_source": "手册/session_beta_02.md",
+    "target_source": "工程/bootstrap_session.py",
+    "symbol": "bootstrap_session"
+  },
+  {
+    "id": "session-03",
+    "question": "登录后的 session bootstrap 在哪里实现？",
+    "seed_source": "运行/session_gamma_03.md",
+    "target_source": "工程/bootstrap_session.py",
+    "symbol": "bootstrap_session"
+  },
+  {
+    "id": "session-04",
+    "question": "谁负责把 user_id 写进初始会话载荷？",
+    "seed_source": "运行/session_delta_04.md",
+    "target_source": "工程/bootstrap_session.py",
+    "symbol": "bootstrap_session"
+  },
+  {
+    "id": "session-05",
+    "question": "新建 session ready 状态是从哪里来的？",
+    "seed_source": "支持/session_epsilon_05.md",
+    "target_source": "工程/bootstrap_session.py",
+    "symbol": "bootstrap_session"
+  },
+  {
+    "id": "dashboard-01",
+    "question": "仪表盘首屏渲染在哪处理？",
+    "seed_source": "手册/dashboard_alpha_01.md",
+    "target_source": "工程/render_dashboard.py",
+    "symbol": "render_dashboard"
+  },
+  {
+    "id": "dashboard-02",
+    "question": "dashboard 数据装配入口在哪？",
+    "seed_source": "手册/dashboard_beta_02.md",
+    "target_source": "工程/render_dashboard.py",
+    "symbol": "render_dashboard"
+  },
+  {
+    "id": "dashboard-03",
+    "question": "首页 dashboard 视图是哪个函数生成的？",
+    "seed_source": "运行/dashboard_gamma_03.md",
+    "target_source": "工程/render_dashboard.py",
+    "symbol": "render_dashboard"
+  },
+  {
+    "id": "dashboard-04",
+    "question": "图表卡片的 dashboard 预渲染逻辑在哪？",
+    "seed_source": "运行/dashboard_delta_04.md",
+    "target_source": "工程/render_dashboard.py",
+    "symbol": "render_dashboard"
+  },
+  {
+    "id": "dashboard-05",
+    "question": "渲染 dashboard 摘要用的是哪个实现？",
+    "seed_source": "支持/dashboard_epsilon_05.md",
+    "target_source": "工程/render_dashboard.py",
+    "symbol": "render_dashboard"
+  },
+  {
+    "id": "invoice-01",
+    "question": "发票对账主流程在哪？",
+    "seed_source": "手册/invoice_alpha_01.md",
+    "target_source": "工程/reconcile_invoice.py",
+    "symbol": "reconcile_invoice"
+  },
+  {
+    "id": "invoice-02",
+    "question": "谁负责 reconcile invoice 的汇总结果？",
+    "seed_source": "手册/invoice_beta_02.md",
+    "target_source": "工程/reconcile_invoice.py",
+    "symbol": "reconcile_invoice"
+  },
+  {
+    "id": "invoice-03",
+    "question": "差异发票的对账入口函数在哪里？",
+    "seed_source": "运行/invoice_gamma_03.md",
+    "target_source": "工程/reconcile_invoice.py",
+    "symbol": "reconcile_invoice"
+  },
+  {
+    "id": "invoice-04",
+    "question": "账单状态变成 matched 的逻辑在哪？",
+    "seed_source": "运行/invoice_delta_04.md",
+    "target_source": "工程/reconcile_invoice.py",
+    "symbol": "reconcile_invoice"
+  },
+  {
+    "id": "invoice-05",
+    "question": "invoice reconciliation 的实现文件是什么？",
+    "seed_source": "支持/invoice_epsilon_05.md",
+    "target_source": "工程/reconcile_invoice.py",
+    "symbol": "reconcile_invoice"
+  },
+  {
+    "id": "report-01",
+    "question": "报告归档动作在哪里执行？",
+    "seed_source": "手册/report_alpha_01.md",
+    "target_source": "工程/archive_report.py",
+    "symbol": "archive_report"
+  },
+  {
+    "id": "report-02",
+    "question": "谁负责把报告放进 archive bucket？",
+    "seed_source": "手册/report_beta_02.md",
+    "target_source": "工程/archive_report.py",
+    "symbol": "archive_report"
+  },
+  {
+    "id": "report-03",
+    "question": "归档日报的实现函数在哪？",
+    "seed_source": "运行/report_gamma_03.md",
+    "target_source": "工程/archive_report.py",
+    "symbol": "archive_report"
+  },
+  {
+    "id": "report-04",
+    "question": "报告封存状态在什么地方落盘？",
+    "seed_source": "运行/report_delta_04.md",
+    "target_source": "工程/archive_report.py",
+    "symbol": "archive_report"
+  },
+  {
+    "id": "report-05",
+    "question": "archive report 的主入口在代码库哪里？",
+    "seed_source": "支持/report_epsilon_05.md",
+    "target_source": "工程/archive_report.py",
+    "symbol": "archive_report"
+  }
+]
