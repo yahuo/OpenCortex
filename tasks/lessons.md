@@ -24,3 +24,8 @@
 - 2026-04-09: 语义节点 id 不能只靠“去掉标点后的 slug”；像 `C#`、`C++`、`C` 这类术语会被折叠到同一个节点，污染 alias、attached files 和推理边。可读 slug 可以保留，但必须再拼上基于原始术语的稳定 hash，并补“标点不同但名字相近”的回归测试。
 - 2026-04-09: 如果 community/report 要消费 semantic graph，不能只投影“节点本身带 file/source 字段”的边；`concept -> decision` 这类纯语义边也要先解析 attached files 再投影成 file-level relationship，否则 runtime 能走通的语义桥在 `community_index.json` / `GRAPH_REPORT.md` 里会凭空消失。对这类问题要补“rationale-only bridge 出现在 report”回归测试。
 - 2026-04-09: 语义 alias 索引不能用 last-write-wins 的单值 map；多个 concept 复用同一个 alias 或 rationale 短语时，如果直接覆盖，`rationale_for` 会静默连到最后一个节点，重新引入顺序相关 bug。对这类别名冲突要么显式标记歧义，要么保留一词多节点，并补“重复 alias 仍稳定连边”的回归测试。
+- 2026-04-09: 多来源 `query_note` 接入语义层时，不能把所有 cited source 的 semantic attachment 先做全局 union 再回写成 note-wide 边；否则一个只被共同引用、但本身不含该语义的文件会“继承”其他来源文件的 concept/decision。对这类功能要按来源文件作用域生成 note-semantic 边，并补“同一 note 引用多文件时，非贡献来源不会扩到额外语义文件”的回归测试。
+- 2026-04-09: 给旧索引补派生产物时，不能因为缺少某个新版本 artifact 就静默 no-op；像 `entity_graph.json` 这种后来引入的文件缺失时，保存路径至少要生成最小可用回退产物，否则用户动作会成功但新能力完全不生效。对这种升级路径要补“删除新 artifact 后仍能通过用户动作恢复”的回归测试。
+- 2026-04-09: 如果项目以多进程方式同时跑 UI 和 API，写磁盘派生产物后的缓存失效不能只清当前进程内的函数缓存；像 query note 保存后，即使 Streamlit 重新加载了 bundle，FastAPI 里常驻的 `_search_bundle` 也会继续读旧图谱。对这类跨进程缓存要在消费方做“产物签名变化后自动 reload”，并补 API 侧回归测试。
+- 2026-04-09: 多进程消费者做磁盘产物签名 reload 时，不能在“重载前后签名发生变化”的情况下直接缓存新 bundle；这通常意味着正好撞上另一个进程的 in-place 写入，读到的可能是半写入/降级内容。对这类 reload 要求“load 前后签名一致才接受”，否则重试或回退旧 bundle，并补“重载中途签名变化”的回归测试。
+- 2026-04-09: 给 API 增加运行时 auto-reload 后，要把 `load_search_bundle()` 抛异常也视为“重载窗口不稳定”的一种表现，而不是直接让请求失败；如果进程里还有上一次的好 bundle，优先继续服务旧 bundle，并补“reload 抛异常时回退旧 bundle”的回归测试。

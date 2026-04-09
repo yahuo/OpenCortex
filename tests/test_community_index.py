@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import ragbot
+import wiki
 
 
 class FakeEmbeddings:
@@ -107,6 +108,45 @@ class SplitCommunitySemanticLLM:
         return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
 
 
+class QueryNoteCommunitySemanticLLM:
+    def invoke(self, prompt: str):
+        lowered = prompt.lower()
+        if "note concept marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [
+                            {
+                                "name": "billing chain",
+                                "summary": "A shared concept reused across billing docs.",
+                                "aliases": ["handoff chain"],
+                            }
+                        ],
+                        "decisions": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "note decision marker" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [],
+                        "decisions": [
+                            {
+                                "name": "snapshot export policy",
+                                "summary": "Exports are reviewed from immutable snapshots.",
+                                "aliases": [],
+                                "rationale": ["billing chain"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
+
+
 def _write_community_corpus(root: Path) -> None:
     (root / "工程").mkdir(parents=True)
     (root / "报告").mkdir(parents=True)
@@ -164,6 +204,70 @@ This document introduces the shared semantic bridge concept.
 
     decision bridge marker
 This report records the rollout policy but does not repeat the concept page path.
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_query_note_community_corpus(root: Path) -> None:
+    (root / "工程").mkdir(parents=True)
+    (root / "报告").mkdir(parents=True)
+
+    (root / "工程" / "handoff_checklist.md").write_text(
+        """
+# Handoff Checklist
+
+This document describes the billing handoff checklist.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "报告" / "export_review.md").write_text(
+        """
+# Export Review
+
+This document describes the audit export review workflow.
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def _write_query_note_semantic_community_corpus(root: Path) -> None:
+    (root / "产品").mkdir(parents=True)
+    (root / "工程").mkdir(parents=True)
+    (root / "报告").mkdir(parents=True)
+    (root / "运营").mkdir(parents=True)
+    (root / "产品" / "concept_anchor.md").write_text(
+        """
+# Concept Anchor
+
+note concept marker
+This file introduces the shared billing chain concept.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "工程" / "concept_consumer.md").write_text(
+        """
+# Concept Consumer
+
+note concept marker
+This file reuses the shared billing chain concept in engineering.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "报告" / "decision_playbook.md").write_text(
+        """
+# Decision Playbook
+
+note decision marker
+This file records the snapshot export policy used in reporting.
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / "运营" / "faq_bridge.md").write_text(
+        """
+# FAQ Bridge
+
+This page captures the saved question but contains no semantic marker by itself.
 """.strip(),
         encoding="utf-8",
     )
@@ -289,3 +393,121 @@ def test_build_vectorstore_projects_rationale_only_semantic_bridges_into_reports
 
     graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
     assert "rationale_for | 产品/concept_bridge.md -> 报告/decision_bridge.md" in graph_report
+
+
+def test_save_query_note_refreshes_community_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_query_note_community_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    wiki.save_query_note(
+        persist_path=bundle.persist_dir,
+        question="handoff checklist 和 export review 是同一条链路吗？",
+        answer="是，它们分别覆盖交付前检查和交付后复核。",
+        sources=[
+            {
+                "source": "工程/handoff_checklist.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This document describes the billing handoff checklist.",
+            },
+            {
+                "source": "报告/export_review.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This document describes the audit export review workflow.",
+            },
+        ],
+    )
+
+    community_index = json.loads((bundle.persist_dir / "community_index.json").read_text(encoding="utf-8"))
+    assert community_index["semantic_summary"]["query_note_count"] == 1
+    assert any(
+        bridge["kind"] == "semantically_related"
+        and bridge["source"] == "工程/handoff_checklist.md"
+        and bridge["target"] == "报告/export_review.md"
+        and any(item.get("type") == "query_note" for item in bridge.get("bridges", []))
+        for bridge in community_index["bridges"]
+    )
+    assert any(
+        any(item["name"] == "handoff checklist 和 export review 是同一条链路吗？" for item in community.get("top_query_notes", []))
+        for community in community_index["communities"]
+    )
+
+    graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "Top Query Notes" in graph_report
+    assert "handoff checklist 和 export review 是同一条链路吗？" in graph_report
+
+
+def test_query_note_semantic_links_project_into_community_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_query_note_semantic_community_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: QueryNoteCommunitySemanticLLM())
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    wiki.save_query_note(
+        persist_path=bundle.persist_dir,
+        question="billing chain FAQ 关联哪些实现和决策？",
+        answer="它关联了共享概念和 export snapshot 决策。",
+        sources=[
+            {
+                "source": "运营/faq_bridge.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This page captures the saved question but contains no semantic marker by itself.",
+            },
+            {
+                "source": "产品/concept_anchor.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This file introduces the shared billing chain concept.",
+            },
+            {
+                "source": "报告/decision_playbook.md",
+                "line_start": 1,
+                "line_end": 3,
+                "snippet": "This file records the snapshot export policy used in reporting.",
+            },
+        ],
+    )
+
+    community_index = json.loads((bundle.persist_dir / "community_index.json").read_text(encoding="utf-8"))
+    assert not any(
+        bridge["kind"] == "semantically_related"
+        and {bridge["source"], bridge["target"]} == {"运营/faq_bridge.md", "工程/concept_consumer.md"}
+        for bridge in community_index["bridges"]
+    )
+    assert any(
+        bridge["kind"] == "semantically_related"
+        and {bridge["source"], bridge["target"]} == {"产品/concept_anchor.md", "工程/concept_consumer.md"}
+        and any(item.get("type") == "query_note" for item in bridge.get("bridges", []))
+        and any(item.get("type") == "concept" for item in bridge.get("bridges", []))
+        for bridge in community_index["bridges"]
+    )
+
+    graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "billing chain FAQ 关联哪些实现和决策？" in graph_report
+    assert (
+        "产品/concept_anchor.md -> 工程/concept_consumer.md" in graph_report
+        or "工程/concept_consumer.md -> 产品/concept_anchor.md" in graph_report
+    )

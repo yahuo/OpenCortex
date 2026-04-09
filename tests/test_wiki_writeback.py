@@ -7,7 +7,30 @@ from pathlib import Path
 import threading
 import time
 
+import ragbot
 import wiki
+
+
+class FakeEmbeddings:
+    def __init__(self, *_args, **_kwargs):
+        self.dim = 32
+
+    def _embed(self, text: str) -> list[float]:
+        vector = [0.0] * self.dim
+        tokens = text.lower().replace("\n", " ").split()
+        for token in tokens:
+            vector[hash(token) % self.dim] += 1.0
+        norm = sum(value * value for value in vector) ** 0.5 or 1.0
+        return [value / norm for value in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
+    def __call__(self, text: str) -> list[float]:
+        return self.embed_query(text)
 
 
 def _write_manifest_and_normalized_texts(persist_dir: Path) -> dict:
@@ -50,6 +73,17 @@ def _write_manifest_and_normalized_texts(persist_dir: Path) -> dict:
         encoding="utf-8",
     )
     return manifest
+
+
+def _write_query_note_docs(root: Path) -> None:
+    (root / "工程").mkdir(parents=True, exist_ok=True)
+    (root / "工程" / "bootstrap_session.py").write_text(
+        """
+def bootstrap_session(user_id: str) -> dict:
+    return {"user_id": user_id, "status": "ready"}
+""".strip(),
+        encoding="utf-8",
+    )
 
 
 def test_save_query_note_writes_note_and_log(tmp_path: Path) -> None:
@@ -156,6 +190,46 @@ def test_save_query_note_generates_missing_wiki_pages_from_manifest(tmp_path: Pa
     assert (persist_dir / "wiki" / "files" / "工程" / "bootstrap_session.py.md").exists()
     note_text = Path(result["note_path"]).read_text(encoding="utf-8")
     assert "../files/工程/bootstrap_session.py.md" in note_text
+
+
+def test_save_query_note_rebuilds_minimal_entity_graph_when_missing(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    persist_dir = tmp_path / "index"
+    _write_query_note_docs(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(persist_dir),
+    )
+    entity_graph_path = persist_dir / "entity_graph.json"
+    entity_graph_path.unlink()
+
+    result = wiki.save_query_note(
+        persist_path=persist_dir,
+        question="bootstrap_session 的职责是什么？",
+        answer="负责初始化会话上下文。",
+        sources=[
+            {
+                "source": "工程/bootstrap_session.py",
+                "line_start": 1,
+                "line_end": 2,
+                "snippet": "def bootstrap_session(user_id: str) -> dict:",
+            }
+        ],
+        created_at=datetime(2026, 4, 9, 10, 45, 0),
+    )
+
+    assert Path(result["note_path"]).exists()
+    assert entity_graph_path.exists()
+    rebuilt_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, dict)
+        and node.get("type") == "query_note"
+        and node.get("name") == "bootstrap_session 的职责是什么？"
+        for node in rebuilt_graph["nodes"]
+    )
 
 
 def test_generate_wiki_preserves_query_note_log_section(tmp_path: Path) -> None:

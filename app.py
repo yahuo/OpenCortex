@@ -369,6 +369,7 @@ def render_query_note_actions(message_index: int, message: dict[str, Any], persi
 
     st.session_state.rag_messages[message_index]["query_note_relpath"] = result["note_relpath"]
     st.session_state.rag_messages[message_index]["query_note_error"] = ""
+    get_search_bundle.clear()
     load_structure_summary.clear()
     st.rerun()
 
@@ -429,6 +430,11 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
             "LLM 抽取出的 concept / decision 节点",
         ),
         (
+            "知识笔记",
+            str(int(semantic_summary.get("query_note_count") or 0)),
+            "显式保存为知识的 query note 节点",
+        ),
+        (
             "健康检查",
             str(lint_issue_count),
             "wiki / query note / 链接的待处理问题",
@@ -478,6 +484,11 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                         for item in community.get("top_decisions", [])
                         if isinstance(item, dict) and item.get("name")
                     ][:2]
+                    top_query_notes = [
+                        str(item.get("name", ""))
+                        for item in community.get("top_query_notes", [])
+                        if isinstance(item, dict) and item.get("name")
+                    ][:2]
                     suggested_queries = [
                         str(item)
                         for item in community.get("suggested_queries", [])
@@ -505,6 +516,8 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                             st.caption("语义概念：" + "、".join(top_concepts))
                         if top_decisions:
                             st.caption("语义决策：" + "、".join(top_decisions))
+                        if top_query_notes:
+                            st.caption("知识笔记：" + "、".join(top_query_notes))
 
         with tabs[1]:
             if not god_nodes:
@@ -569,6 +582,7 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                     st.markdown(f"- 禁用原因：`{disabled_reason}`")
                 st.markdown(f"- Concepts：`{int(semantic_summary.get('concept_count') or 0)}`")
                 st.markdown(f"- Decisions：`{int(semantic_summary.get('decision_count') or 0)}`")
+                st.markdown(f"- Query Notes：`{int(semantic_summary.get('query_note_count') or 0)}`")
                 st.markdown(f"- 语义边：`{int(semantic_summary.get('semantic_edge_count') or 0)}`")
                 st.markdown(f"- API 调用：`{int(semantic_summary.get('api_calls') or 0)}`")
                 st.markdown(f"- 缓存命中 section：`{int(semantic_summary.get('cached_sections') or 0)}`")
