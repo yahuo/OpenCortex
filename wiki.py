@@ -30,6 +30,15 @@ except ImportError:
     wintypes = None
     _CTYPES_AVAILABLE = False
 
+if _CTYPES_AVAILABLE:
+    class _WindowsFILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+else:
+    _WindowsFILETIME = None
+
 WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
@@ -287,6 +296,26 @@ def _parse_lock_metadata(content: str) -> tuple[int | None, int | None]:
     return pid, token
 
 
+def _configure_windows_kernel32_signatures(kernel32: Any) -> Any:
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_WindowsFILETIME),
+        ctypes.POINTER(_WindowsFILETIME),
+        ctypes.POINTER(_WindowsFILETIME),
+        ctypes.POINTER(_WindowsFILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
 def _load_manifest(persist_path: Path) -> dict[str, Any] | None:
     manifest_path = persist_path / "index_manifest.json"
     if not manifest_path.exists():
@@ -391,21 +420,16 @@ def _windows_process_identity_token(pid: int) -> int | None:
         return None
 
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-    class FILETIME(ctypes.Structure):
-        _fields_ = [
-            ("dwLowDateTime", wintypes.DWORD),
-            ("dwHighDateTime", wintypes.DWORD),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = _configure_windows_kernel32_signatures(
+        ctypes.WinDLL("kernel32", use_last_error=True)
+    )
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
-    creation = FILETIME()
-    exit_time = FILETIME()
-    kernel_time = FILETIME()
-    user_time = FILETIME()
+    creation = _WindowsFILETIME()
+    exit_time = _WindowsFILETIME()
+    kernel_time = _WindowsFILETIME()
+    user_time = _WindowsFILETIME()
     try:
         success = kernel32.GetProcessTimes(
             handle,

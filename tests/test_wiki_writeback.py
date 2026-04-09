@@ -300,3 +300,30 @@ def test_lock_owner_alive_uses_windows_safe_probe(monkeypatch, tmp_path: Path) -
 
     assert wiki._lock_owner_alive(lock_path) is True
     assert seen["args"] == (4321, 987654321)
+
+
+def test_configure_windows_kernel32_signatures_sets_handle_safe_types() -> None:
+    class FakeFunction:
+        def __init__(self):
+            self.argtypes = None
+            self.restype = None
+
+    class FakeKernel32:
+        def __init__(self):
+            self.OpenProcess = FakeFunction()
+            self.GetProcessTimes = FakeFunction()
+            self.CloseHandle = FakeFunction()
+
+    kernel32 = FakeKernel32()
+    configured = wiki._configure_windows_kernel32_signatures(kernel32)
+
+    assert configured is kernel32
+    assert kernel32.OpenProcess.argtypes == [
+        wiki.wintypes.DWORD,
+        wiki.wintypes.BOOL,
+        wiki.wintypes.DWORD,
+    ]
+    assert kernel32.OpenProcess.restype == wiki.wintypes.HANDLE
+    assert kernel32.GetProcessTimes.restype == wiki.wintypes.BOOL
+    assert kernel32.CloseHandle.argtypes == [wiki.wintypes.HANDLE]
+    assert kernel32.CloseHandle.restype == wiki.wintypes.BOOL
