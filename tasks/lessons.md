@@ -29,3 +29,6 @@
 - 2026-04-09: 如果项目以多进程方式同时跑 UI 和 API，写磁盘派生产物后的缓存失效不能只清当前进程内的函数缓存；像 query note 保存后，即使 Streamlit 重新加载了 bundle，FastAPI 里常驻的 `_search_bundle` 也会继续读旧图谱。对这类跨进程缓存要在消费方做“产物签名变化后自动 reload”，并补 API 侧回归测试。
 - 2026-04-09: 多进程消费者做磁盘产物签名 reload 时，不能在“重载前后签名发生变化”的情况下直接缓存新 bundle；这通常意味着正好撞上另一个进程的 in-place 写入，读到的可能是半写入/降级内容。对这类 reload 要求“load 前后签名一致才接受”，否则重试或回退旧 bundle，并补“重载中途签名变化”的回归测试。
 - 2026-04-09: 给 API 增加运行时 auto-reload 后，要把 `load_search_bundle()` 抛异常也视为“重载窗口不稳定”的一种表现，而不是直接让请求失败；如果进程里还有上一次的好 bundle，优先继续服务旧 bundle，并补“reload 抛异常时回退旧 bundle”的回归测试。
+- 2026-04-09: 一旦把派生 Markdown 页面接入运行时检索或 API，就不能再把它们当“纯展示产物”；像 query note 保存后不仅要刷新 `entity_graph.json` / `community_index.json` / `GRAPH_REPORT.md`，还要同步重建 runtime 会消费的 `wiki/communities/*`、`wiki/entities/*` 等页面，否则磁盘 JSON 是新的、Wiki-first 页面却还是旧的。对这类链路要补“重载 bundle 后派生页面文本已反映新数据”的回归测试。
+- 2026-04-09: 多进程消费者的 artifact reload 签名必须覆盖“运行时实际会读取的所有派生产物”，而不是只覆盖底层 JSON/FAISS；一旦 `wiki/*.md` 这类页面被 `load_search_bundle()` 和 API 端点消费，它们也必须参与签名比较，否则会把半更新或旧页面缓存成稳定 bundle。对这类问题要补“只改 wiki 页面也会触发 reload”的回归测试。
+- 2026-04-09: 即使 artifact reload 签名已经覆盖了 runtime wiki 页面，也不能只靠“前后签名一致”判断稳定；如果生成流程会先删目录再重建页面，消费者还必须感知同一把 wiki 写锁，否则仍可能在空目录窗口里把“暂时缺页”的 bundle 缓存成稳定结果。对这类问题要补“锁持有期间 reload 等待，释放后才接受新 bundle”的回归测试。

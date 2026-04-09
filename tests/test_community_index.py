@@ -362,6 +362,87 @@ def test_build_vectorstore_surfaces_semantic_summary_in_community_outputs(
     assert "deferred report archival" in graph_report
 
 
+def test_build_vectorstore_writes_wiki_community_and_entity_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_community_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeSemanticLLM())
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    community_page = bundle.persist_dir / "wiki" / "communities" / "community-001.md"
+    assert community_page.exists()
+    community_text = community_page.read_text(encoding="utf-8")
+    assert "Top Files" in community_text
+    assert "Top Concepts" in community_text
+    assert "orchestration phase" in community_text
+
+    entity_pages = sorted((bundle.persist_dir / "wiki" / "entities").glob("*.md"))
+    assert entity_pages
+    assert any("orchestration phase" in page.read_text(encoding="utf-8") for page in entity_pages)
+
+    wiki_index = (bundle.persist_dir / "wiki" / "index.md").read_text(encoding="utf-8")
+    assert "## Communities" in wiki_index
+    assert "## Entities" in wiki_index
+
+    reloaded = ragbot.load_search_bundle(embed_api_key="fake-key", persist_dir=str(index_dir))
+    assert reloaded is not None
+    assert any(page["kind"] == "community" for page in reloaded.wiki_pages)
+    assert any(page["kind"] == "entity" for page in reloaded.wiki_pages)
+
+
+def test_wiki_first_runtime_uses_entity_pages_to_seed_semantic_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_community_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeSemanticLLM())
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+    reloaded = ragbot.load_search_bundle(embed_api_key="fake-key", persist_dir=str(index_dir))
+    assert reloaded is not None
+
+    captured: dict[str, set[str]] = {}
+    original_vector = ragbot.vector_search
+
+    def tracked_vector(*args, **kwargs):
+        captured["candidate_sources"] = set(kwargs.get("candidate_sources") or set())
+        return original_vector(*args, **kwargs)
+
+    monkeypatch.setattr(ragbot, "vector_search", tracked_vector)
+
+    result = ragbot.retrieve("orchestration phase 在哪些文件里被讨论？", reloaded, mode="hybrid")
+
+    assert {"工程/session_notes.md", "报告/report_notes.md"} <= captured["candidate_sources"]
+    assert any(
+        hit["kind"] == "entity" and hit["title"] == "orchestration phase"
+        for hit in result["search_trace"][0]["wiki_hits"]
+    )
+
+
 def test_build_vectorstore_projects_rationale_only_semantic_bridges_into_reports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -439,6 +520,14 @@ def test_save_query_note_refreshes_community_outputs(tmp_path: Path, monkeypatch
     assert any(
         any(item["name"] == "handoff checklist 和 export review 是同一条链路吗？" for item in community.get("top_query_notes", []))
         for community in community_index["communities"]
+    )
+
+    reloaded = ragbot.load_search_bundle(embed_api_key="fake-key", persist_dir=str(bundle.persist_dir))
+    assert reloaded is not None
+    assert any(
+        page.get("kind") == "community"
+        and "handoff checklist 和 export review 是同一条链路吗？" in str(page.get("text", ""))
+        for page in reloaded.wiki_pages
     )
 
     graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")

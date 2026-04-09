@@ -322,9 +322,21 @@ def render_search_trace(search_trace: list[dict]) -> None:
             st.json(step, expanded=False)
 
 
+def render_wiki_trace(wiki_trace: list[dict]) -> None:
+    with st.expander("查看 Wiki 轨迹"):
+        for step in wiki_trace:
+            st.markdown(f"**{step.get('step', 'step')}**")
+            st.json(step, expanded=False)
+
+
 def render_bridge_entities(bridge_entities: list[dict]) -> None:
     with st.expander("查看桥接实体"):
         st.json(bridge_entities, expanded=False)
+
+
+def render_artifacts(artifacts: dict[str, Any]) -> None:
+    with st.expander("查看产物摘要"):
+        st.json(artifacts, expanded=False)
 
 
 def render_query_note_actions(message_index: int, message: dict[str, Any], persist_dir: str) -> None:
@@ -676,6 +688,10 @@ for msg_index, msg in enumerate(st.session_state.rag_messages):
             render_sources(msg["sources"])
         if msg.get("bridge_entities"):
             render_bridge_entities(msg["bridge_entities"])
+        if msg.get("wiki_trace"):
+            render_wiki_trace(msg["wiki_trace"])
+        if msg.get("artifacts"):
+            render_artifacts(msg["artifacts"])
         if msg.get("search_trace"):
             render_search_trace(msg["search_trace"])
         if msg.get("role") == "assistant":
@@ -702,6 +718,8 @@ if question := st.chat_input("输入问题..."):
             sources = result["sources"]
             base_stream = result["answer_stream"]
             bridge_entities = result.get("bridge_entities", [])
+            wiki_trace = result.get("wiki_trace", [])
+            artifacts = result.get("artifacts", {})
             search_trace = result.get("search_trace", [])
 
             def stream_with_status():
@@ -718,6 +736,8 @@ if question := st.chat_input("输入问题..."):
             answer = f"问答失败：{exc}"
             sources = []
             bridge_entities = []
+            wiki_trace = []
+            artifacts = {}
             search_trace = []
             status_placeholder.empty()
             st.markdown(answer)
@@ -726,6 +746,10 @@ if question := st.chat_input("输入问题..."):
             render_sources(sources)
         if bridge_entities:
             render_bridge_entities(bridge_entities)
+        if wiki_trace:
+            render_wiki_trace(wiki_trace)
+        if artifacts:
+            render_artifacts(artifacts)
         if search_trace:
             render_search_trace(search_trace)
 
@@ -736,6 +760,8 @@ if question := st.chat_input("输入问题..."):
             "content": answer,
             "sources": sources,
             "bridge_entities": bridge_entities,
+            "wiki_trace": wiki_trace,
+            "artifacts": artifacts,
             "search_trace": search_trace,
             "query_note_relpath": "",
             "query_note_error": "",

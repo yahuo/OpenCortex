@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import time
@@ -41,6 +43,8 @@ else:
 
 WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
+COMMUNITIES_DIRNAME = "communities"
+ENTITIES_DIRNAME = "entities"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
 LINT_REPORT_FILENAME = "lint_report.json"
 WRITE_LOCK_FILENAME = ".write.lock"
@@ -88,6 +92,36 @@ def _iter_file_entries(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _page_relpath_for_source(source: str) -> Path:
     return Path("files") / Path(f"{source}.md")
+
+
+def _community_page_relpath(community_id: str) -> Path:
+    return Path(COMMUNITIES_DIRNAME) / f"{community_id}.md"
+
+
+def _normalize_wiki_relpath(path_like: str | Path) -> Path:
+    text = str(path_like).strip().replace("\\", "/")
+    if text.startswith(f"{WIKI_DIRNAME}/"):
+        text = text[len(WIKI_DIRNAME) + 1 :]
+    return Path(text)
+
+
+def _entity_page_relpath(node: dict[str, Any]) -> Path:
+    node_id = str(node.get("id", "") or "")
+    node_type = str(node.get("type", "") or "entity")
+    name = str(node.get("name") or node.get("qualified_name") or node_id or node_type)
+    slug = _slugify_query(name, max_len=48)
+    digest = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:8] if node_id else "entity"
+    return Path(ENTITIES_DIRNAME) / f"{node_type}-{slug}-{digest}.md"
+
+
+def _relative_page_target(from_relpath: Path, to_relpath: Path) -> str:
+    from_dir = from_relpath.parent.as_posix()
+    start = "." if from_dir in {"", "."} else from_dir
+    return posixpath.relpath(to_relpath.as_posix(), start=start)
+
+
+def _page_link(label: str, from_relpath: Path, to_relpath: Path) -> str:
+    return _markdown_link(label, _relative_page_target(from_relpath, to_relpath))
 
 
 def _escape_markdown_link_text(text: str) -> str:
@@ -521,6 +555,27 @@ def _portable_write_lock(lock_path: Path):
             pass
 
 
+def is_wiki_write_in_progress(persist_path: Path) -> bool:
+    wiki_dir = persist_path / WIKI_DIRNAME
+    lock_path = wiki_dir / WRITE_LOCK_FILENAME
+    if not lock_path.exists():
+        return False
+
+    if _FCNTL_AVAILABLE:
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    return not _lock_is_stale(lock_path)
+
+
 def _preview_from_normalized_text(normalized_root: Path, normalized_rel: str) -> str:
     normalized_path = normalized_root / normalized_rel
     if not normalized_path.exists():
@@ -534,7 +589,77 @@ def _preview_from_normalized_text(normalized_root: Path, normalized_rel: str) ->
     return preview
 
 
-def _render_index(entries: list[dict[str, Any]], build_time: str) -> str:
+def _load_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _entity_display_name(node: dict[str, Any]) -> str:
+    return str(node.get("qualified_name") or node.get("name") or node.get("id") or "unknown")
+
+
+def _entity_summary_text(node: dict[str, Any]) -> str:
+    return str(node.get("summary", "") or "").strip()
+
+
+def _entity_aliases(node: dict[str, Any]) -> list[str]:
+    aliases = node.get("aliases", [])
+    if not isinstance(aliases, list):
+        return []
+    return [str(alias).strip() for alias in aliases if str(alias).strip()]
+
+
+def _load_graph_context(
+    persist_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, set[str]]]:
+    from ragbot import (
+        COMMUNITY_INDEX_FILENAME,
+        ENTITY_GRAPH_FILENAME,
+        _entity_attachment_files,
+        _normalize_entity_edge_payload,
+        _normalize_entity_node_payload,
+    )
+
+    community_index = _load_json_object(persist_path / COMMUNITY_INDEX_FILENAME)
+    entity_graph = _load_json_object(persist_path / ENTITY_GRAPH_FILENAME)
+
+    nodes_by_id: dict[str, dict[str, Any]] = {}
+    raw_nodes = entity_graph.get("nodes", [])
+    if isinstance(raw_nodes, list):
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            normalized_node = _normalize_entity_node_payload(raw_node)
+            if normalized_node is None:
+                continue
+            nodes_by_id[str(normalized_node["id"])] = normalized_node
+
+    edges: list[dict[str, Any]] = []
+    raw_edges = entity_graph.get("edges", [])
+    if isinstance(raw_edges, list):
+        for raw_edge in raw_edges:
+            if not isinstance(raw_edge, dict):
+                continue
+            normalized_edge = _normalize_entity_edge_payload(raw_edge)
+            if normalized_edge is None:
+                continue
+            edges.append(normalized_edge)
+
+    attachment_files = _entity_attachment_files(nodes_by_id, edges, attachment_types={"concept", "decision", "query_note"})
+    return community_index, entity_graph, nodes_by_id, edges, attachment_files
+
+
+def _render_index(
+    entries: list[dict[str, Any]],
+    build_time: str,
+    community_pages: list[dict[str, Any]] | None = None,
+    entity_pages: list[dict[str, Any]] | None = None,
+) -> str:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for entry in entries:
         kb = str(entry.get("kb", "") or "未分类")
@@ -543,7 +668,7 @@ def _render_index(entries: list[dict[str, Any]], build_time: str) -> str:
     lines = [
         "# 知识库导航",
         "",
-        "此目录由构建阶段自动生成，当前只用于人类导航，不参与运行时检索。",
+        "此目录由构建阶段自动生成，用于 Wiki-first 导航和运行时检索缩小范围。",
         "",
         f"- 最近构建：`{build_time or 'unknown'}`",
         f"- 文件总数：`{len(entries)}`",
@@ -565,8 +690,34 @@ def _render_index(entries: list[dict[str, Any]], build_time: str) -> str:
             page_rel = _page_relpath_for_source(source).as_posix()
             lines.append(
                 f"- {_markdown_link(source, page_rel)} · `{suffix}` · `{chunks}` chunks"
+        )
+        lines.append("")
+
+    if community_pages:
+        lines.extend(["## Communities", ""])
+        for page in community_pages:
+            relpath = str(page.get("relpath", "") or "")
+            label = str(page.get("label", "") or page.get("id", "") or "community")
+            size = int(page.get("size") or 0)
+            lines.append(
+                f"- {_markdown_link(label, relpath)} · `{page.get('id', 'community')}` · `{size}` files"
             )
         lines.append("")
+
+    if entity_pages:
+        grouped_entities: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for page in entity_pages:
+            grouped_entities[str(page.get("type", "") or "entity")].append(page)
+        lines.extend(["## Entities", ""])
+        for entity_type, pages in sorted(grouped_entities.items()):
+            lines.append(f"### {entity_type}")
+            lines.append("")
+            for page in pages:
+                relpath = str(page.get("relpath", "") or "")
+                name = str(page.get("name", "") or page.get("id", "") or "entity")
+                file_count = int(page.get("file_count") or 0)
+                lines.append(f"- {_markdown_link(name, relpath)} · `{file_count}` files")
+            lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -604,7 +755,169 @@ def _render_file_page(entry: dict[str, Any], preview: str) -> str:
             "",
             "## 备注",
             "",
-            "此页面由构建阶段自动生成，当前仅用于人类导航。",
+            "此页面由构建阶段自动生成，可作为 Wiki-first 检索的辅助导航页，但不是最高优先级原始证据。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _render_community_page(
+    community: dict[str, Any],
+    relpath: Path,
+    entity_page_map: dict[str, Path],
+) -> str:
+    community_id = str(community.get("id", "") or "community")
+    label = str(community.get("label", "") or community_id)
+    files = [str(item) for item in community.get("files", []) if str(item)]
+    kbs = [str(item) for item in community.get("kbs", []) if str(item)]
+    lines = [
+        f"# {community_id}: {label}",
+        "",
+        f"- 社区 ID：{_inline_code(community_id)}",
+        f"- 文件数：{_inline_code(str(int(community.get('size') or len(files))))}",
+        f"- 知识库：{', '.join(_inline_code(kb) for kb in kbs) if kbs else '_未分类_'}",
+        "",
+        "## Top Files",
+        "",
+    ]
+
+    top_files = community.get("top_files", [])
+    if isinstance(top_files, list) and top_files:
+        for item in top_files:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source", "") or "")
+            if not source:
+                continue
+            lines.append(
+                f"- {_page_link(source, relpath, _page_relpath_for_source(source))} · degree={_inline_code(str(item.get('degree', 0)))}"
+            )
+    else:
+        lines.append("_无_")
+
+    lines.extend(["", "## Top Symbols", ""])
+    top_symbols = community.get("top_symbols", [])
+    if isinstance(top_symbols, list) and top_symbols:
+        for item in top_symbols:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "")
+            source = str(item.get("source", "") or "")
+            if source:
+                lines.append(
+                    f"- {_inline_code(name)} @ {_page_link(source, relpath, _page_relpath_for_source(source))}"
+                )
+            elif name:
+                lines.append(f"- {_inline_code(name)}")
+    else:
+        lines.append("_无_")
+
+    for section_title, key in [("Top Concepts", "top_concepts"), ("Top Decisions", "top_decisions")]:
+        lines.extend(["", f"## {section_title}", ""])
+        items = community.get(key, [])
+        if isinstance(items, list) and items:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                entity_id = str(item.get("id", "") or "")
+                name = str(item.get("name", "") or "")
+                entity_relpath = entity_page_map.get(entity_id)
+                if entity_relpath is not None:
+                    label_text = _page_link(name, relpath, entity_relpath)
+                else:
+                    label_text = _inline_code(name)
+                lines.append(
+                    f"- {label_text} · files={_inline_code(str(item.get('file_count', 0)))}"
+                )
+        else:
+            lines.append("_无_")
+
+    lines.extend(["", "## Top Query Notes", ""])
+    top_query_notes = community.get("top_query_notes", [])
+    if isinstance(top_query_notes, list) and top_query_notes:
+        for item in top_query_notes:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "")
+            note_relpath = str(item.get("note_relpath", "") or "")
+            if note_relpath:
+                lines.append(f"- {_page_link(name, relpath, _normalize_wiki_relpath(note_relpath))}")
+            elif name:
+                lines.append(f"- {_inline_code(name)}")
+    else:
+        lines.append("_无_")
+
+    lines.extend(["", "## Suggested Queries", ""])
+    suggested_queries = community.get("suggested_queries", [])
+    if isinstance(suggested_queries, list) and suggested_queries:
+        lines.extend(f"- {str(item)}" for item in suggested_queries if str(item).strip())
+    else:
+        lines.append("_无_")
+
+    lines.extend(
+        [
+            "",
+            "## 备注",
+            "",
+            "此页面由构建阶段自动生成，用于概览一个社区涉及的文件、实体和问题。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _render_entity_page(
+    node: dict[str, Any],
+    relpath: Path,
+    attached_files: set[str],
+    related_entities: list[dict[str, str]],
+    entity_page_map: dict[str, Path],
+) -> str:
+    node_id = str(node.get("id", "") or "")
+    node_type = str(node.get("type", "") or "entity")
+    name = _entity_display_name(node)
+    summary = _entity_summary_text(node)
+    aliases = _entity_aliases(node)
+
+    lines = [
+        f"# {name}",
+        "",
+        f"- 实体 ID：{_inline_code(node_id)}",
+        f"- 类型：{_inline_code(node_type)}",
+    ]
+    if summary:
+        lines.append(f"- 摘要：{summary}")
+    if aliases:
+        lines.append(f"- 别名：{', '.join(_inline_code(alias) for alias in aliases)}")
+
+    lines.extend(["", "## Attached Files", ""])
+    if attached_files:
+        for source in sorted(attached_files):
+            lines.append(f"- {_page_link(source, relpath, _page_relpath_for_source(source))}")
+    else:
+        lines.append("_无_")
+
+    lines.extend(["", "## Related Entities", ""])
+    if related_entities:
+        for item in related_entities:
+            entity_name = str(item.get("name", "") or "")
+            entity_id = str(item.get("id", "") or "")
+            relation = str(item.get("relation", "") or "")
+            entity_relpath = entity_page_map.get(entity_id)
+            if entity_relpath is not None:
+                lines.append(f"- {_page_link(entity_name, relpath, entity_relpath)} · {_inline_code(relation)}")
+            else:
+                lines.append(f"- {_inline_code(entity_name)} · {_inline_code(relation)}")
+    else:
+        lines.append("_无_")
+
+    lines.extend(
+        [
+            "",
+            "## 备注",
+            "",
+            "此页面由构建阶段自动生成，可作为 Wiki-first 检索的辅助实体页，但不是最高优先级原始证据。",
             "",
         ]
     )
@@ -782,15 +1095,21 @@ def _generate_wiki_unlocked(persist_path: Path, manifest: dict[str, Any]) -> dic
     normalized_root = persist_path / str(
         manifest.get("normalized_text_dir", NORMALIZED_TEXT_DIRNAME) or NORMALIZED_TEXT_DIRNAME
     )
+    community_index, _entity_graph, entity_nodes_by_id, entity_edges, attachment_files = _load_graph_context(
+        persist_path
+    )
 
     wiki_dir = persist_path / WIKI_DIRNAME
     files_dir = wiki_dir / "files"
+    communities_dir = wiki_dir / COMMUNITIES_DIRNAME
+    entities_dir = wiki_dir / ENTITIES_DIRNAME
     existing_log_text = ""
     if (wiki_dir / "log.md").exists():
         existing_log_text = (wiki_dir / "log.md").read_text(encoding="utf-8")
-    if files_dir.exists():
-        shutil.rmtree(files_dir)
-    files_dir.mkdir(parents=True, exist_ok=True)
+    for generated_dir in (files_dir, communities_dir, entities_dir):
+        if generated_dir.exists():
+            shutil.rmtree(generated_dir)
+        generated_dir.mkdir(parents=True, exist_ok=True)
 
     for entry in entries:
         source = str(entry["name"])
@@ -799,14 +1118,119 @@ def _generate_wiki_unlocked(persist_path: Path, manifest: dict[str, Any]) -> dic
         preview = _preview_from_normalized_text(normalized_root, str(entry["normalized_text"]))
         page_path.write_text(_render_file_page(entry, preview), encoding="utf-8")
 
+    entity_nodes = [
+        node
+        for node in entity_nodes_by_id.values()
+        if str(node.get("type", "") or "") in {"concept", "decision"}
+    ]
+    entity_nodes.sort(key=lambda node: (str(node.get("type", "") or ""), _entity_display_name(node)))
+    entity_page_map: dict[str, Path] = {
+        str(node.get("id", "") or ""): _entity_page_relpath(node)
+        for node in entity_nodes
+        if str(node.get("id", "") or "")
+    }
+    entity_pages: list[dict[str, Any]] = []
+    for node in entity_nodes:
+        node_id = str(node.get("id", "") or "")
+        if not node_id:
+            continue
+        relpath = entity_page_map[node_id]
+        page_path = wiki_dir / relpath
+        page_path.parent.mkdir(parents=True, exist_ok=True)
+        related_entities: list[dict[str, str]] = []
+        seen_related: set[tuple[str, str]] = set()
+        for edge in entity_edges:
+            source_id = str(edge.get("source", "") or "")
+            target_id = str(edge.get("target", "") or "")
+            relation = str(edge.get("type", "") or "")
+            if source_id == node_id:
+                other_id = target_id
+            elif target_id == node_id:
+                other_id = source_id
+            else:
+                continue
+            other_node = entity_nodes_by_id.get(other_id)
+            if not other_node or str(other_node.get("type", "") or "") not in {"concept", "decision"}:
+                continue
+            key = (other_id, relation)
+            if key in seen_related:
+                continue
+            seen_related.add(key)
+            related_entities.append(
+                {
+                    "id": other_id,
+                    "name": _entity_display_name(other_node),
+                    "relation": relation,
+                }
+            )
+        page_path.write_text(
+            _render_entity_page(
+                node=node,
+                relpath=relpath,
+                attached_files=attachment_files.get(node_id, set()),
+                related_entities=related_entities,
+                entity_page_map=entity_page_map,
+            ),
+            encoding="utf-8",
+        )
+        entity_pages.append(
+            {
+                "id": node_id,
+                "type": str(node.get("type", "") or "entity"),
+                "name": _entity_display_name(node),
+                "relpath": relpath.as_posix(),
+                "file_count": len(attachment_files.get(node_id, set())),
+            }
+        )
+
+    community_pages: list[dict[str, Any]] = []
+    communities = community_index.get("communities", [])
+    if isinstance(communities, list):
+        for community in communities:
+            if not isinstance(community, dict):
+                continue
+            community_id = str(community.get("id", "") or "")
+            if not community_id:
+                continue
+            relpath = _community_page_relpath(community_id)
+            page_path = wiki_dir / relpath
+            page_path.parent.mkdir(parents=True, exist_ok=True)
+            page_path.write_text(
+                _render_community_page(
+                    community=community,
+                    relpath=relpath,
+                    entity_page_map=entity_page_map,
+                ),
+                encoding="utf-8",
+            )
+            community_pages.append(
+                {
+                    "id": community_id,
+                    "label": str(community.get("label", "") or community_id),
+                    "size": int(community.get("size") or len(community.get("files", []) or [])),
+                    "relpath": relpath.as_posix(),
+                }
+            )
+
     wiki_dir.mkdir(parents=True, exist_ok=True)
-    (wiki_dir / "index.md").write_text(_render_index(entries, build_time), encoding="utf-8")
+    (wiki_dir / "index.md").write_text(
+        _render_index(
+            entries,
+            build_time,
+            community_pages=community_pages,
+            entity_pages=entity_pages,
+        ),
+        encoding="utf-8",
+    )
     (wiki_dir / "log.md").write_text(
         _render_log(entries, build_time, existing_log_text=existing_log_text),
         encoding="utf-8",
     )
     lint_report = generate_lint_report(persist_path=persist_path, manifest=manifest)
-    return {"pages": len(entries), "lint_issues": sum(int(count) for count in lint_report["summary"].values())}
+    return {
+        "pages": len(entries) + len(community_pages) + len(entity_pages),
+        "lint_issues": sum(int(count) for count in lint_report["summary"].values()),
+    }
 
 
 def generate_wiki(persist_path: Path, manifest: dict[str, Any]) -> dict[str, int]:
@@ -858,10 +1282,10 @@ def save_query_note(
 
         log_path = wiki_dir / "log.md"
         _append_query_note_log(log_path, created, question, note_relpath)
-        generate_lint_report(persist_path=persist_path, manifest=manifest, generated_at=created)
         from ragbot import refresh_query_note_graph_artifacts
 
         refresh_query_note_graph_artifacts(persist_path)
+        _generate_wiki_unlocked(persist_path=persist_path, manifest=manifest)
     return {
         "note_path": str(note_path),
         "note_relpath": (Path(WIKI_DIRNAME) / note_relpath).as_posix(),

@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import unquote
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -284,6 +285,7 @@ class SearchBundle:
     entity_graph: dict[str, Any]
     entity_nodes_by_id: dict[str, dict[str, Any]]
     entity_edges_by_source: dict[str, list[dict[str, Any]]]
+    wiki_pages: list[dict[str, Any]]
 
     def cache_path_for(self, source: str) -> Path | None:
         entry = self.files_by_source.get(source)
@@ -378,6 +380,123 @@ def _normalize_source_path(path_like: str | Path) -> str:
         return ""
     normalized = posixpath.normpath(text.replace("\\", "/"))
     return "" if normalized in {"", "."} else normalized
+
+
+def _markdown_heading_title(text: str, fallback: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title
+    return fallback
+
+
+def _source_from_wiki_file_relpath(relpath: str) -> str:
+    normalized = _normalize_source_path(relpath)
+    if not normalized.startswith("files/") or not normalized.endswith(".md"):
+        return ""
+    return _normalize_source_path(normalized[len("files/") : -3])
+
+
+def _wiki_page_kind(relpath: str) -> str:
+    normalized = _normalize_source_path(relpath)
+    if normalized == "index.md":
+        return "index"
+    if normalized == "log.md":
+        return "log"
+    if normalized.startswith("files/"):
+        return "file"
+    if normalized.startswith(f"{QUERY_NOTES_DIRNAME}/"):
+        return "query"
+    if normalized.startswith("communities/"):
+        return "community"
+    if normalized.startswith("entities/"):
+        return "entity"
+    return ""
+
+
+def _source_from_wiki_link_target(target: str) -> str:
+    cleaned = unquote(str(target).strip()).split("#", 1)[0].split("?", 1)[0]
+    if cleaned.startswith("../"):
+        cleaned = cleaned[3:]
+    return _source_from_wiki_file_relpath(cleaned)
+
+
+def _iter_wiki_markdown_links(text: str) -> list[str]:
+    links: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    fence_len = 0
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        fence_match = re.match(r"^([`~]{3,})", stripped)
+        if fence_match:
+            marker_run = fence_match.group(1)
+            marker = marker_run[0]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+                fence_len = len(marker_run)
+                continue
+            if marker == fence_marker and len(marker_run) >= fence_len:
+                in_fence = False
+                fence_marker = ""
+                fence_len = 0
+                continue
+        if in_fence:
+            continue
+        links.extend(
+            target.strip()
+            for target in MARKDOWN_LINK_RE.findall(line)
+            if isinstance(target, str) and target.strip()
+        )
+    return links
+
+
+def _load_wiki_pages(persist_dir: Path, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    wiki_dir = persist_dir / WIKI_DIRNAME
+    if not wiki_dir.exists():
+        return []
+
+    file_relpaths = {
+        _normalize_source_path((Path("files") / Path(f"{str(entry.get('name', '') or '')}.md")).as_posix()): _normalize_source_path(
+            str(entry.get("name", "") or "")
+        )
+        for entry in files
+        if _normalize_source_path(str(entry.get("name", "") or ""))
+    }
+    pages: list[dict[str, Any]] = []
+    for page_path in sorted(wiki_dir.rglob("*.md")):
+        relpath = _normalize_source_path(page_path.relative_to(wiki_dir).as_posix())
+        kind = _wiki_page_kind(relpath)
+        if not kind or kind == "log":
+            continue
+        text = page_path.read_text(encoding="utf-8")
+        if kind == "file":
+            source = file_relpaths.get(relpath) or _source_from_wiki_file_relpath(relpath)
+            source_refs = [source] if source else []
+            title = source or _markdown_heading_title(text, page_path.stem)
+            page_id = f"wiki:file:{source or relpath}"
+        else:
+            source_refs = _dedupe_strings(
+                _source_from_wiki_link_target(target)
+                for target in _iter_wiki_markdown_links(text)
+            )
+            title = "知识导航" if kind == "index" else _markdown_heading_title(text, page_path.stem)
+            page_id = f"wiki:{kind}:{relpath}"
+        pages.append(
+            {
+                "id": page_id,
+                "kind": kind,
+                "title": title,
+                "relpath": relpath,
+                "text": text,
+                "source_refs": source_refs,
+            }
+        )
+
+    return pages
 
 
 def _safe_signature_from_args(node: ast.AST) -> str:
@@ -3863,6 +3982,7 @@ def load_search_bundle(
     }
 
     source_dir = manifest.get("source_dir")
+    wiki_pages = _load_wiki_pages(Path(persist_dir), files)
     return SearchBundle(
         vectorstore=vectorstore,
         persist_dir=Path(persist_dir),
@@ -3877,6 +3997,7 @@ def load_search_bundle(
         entity_graph=entity_graph,
         entity_nodes_by_id=entity_nodes_by_id,
         entity_edges_by_source=entity_edges_by_source,
+        wiki_pages=wiki_pages,
     )
 
 
@@ -4672,6 +4793,118 @@ def _expand_candidate_sources_detailed(
     )
 
 
+def _wiki_query_terms(question: str, query_plan: QueryPlan) -> tuple[list[str], list[str]]:
+    phrases = _dedupe_strings(
+        item
+        for item in [question, query_plan.semantic_query]
+        if isinstance(item, str) and len(item.strip()) >= 2
+    )
+    tokens = _dedupe_strings(
+        cleaned
+        for item in [*query_plan.symbols, *query_plan.keywords, *query_plan.path_globs]
+        for cleaned in [str(item).strip().strip("*").strip(".,:;!?()[]{}")]
+        if len(cleaned) >= 2 and cleaned.lower() not in GRAPH_STOPWORDS
+    )
+    return phrases, tokens
+
+
+def _wiki_kind_priority(kind: str) -> int:
+    return {"query": 4, "entity": 3, "community": 2, "file": 1, "index": 0}.get(kind, 0)
+
+
+def _wiki_search(
+    bundle: SearchBundle,
+    question: str,
+    query_plan: QueryPlan,
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    if not bundle.wiki_pages:
+        return []
+
+    valid_sources = (
+        set(_bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
+        if kb is not None or allowed_sources is not None
+        else None
+    )
+    phrases, tokens = _wiki_query_terms(question, query_plan)
+    if not phrases and not tokens:
+        return []
+
+    hits: list[dict[str, Any]] = []
+    for page in bundle.wiki_pages:
+        page_kind = str(page.get("kind", "") or "")
+        page_title = str(page.get("title", "") or "")
+        page_text = str(page.get("text", "") or "")
+        source_refs = [
+            source
+            for source in page.get("source_refs", [])
+            if isinstance(source, str) and source
+        ]
+        if valid_sources is not None:
+            source_refs = [source for source in source_refs if source in valid_sources]
+        if page_kind != "index" and not source_refs:
+            continue
+
+        lowered_text = page_text.lower()
+        lowered_title = page_title.lower()
+        matched_terms: list[str] = []
+        score = 0.0
+
+        for phrase in phrases:
+            lowered_phrase = phrase.lower()
+            if lowered_phrase not in lowered_text:
+                continue
+            matched_terms.append(phrase)
+            score += 3.0 if page_kind == "query" else 2.0
+
+        for token in tokens:
+            lowered_token = token.lower()
+            if lowered_token not in lowered_text:
+                continue
+            matched_terms.append(token)
+            score += 1.5 if lowered_token in lowered_title else 1.0
+
+        if page_kind == "file" and source_refs:
+            page_source = source_refs[0]
+            lowered_source = page_source.lower()
+            lowered_basename = Path(page_source).name.lower()
+            for pattern in query_plan.path_globs:
+                normalized_pattern = pattern.lower()
+                if fnmatch.fnmatch(lowered_source, normalized_pattern) or fnmatch.fnmatch(
+                    lowered_basename, normalized_pattern
+                ):
+                    matched_terms.append(pattern)
+                    score += 1.5
+                    break
+
+        deduped_terms = _dedupe_strings(matched_terms)
+        if score <= 0 or not deduped_terms:
+            continue
+
+        hits.append(
+            {
+                "kind": page_kind,
+                "title": page_title,
+                "relpath": str(page.get("relpath", "") or ""),
+                "score": round(score, 3),
+                "matched_terms": deduped_terms,
+                "source_refs": source_refs,
+            }
+        )
+
+    hits.sort(
+        key=lambda item: (
+            -float(item.get("score", 0.0) or 0.0),
+            -_wiki_kind_priority(str(item.get("kind", "") or "")),
+            len(item.get("source_refs", [])),
+            str(item.get("relpath", "") or ""),
+        )
+    )
+    return hits[:limit]
+
+
 def _run_search_step(
     question: str,
     bundle: SearchBundle,
@@ -4683,8 +4916,22 @@ def _run_search_step(
     graph_max_hops: int = 1,
     graph_max_extra_sources: int = 12,
 ) -> SearchStepResult:
+    wiki_hits = _wiki_search(
+        bundle,
+        question=question,
+        query_plan=query_plan,
+        kb=kb,
+        allowed_sources=allowed_sources,
+    )
+    wiki_seed_sources = _dedupe_strings(
+        source
+        for hit in wiki_hits
+        for source in hit.get("source_refs", [])
+        if isinstance(source, str) and source
+    )
+    wiki_scope = set(wiki_seed_sources)
     glob_hits = glob_search(bundle, query_plan.path_globs, kb=kb, allowed_sources=allowed_sources)
-    glob_scope = set(_candidate_sources_from_hits(glob_hits))
+    glob_scope = wiki_scope | set(_candidate_sources_from_hits(glob_hits))
     grep_scope = glob_scope or allowed_sources
     grep_hits = grep_search(
         bundle,
@@ -4703,15 +4950,21 @@ def _run_search_step(
         )
         grep_fallback_used = True
     ast_hits = ast_search(bundle, query_plan, kb=kb, allowed_sources=allowed_sources)
+    graph_seed_sources = _dedupe_strings(
+        [
+            *wiki_seed_sources,
+            *_candidate_sources_from_hits(glob_hits[:3], grep_hits[:3], ast_hits[:3]),
+        ]
+    )
     graph_expansion = _expand_candidate_sources_detailed(
         bundle,
-        _candidate_sources_from_hits(glob_hits[:3], grep_hits[:3], ast_hits[:3]),
+        graph_seed_sources,
         kb=kb,
         allowed_sources=allowed_sources,
         max_hops=graph_max_hops,
         max_extra_sources=graph_max_extra_sources,
     )
-    narrowed_vector_scope = set(_candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4]))
+    narrowed_vector_scope = wiki_scope | set(_candidate_sources_from_hits(glob_hits, grep_hits[:4], ast_hits[:4]))
     if graph_expansion.sources:
         narrowed_vector_scope = narrowed_vector_scope | graph_expansion.sources
     if not narrowed_vector_scope:
@@ -4743,6 +4996,8 @@ def _run_search_step(
         },
         "retrievers": {name: len(hits) for name, hits in grouped.items()},
         "candidate_scope": sorted(narrowed_vector_scope) if narrowed_vector_scope else [],
+        "wiki_hits": wiki_hits,
+        "wiki_scope": wiki_seed_sources,
         "grep_fallback_used": grep_fallback_used,
         "graph_strategy": graph_expansion.strategy,
         "graph_seed_sources": graph_expansion.seed_sources,
@@ -4926,6 +5181,60 @@ def _collect_bridge_entities(search_trace: list[dict[str, Any]]) -> list[dict[st
     return bridge_entities
 
 
+def _collect_wiki_trace(search_trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    wiki_trace: list[dict[str, Any]] = []
+    for step in search_trace:
+        wiki_hits = step.get("wiki_hits", [])
+        wiki_scope = step.get("wiki_scope", [])
+        if not isinstance(wiki_hits, list):
+            wiki_hits = []
+        if not isinstance(wiki_scope, list):
+            wiki_scope = []
+        wiki_trace.append(
+            {
+                "step": str(step.get("step", "") or ""),
+                "hit_count": len(wiki_hits),
+                "scope_count": len(wiki_scope),
+                "hits": wiki_hits,
+                "scope": wiki_scope,
+            }
+        )
+    return wiki_trace
+
+
+def _bundle_artifacts_summary(search_bundle: SearchBundle) -> dict[str, Any]:
+    wiki_pages = [
+        {
+            "kind": str(page.get("kind", "") or ""),
+            "title": str(page.get("title", "") or ""),
+            "relpath": str(page.get("relpath", "") or ""),
+            "source_refs": [
+                str(source)
+                for source in page.get("source_refs", [])
+                if isinstance(source, str) and source
+            ],
+        }
+        for page in search_bundle.wiki_pages
+        if isinstance(page, dict)
+    ]
+    return {
+        "wiki_pages": wiki_pages,
+        "community_pages": [page for page in wiki_pages if page.get("kind") == "community"],
+        "entity_pages": [page for page in wiki_pages if page.get("kind") == "entity"],
+        "graph_report_path": str(
+            search_bundle.manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
+            or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
+        ),
+        "community_index_path": str(
+            search_bundle.manifest.get("community_index_file", COMMUNITY_INDEX_FILENAME)
+            or COMMUNITY_INDEX_FILENAME
+        ),
+        "lint_report_path": str(
+            search_bundle.manifest.get("lint_report_file", LINT_REPORT_FILENAME) or LINT_REPORT_FILENAME
+        ),
+    }
+
+
 def _build_context_and_sources(results: list[SearchHit]) -> tuple[str, list[dict[str, Any]]]:
     context_parts = []
     for index, hit in enumerate(results, start=1):
@@ -4977,6 +5286,7 @@ def retrieve(
             "context": context,
             "sources": sources,
             "search_trace": trace,
+            "wiki_trace": _collect_wiki_trace(trace),
             "bridge_entities": [],
         }
 
@@ -5044,6 +5354,7 @@ def retrieve(
         "context": context,
         "sources": sources,
         "search_trace": trace,
+        "wiki_trace": _collect_wiki_trace(trace),
         "bridge_entities": bridge_entities,
     }
 
@@ -5118,6 +5429,11 @@ def ask_stream(
         "sources": retrieval["sources"],
     }
     if debug:
+        wiki_trace = retrieval.get("wiki_trace")
+        if not isinstance(wiki_trace, list):
+            wiki_trace = _collect_wiki_trace(retrieval.get("search_trace", []))
         result["search_trace"] = retrieval["search_trace"]
+        result["wiki_trace"] = wiki_trace
         result["bridge_entities"] = retrieval.get("bridge_entities", [])
+        result["artifacts"] = _bundle_artifacts_summary(search_bundle)
     return result
