@@ -12,6 +12,14 @@ import time
 from typing import Any
 from urllib.parse import unquote
 
+try:
+    import fcntl
+
+    _FCNTL_AVAILABLE = True
+except ImportError:
+    fcntl = None
+    _FCNTL_AVAILABLE = False
+
 WIKI_DIRNAME = "wiki"
 QUERY_NOTES_DIRNAME = "queries"
 NORMALIZED_TEXT_DIRNAME = "normalized_texts"
@@ -19,6 +27,7 @@ LINT_REPORT_FILENAME = "lint_report.json"
 WRITE_LOCK_FILENAME = ".write.lock"
 WRITE_LOCK_TIMEOUT_SECONDS = 5.0
 WRITE_LOCK_POLL_SECONDS = 0.05
+STALE_LOCK_GRACE_SECONDS = 1.0
 MAX_PREVIEW_LINES = 12
 MAX_PREVIEW_CHARS = 1200
 LINK_TEXT_ESCAPES = str.maketrans({
@@ -309,6 +318,76 @@ def _ensure_wiki_artifacts_for_sources(
 def _write_lock(wiki_dir: Path):
     lock_path = wiki_dir / WRITE_LOCK_FILENAME
     wiki_dir.mkdir(parents=True, exist_ok=True)
+    if _FCNTL_AVAILABLE:
+        with _posix_write_lock(lock_path):
+            yield
+        return
+
+    with _portable_write_lock(lock_path):
+        yield
+
+
+@contextmanager
+def _posix_write_lock(lock_path: Path):
+    start = time.monotonic()
+    lock_path.touch(exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.ftruncate(fd, 0)
+                os.write(fd, f"{os.getpid()} {time.time_ns()}\n".encode("utf-8"))
+                os.fsync(fd)
+                break
+            except BlockingIOError:
+                if time.monotonic() - start >= WRITE_LOCK_TIMEOUT_SECONDS:
+                    raise TimeoutError("等待 wiki 写锁超时，请稍后重试。")
+                time.sleep(WRITE_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _lock_owner_alive(lock_path: Path) -> bool:
+    try:
+        content = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not content:
+        return False
+    pid_text = content.split()[0]
+    if not pid_text.isdigit():
+        return False
+    pid = int(pid_text)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    if not lock_path.exists():
+        return False
+    if _lock_owner_alive(lock_path):
+        return False
+    try:
+        age_seconds = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    return age_seconds >= STALE_LOCK_GRACE_SECONDS
+
+
+@contextmanager
+def _portable_write_lock(lock_path: Path):
     start = time.monotonic()
     fd: int | None = None
     while True:
@@ -317,6 +396,12 @@ def _write_lock(wiki_dir: Path):
             os.write(fd, f"{os.getpid()} {time.time_ns()}\n".encode("utf-8"))
             break
         except FileExistsError:
+            if _lock_is_stale(lock_path):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
             if time.monotonic() - start >= WRITE_LOCK_TIMEOUT_SECONDS:
                 raise TimeoutError("等待 wiki 写锁超时，请稍后重试。")
             time.sleep(WRITE_LOCK_POLL_SECONDS)

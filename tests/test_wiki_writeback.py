@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -265,3 +266,17 @@ def test_generate_wiki_waits_for_shared_write_lock(tmp_path: Path) -> None:
     assert finished.is_set()
     log_text = log_path.read_text(encoding="utf-8")
     assert "锁内追加的问题" in log_text
+
+
+def test_write_lock_recovers_from_stale_lock_file(tmp_path: Path) -> None:
+    wiki_dir = tmp_path / "index" / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = wiki_dir / wiki.WRITE_LOCK_FILENAME
+    lock_path.write_text("999999 0\n", encoding="utf-8")
+    stale_time = time.time() - (wiki.STALE_LOCK_GRACE_SECONDS + 1)
+    os.utime(lock_path, (stale_time, stale_time))
+
+    with wiki._write_lock(wiki_dir):
+        assert lock_path.exists()
+
+    assert lock_path.exists()
