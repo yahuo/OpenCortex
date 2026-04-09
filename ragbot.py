@@ -59,6 +59,8 @@ DEFAULT_FAISS_DIR = str(Path.home() / "wechat_rag_db")
 DEFAULT_TOP_K = 6
 GENERIC_CHUNK_SIZE = 1200
 GENERIC_CHUNK_OVERLAP_LINES = 3
+DEFAULT_EMBED_BATCH_SIZE = 64
+DEFAULT_EMBED_BATCH_SLEEP_SECONDS = 0.0
 DEFAULT_SEARCH_MODE = "hybrid"
 SEARCH_MODES = {"vector", "hybrid", "agentic"}
 SEARCH_MAX_STEPS_DEFAULT = 2
@@ -184,6 +186,10 @@ _EXTENSION_ALIASES = {
     "rs": "*.rs",
     "shell": "*.sh",
     "sh": "*.sh",
+    "docx": "*.docx",
+    "xlsx": "*.xlsx",
+    "xls": "*.xls",
+    "pdf": "*.pdf",
 }
 DEFAULT_IGNORED_DIRS = {
     ".git",
@@ -198,6 +204,7 @@ DEFAULT_IGNORED_DIRS = {
 }
 PATHISH_RE = re.compile(r"[\w./*+-]+\.[A-Za-z0-9]+|[\w./*+-]+/[\w./*+-]+")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./*:-]{2,}")
+NON_ASCII_FILENAME_RE = re.compile(r"[^\s`\"'“”]+[^\x00-\x7F][^\s`\"'“”]*\.[A-Za-z][A-Za-z0-9]{0,7}")
 SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 WORD_CHARS_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -3824,8 +3831,12 @@ def build_vectorstore(
     _cb(0, total + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
     embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
 
-    batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", "10")))
-    batch_sleep_seconds = max(0.0, float(os.getenv("EMBED_BATCH_SLEEP_SECONDS", "0.5")))
+    batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))))
+    # 默认不做固定节流；仅在真正触发限流时才指数退避，避免大语料重建被 sleep 吞掉数小时。
+    batch_sleep_seconds = max(
+        0.0,
+        float(os.getenv("EMBED_BATCH_SLEEP_SECONDS", str(DEFAULT_EMBED_BATCH_SLEEP_SECONDS))),
+    )
     max_retries = max(0, int(os.getenv("EMBED_MAX_RETRIES", "8")))
     retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
 
@@ -4159,7 +4170,7 @@ def _extract_query_plan(question: str) -> QueryPlan:
         if clean:
             quoted_clean_map[clean.lower()] = clean
 
-    raw_tokens = quoted + TOKEN_RE.findall(question)
+    raw_tokens = quoted + TOKEN_RE.findall(question) + NON_ASCII_FILENAME_RE.findall(question)
     path_globs: list[str] = []
     symbols: list[str] = []
     keywords: list[str] = []
@@ -4168,9 +4179,13 @@ def _extract_query_plan(question: str) -> QueryPlan:
         clean = token.strip().strip(".,:;!?()[]{}")
         if not clean:
             continue
-        keywords.append(clean)
+        has_supported_suffix = any(
+            clean.lower().endswith(suffix) and len(clean) > len(suffix) for suffix in SUPPORTED_TEXT_SUFFIXES
+        )
+        if clean.lower() not in _EXTENSION_ALIASES:
+            keywords.append(clean)
 
-        if PATHISH_RE.fullmatch(clean) or "/" in clean or "*" in clean:
+        if PATHISH_RE.fullmatch(clean) or has_supported_suffix or "/" in clean or "*" in clean:
             if clean.startswith(".") and clean.count(".") == 1 and "/" not in clean:
                 path_globs.append(f"*{clean}")
             elif "*" in clean:
@@ -4191,7 +4206,7 @@ def _extract_query_plan(question: str) -> QueryPlan:
         if quoted_token and "." in clean and all(SYMBOL_RE.fullmatch(part) for part in clean.split(".")):
             symbols.append(clean)
 
-        if "." in stripped_call and all(part for part in stripped_call.split(".")):
+        if not has_supported_suffix and "." in stripped_call and all(part for part in stripped_call.split(".")):
             tail = stripped_call.split(".")[-1]
             if SYMBOL_RE.fullmatch(tail):
                 symbols.append(tail)

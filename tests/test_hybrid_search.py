@@ -238,6 +238,101 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert any(page["kind"] == "community" for page in search_bundle.wiki_pages)
 
 
+def test_build_vectorstore_uses_faster_embedding_defaults(tmp_path: Path, monkeypatch) -> None:
+    docs = [
+        ragbot.Document(
+            page_content=f"chunk {index}",
+            metadata={"source": "工程/bootstrap_session.py", "chunk_index": index},
+        )
+        for index in range(ragbot.DEFAULT_EMBED_BATCH_SIZE + 1)
+    ]
+    batch_sizes: list[int] = []
+    sleep_calls: list[float] = []
+
+    class FakeVectorStore:
+        @classmethod
+        def from_documents(cls, batch, _embeddings):
+            batch_sizes.append(len(batch))
+            return cls()
+
+        def add_documents(self, batch):
+            batch_sizes.append(len(batch))
+
+        def save_local(self, _path: str) -> None:
+            return None
+
+    fake_bundle = SimpleNamespace(manifest={})
+
+    monkeypatch.delenv("EMBED_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("EMBED_BATCH_SLEEP_SECONDS", raising=False)
+    monkeypatch.setattr(ragbot, "_build_documents", lambda _source_dir: (docs, []))
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "FAISS", FakeVectorStore)
+    monkeypatch.setattr(
+        ragbot,
+        "_write_index_artifacts",
+        lambda **_kwargs: {"files": [], "normalized_text_dir": ragbot.NORMALIZED_TEXT_DIRNAME},
+    )
+    monkeypatch.setattr(ragbot, "load_search_bundle", lambda **_kwargs: fake_bundle)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(wiki, "generate_wiki", lambda **_kwargs: {"pages": 0, "lint_issues": 0})
+
+    ragbot.build_vectorstore(
+        md_dir=str(tmp_path / "docs"),
+        embed_api_key="fake-key",
+        persist_dir=str(tmp_path / "index"),
+    )
+
+    assert batch_sizes == [ragbot.DEFAULT_EMBED_BATCH_SIZE, 1]
+    assert sleep_calls == []
+
+
+def test_build_vectorstore_still_honors_configured_batch_sleep(tmp_path: Path, monkeypatch) -> None:
+    docs = [
+        ragbot.Document(
+            page_content=f"chunk {index}",
+            metadata={"source": "工程/bootstrap_session.py", "chunk_index": index},
+        )
+        for index in range(3)
+    ]
+    sleep_calls: list[float] = []
+
+    class FakeVectorStore:
+        @classmethod
+        def from_documents(cls, batch, _embeddings):
+            return cls()
+
+        def add_documents(self, batch):
+            return None
+
+        def save_local(self, _path: str) -> None:
+            return None
+
+    fake_bundle = SimpleNamespace(manifest={})
+
+    monkeypatch.setenv("EMBED_BATCH_SIZE", "1")
+    monkeypatch.setenv("EMBED_BATCH_SLEEP_SECONDS", "0.25")
+    monkeypatch.setattr(ragbot, "_build_documents", lambda _source_dir: (docs, []))
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "FAISS", FakeVectorStore)
+    monkeypatch.setattr(
+        ragbot,
+        "_write_index_artifacts",
+        lambda **_kwargs: {"files": [], "normalized_text_dir": ragbot.NORMALIZED_TEXT_DIRNAME},
+    )
+    monkeypatch.setattr(ragbot, "load_search_bundle", lambda **_kwargs: fake_bundle)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(wiki, "generate_wiki", lambda **_kwargs: {"pages": 0, "lint_issues": 0})
+
+    ragbot.build_vectorstore(
+        md_dir=str(tmp_path / "docs"),
+        embed_api_key="fake-key",
+        persist_dir=str(tmp_path / "index"),
+    )
+
+    assert sleep_calls == [0.25, 0.25]
+
+
 def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: pytest.MonkeyPatch):
     entity_graph_path = search_bundle.persist_dir / "entity_graph.json"
     entity_graph = json.loads(entity_graph_path.read_text(encoding="utf-8"))
@@ -1158,6 +1253,16 @@ def test_extract_query_plan_uses_boundaries_for_extension_aliases():
     assert "*.go" in explicit.path_globs
 
 
+def test_extract_query_plan_promotes_non_ascii_filename_to_exact_keyword_and_glob():
+    plan = ragbot._extract_query_plan("创业慧康基础门户系统操作手册.docx")
+
+    assert "创业慧康基础门户系统操作手册.docx" in plan.keywords
+    assert "docx" not in {keyword.lower() for keyword in plan.keywords}
+    assert plan.symbols == []
+    assert "*创业慧康基础门户系统操作手册.docx*" in plan.path_globs
+    assert "*.docx" in plan.path_globs
+
+
 def test_extract_query_plan_promotes_quoted_symbol_tokens():
     plan = ragbot._extract_query_plan("查看 `login` 的定义")
     assert "login" in plan.symbols
@@ -1207,6 +1312,42 @@ def test_rg_grep_uses_single_process_for_multiple_keywords(search_bundle, monkey
     assert len(calls) == 1
     assert calls[0].count("-e") == 3
     assert hits
+
+
+def test_retrieve_prefers_exact_non_ascii_filename_over_other_docx_files(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    (docs_dir / "产品").mkdir(parents=True)
+    (docs_dir / "聊天").mkdir(parents=True)
+
+    (docs_dir / "产品" / "创业慧康基础门户系统操作手册.docx").write_text("placeholder", encoding="utf-8")
+    (docs_dir / "产品" / "华南大区技术协同规范V1.0.docx").write_text("placeholder", encoding="utf-8")
+    (docs_dir / "聊天" / "华南大区群.md").write_text(
+        "请重新查看 Hi-HIS-大区技术协同规范V1.0.docx 的流程说明。",
+        encoding="utf-8",
+    )
+
+    def fake_convert(path: Path) -> str:
+        if path.name == "创业慧康基础门户系统操作手册.docx":
+            return "# 创业慧康基础门户系统操作手册\n\n系统登录与租户管理。"
+        if path.name == "华南大区技术协同规范V1.0.docx":
+            return "# 华南大区技术协同规范\n\n大区分支提交流程。"
+        raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "_convert_binary_to_markdown", fake_convert)
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+    )
+
+    result = ragbot.retrieve("创业慧康基础门户系统操作手册.docx", bundle, kb="产品", mode="hybrid")
+
+    assert result["search_trace"][0]["query_plan"]["keywords"] == ["创业慧康基础门户系统操作手册.docx"]
+    assert result["hits"][0].source == "产品/创业慧康基础门户系统操作手册.docx"
+    assert all(hit.source != "聊天/华南大区群.md" for hit in result["hits"][:3])
 
 
 def test_load_wiki_pages_retries_when_rebuild_temporarily_removes_page(
