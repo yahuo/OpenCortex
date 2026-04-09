@@ -15,3 +15,8 @@ wechat_db_key.txt
 
 # Git worktrees
 .worktrees/
+
+# Local benchmark drafts
+docs/benchmarks/knowledge-compiler-benchmark.md
+tests/fixtures/business_smoke_queries.json
+tests/fixtures/wiki_first_query_note_benchmark.json
