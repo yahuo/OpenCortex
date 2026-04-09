@@ -1207,3 +1207,34 @@ def test_rg_grep_uses_single_process_for_multiple_keywords(search_bundle, monkey
     assert len(calls) == 1
     assert calls[0].count("-e") == 3
     assert hits
+
+
+def test_load_wiki_pages_retries_when_rebuild_temporarily_removes_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wiki_dir = tmp_path / "wiki" / "queries"
+    wiki_dir.mkdir(parents=True)
+    page_path = wiki_dir / "2026-04-09-note.md"
+    page_path.write_text("# Query Note\n\n[源文件](../files/工程/bootstrap_session.py.md)\n", encoding="utf-8")
+
+    original_read_text = Path.read_text
+    call_count = {"page": 0}
+
+    def flaky_read_text(self: Path, *args, **kwargs):
+        if self == page_path and call_count["page"] == 0:
+            call_count["page"] += 1
+            raise FileNotFoundError("transient wiki rebuild window")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(wiki, "is_wiki_write_in_progress", lambda _persist_path: call_count["page"] == 1)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda _seconds: None)
+
+    pages = ragbot._load_wiki_pages(
+        tmp_path,
+        [{"name": "工程/bootstrap_session.py"}],
+    )
+
+    assert pages[0]["kind"] == "query"
+    assert pages[0]["relpath"] == "queries/2026-04-09-note.md"
+    assert pages[0]["source_refs"] == ["工程/bootstrap_session.py"]

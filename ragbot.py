@@ -382,6 +382,69 @@ def _normalize_source_path(path_like: str | Path) -> str:
     return "" if normalized in {"", "."} else normalized
 
 
+def _runtime_wiki_artifact_paths(persist_path: Path) -> list[str]:
+    wiki_dir = persist_path / WIKI_DIRNAME
+    if not wiki_dir.exists():
+        return []
+
+    paths: list[str] = []
+    for page_path in sorted(wiki_dir.rglob("*.md")):
+        if not page_path.is_file():
+            continue
+        relative = page_path.relative_to(persist_path).as_posix()
+        if relative == f"{WIKI_DIRNAME}/log.md":
+            continue
+        paths.append(relative)
+    return paths
+
+
+def search_bundle_artifact_signature(
+    persist_dir: str | Path,
+) -> tuple[tuple[str, bool, int, int], ...]:
+    persist_path = Path(persist_dir)
+    manifest_path = persist_path / "index_manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_manifest, dict):
+                manifest = loaded_manifest
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+
+    relative_paths = [
+        "index.faiss",
+        "index.pkl",
+        "index_manifest.json",
+        str(manifest.get("symbol_index_file", SYMBOL_INDEX_FILENAME) or SYMBOL_INDEX_FILENAME),
+        str(manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME) or DOCUMENT_GRAPH_FILENAME),
+        str(manifest.get("entity_graph_file", ENTITY_GRAPH_FILENAME) or ENTITY_GRAPH_FILENAME),
+        str(manifest.get("community_index_file", COMMUNITY_INDEX_FILENAME) or COMMUNITY_INDEX_FILENAME),
+        str(manifest.get("lint_report_file", LINT_REPORT_FILENAME) or LINT_REPORT_FILENAME),
+        str(
+            manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
+            or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
+        ),
+    ]
+    relative_paths.extend(_runtime_wiki_artifact_paths(persist_path))
+
+    signature: list[tuple[str, bool, int, int]] = []
+    seen: set[str] = set()
+    for relative_path in relative_paths:
+        normalized = Path(relative_path).as_posix()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        artifact_path = persist_path / normalized
+        try:
+            stat = artifact_path.stat()
+        except OSError:
+            signature.append((normalized, False, 0, 0))
+            continue
+        signature.append((normalized, True, stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
 def _markdown_heading_title(text: str, fallback: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -466,37 +529,51 @@ def _load_wiki_pages(persist_dir: Path, files: list[dict[str, Any]]) -> list[dic
         for entry in files
         if _normalize_source_path(str(entry.get("name", "") or ""))
     }
-    pages: list[dict[str, Any]] = []
-    for page_path in sorted(wiki_dir.rglob("*.md")):
-        relpath = _normalize_source_path(page_path.relative_to(wiki_dir).as_posix())
-        kind = _wiki_page_kind(relpath)
-        if not kind or kind == "log":
-            continue
-        text = page_path.read_text(encoding="utf-8")
-        if kind == "file":
-            source = file_relpaths.get(relpath) or _source_from_wiki_file_relpath(relpath)
-            source_refs = [source] if source else []
-            title = source or _markdown_heading_title(text, page_path.stem)
-            page_id = f"wiki:file:{source or relpath}"
-        else:
-            source_refs = _dedupe_strings(
-                _source_from_wiki_link_target(target)
-                for target in _iter_wiki_markdown_links(text)
-            )
-            title = "知识导航" if kind == "index" else _markdown_heading_title(text, page_path.stem)
-            page_id = f"wiki:{kind}:{relpath}"
-        pages.append(
-            {
-                "id": page_id,
-                "kind": kind,
-                "title": title,
-                "relpath": relpath,
-                "text": text,
-                "source_refs": source_refs,
-            }
-        )
+    from wiki import is_wiki_write_in_progress
 
-    return pages
+    last_error: OSError | None = None
+    for attempt in range(3):
+        pages: list[dict[str, Any]] = []
+        try:
+            for page_path in sorted(wiki_dir.rglob("*.md")):
+                relpath = _normalize_source_path(page_path.relative_to(wiki_dir).as_posix())
+                kind = _wiki_page_kind(relpath)
+                if not kind or kind == "log":
+                    continue
+                text = page_path.read_text(encoding="utf-8")
+                if kind == "file":
+                    source = file_relpaths.get(relpath) or _source_from_wiki_file_relpath(relpath)
+                    source_refs = [source] if source else []
+                    title = source or _markdown_heading_title(text, page_path.stem)
+                    page_id = f"wiki:file:{source or relpath}"
+                else:
+                    source_refs = _dedupe_strings(
+                        _source_from_wiki_link_target(target)
+                        for target in _iter_wiki_markdown_links(text)
+                    )
+                    title = "知识导航" if kind == "index" else _markdown_heading_title(text, page_path.stem)
+                    page_id = f"wiki:{kind}:{relpath}"
+                pages.append(
+                    {
+                        "id": page_id,
+                        "kind": kind,
+                        "title": title,
+                        "relpath": relpath,
+                        "text": text,
+                        "source_refs": source_refs,
+                    }
+                )
+            return pages
+        except OSError as exc:
+            last_error = exc
+            if is_wiki_write_in_progress(persist_dir) and attempt < 2:
+                time.sleep(0.05)
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def _safe_signature_from_args(node: ast.AST) -> str:

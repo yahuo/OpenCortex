@@ -28,6 +28,7 @@ from ragbot import (
     ask_stream as rag_ask_stream,
     list_kbs,
     load_search_bundle,
+    search_bundle_artifact_signature,
 )
 from wiki import is_wiki_write_in_progress, save_query_note
 
@@ -56,69 +57,14 @@ def _read_config() -> dict[str, str]:
 
 _search_bundle = None
 _search_bundle_signature: tuple[tuple[str, bool, int, int], ...] | None = None
+_graph_report_snapshot: dict[str, Any] | None = None
 _cfg: dict[str, str] = {}
 _SEARCH_BUNDLE_RELOAD_RETRIES = 3
 _SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS = 0.05
 
 
-def _runtime_wiki_artifact_paths(persist_path: Path) -> list[str]:
-    wiki_dir = persist_path / WIKI_DIRNAME
-    if not wiki_dir.exists():
-        return []
-
-    paths: list[str] = []
-    for page_path in sorted(wiki_dir.rglob("*.md")):
-        if not page_path.is_file():
-            continue
-        relative = page_path.relative_to(persist_path).as_posix()
-        if relative == f"{WIKI_DIRNAME}/log.md":
-            continue
-        paths.append(relative)
-    return paths
-
-
 def _search_artifact_signature(persist_dir: str) -> tuple[tuple[str, bool, int, int], ...]:
-    persist_path = Path(persist_dir)
-    manifest_path = persist_path / "index_manifest.json"
-    manifest: dict[str, str] = {}
-    if manifest_path.exists():
-        try:
-            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_manifest, dict):
-                manifest = loaded_manifest
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
-
-    relative_paths = [
-        "index.faiss",
-        "index.pkl",
-        "index_manifest.json",
-        str(manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME) or DOCUMENT_GRAPH_FILENAME),
-        str(manifest.get("entity_graph_file", ENTITY_GRAPH_FILENAME) or ENTITY_GRAPH_FILENAME),
-        str(manifest.get("community_index_file", COMMUNITY_INDEX_FILENAME) or COMMUNITY_INDEX_FILENAME),
-        str(manifest.get("lint_report_file", LINT_REPORT_FILENAME) or LINT_REPORT_FILENAME),
-        str(
-            manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
-            or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
-        ),
-    ]
-    relative_paths.extend(_runtime_wiki_artifact_paths(persist_path))
-
-    signature: list[tuple[str, bool, int, int]] = []
-    seen: set[str] = set()
-    for relative_path in relative_paths:
-        normalized = Path(relative_path).as_posix()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        artifact_path = persist_path / normalized
-        try:
-            stat = artifact_path.stat()
-        except OSError:
-            signature.append((normalized, False, 0, 0))
-            continue
-        signature.append((normalized, True, stat.st_mtime_ns, stat.st_size))
-    return tuple(signature)
+    return search_bundle_artifact_signature(persist_dir)
 
 
 def _wiki_write_in_progress(persist_dir: str) -> bool:
@@ -128,8 +74,21 @@ def _wiki_write_in_progress(persist_dir: str) -> bool:
         return False
 
 
+def _read_graph_report_snapshot(manifest: dict[str, Any], persist_dir: str) -> dict[str, Any]:
+    relpath = str(
+        manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
+        or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
+    )
+    report_path = Path(persist_dir) / Path(relpath)
+    try:
+        content = report_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"path": relpath, "content": None, "exists": False}
+    return {"path": relpath, "content": content, "exists": True}
+
+
 def _refresh_search_bundle_if_needed(force: bool = False):
-    global _search_bundle, _search_bundle_signature
+    global _search_bundle, _search_bundle_signature, _graph_report_snapshot
     current_signature = _search_artifact_signature(_cfg["persist_dir"])
     if not force and _search_bundle is not None and current_signature == _search_bundle_signature:
         return _search_bundle
@@ -168,9 +127,20 @@ def _refresh_search_bundle_if_needed(force: bool = False):
             break
         after_signature = _search_artifact_signature(_cfg["persist_dir"])
         if before_signature == after_signature:
-            _search_bundle = bundle
-            _search_bundle_signature = after_signature
-            return bundle
+            try:
+                graph_report_snapshot = _read_graph_report_snapshot(bundle.manifest, _cfg["persist_dir"])
+            except OSError as exc:
+                last_error = RuntimeError(f"结构报告快照读取失败：{exc}")
+                if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
+                    time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
+                    continue
+                break
+            final_signature = _search_artifact_signature(_cfg["persist_dir"])
+            if after_signature == final_signature:
+                _search_bundle = bundle
+                _search_bundle_signature = final_signature
+                _graph_report_snapshot = graph_report_snapshot
+                return bundle
         if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
             time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
 
@@ -402,16 +372,15 @@ def save_query(req: SaveQueryRequest):
 @app.get("/api/graph/report")
 def graph_report():
     search_bundle = _refresh_search_bundle_if_needed()
+    snapshot = _graph_report_snapshot
     relpath = _graph_report_relpath(search_bundle)
-    report_path = search_bundle.persist_dir / Path(relpath)
-    try:
-        content = report_path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="结构报告不存在") from exc
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"读取结构报告失败：{exc}") from exc
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=503, detail="结构报告快照尚未就绪，请稍后重试。")
+    if not bool(snapshot.get("exists")):
+        raise HTTPException(status_code=404, detail="结构报告不存在")
+    content = str(snapshot.get("content", "") or "")
     return {
-        "path": relpath,
+        "path": str(snapshot.get("path", "") or relpath),
         "content": content,
         "artifacts": _bundle_artifacts_summary(search_bundle),
     }

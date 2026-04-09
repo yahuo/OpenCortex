@@ -41,9 +41,17 @@ def _fake_bundle(tmp_path: Path) -> SimpleNamespace:
     )
 
 
+def _minimal_bundle(persist_dir: Path | str) -> SimpleNamespace:
+    return SimpleNamespace(
+        persist_dir=Path(persist_dir),
+        manifest={"graph_report_file": "reports/GRAPH_REPORT.md"},
+        wiki_pages=[],
+    )
+
+
 def test_ask_refreshes_bundle_when_artifacts_change(monkeypatch) -> None:
     first_bundle = object()
-    second_bundle = object()
+    second_bundle = _minimal_bundle("/tmp/fake-index")
     refreshed_signature = (("entity_graph.json", True, 2, 128),)
     captured: dict[str, object] = {}
 
@@ -117,8 +125,8 @@ def test_api_debug_response_exposes_wiki_trace(monkeypatch) -> None:
 
 def test_refresh_retries_until_artifact_signature_stabilizes(monkeypatch) -> None:
     old_bundle = object()
-    unstable_bundle = object()
-    stable_bundle = object()
+    unstable_bundle = _minimal_bundle("/tmp/fake-index")
+    stable_bundle = _minimal_bundle("/tmp/fake-index")
     old_signature = (("entity_graph.json", True, 1, 64),)
     partial_signature = (("entity_graph.json", True, 2, 32),)
     complete_signature = (("entity_graph.json", True, 3, 128),)
@@ -145,7 +153,11 @@ def test_refresh_retries_until_artifact_signature_stabilizes(monkeypatch) -> Non
             complete_signature,
         ]
     )
-    monkeypatch.setattr(api, "_search_artifact_signature", lambda _persist_dir: next(signature_sequence))
+
+    def next_signature(_persist_dir):
+        return next(signature_sequence, complete_signature)
+
+    monkeypatch.setattr(api, "_search_artifact_signature", next_signature)
     load_calls: list[object] = []
 
     def fake_load_search_bundle(**_kwargs):
@@ -166,7 +178,7 @@ def test_refresh_retries_until_artifact_signature_stabilizes(monkeypatch) -> Non
 
 def test_refresh_waits_until_wiki_write_lock_releases(monkeypatch) -> None:
     old_bundle = object()
-    refreshed_bundle = object()
+    refreshed_bundle = _minimal_bundle("/tmp/fake-index")
     old_signature = (("entity_graph.json", True, 1, 64),)
     refreshed_signature = (("entity_graph.json", True, 2, 128),)
 
@@ -325,12 +337,77 @@ def test_graph_report_returns_markdown_content(monkeypatch, tmp_path: Path) -> N
     report_dir.mkdir(parents=True)
     (report_dir / "GRAPH_REPORT.md").write_text("# 图谱报告\n\n内容", encoding="utf-8")
     bundle = _fake_bundle(tmp_path)
+    api._graph_report_snapshot = {
+        "path": "reports/GRAPH_REPORT.md",
+        "content": "# 图谱报告\n\n内容",
+        "exists": True,
+    }
     monkeypatch.setattr(api, "_refresh_search_bundle_if_needed", lambda force=False: bundle)
 
     response = api.graph_report()
 
     assert response["path"] == "reports/GRAPH_REPORT.md"
     assert response["content"].startswith("# 图谱报告")
+
+
+def test_refresh_caches_graph_report_snapshot_with_bundle(monkeypatch, tmp_path: Path) -> None:
+    persist_dir = tmp_path / "index"
+    report_dir = persist_dir / "reports"
+    report_dir.mkdir(parents=True)
+    (persist_dir / "index_manifest.json").write_text("{}", encoding="utf-8")
+    (report_dir / "GRAPH_REPORT.md").write_text("# 图谱报告\n\n稳定内容", encoding="utf-8")
+
+    bundle = SimpleNamespace(
+        persist_dir=persist_dir,
+        manifest={"graph_report_file": "reports/GRAPH_REPORT.md"},
+        wiki_pages=[],
+    )
+    refreshed_signature = (("reports/GRAPH_REPORT.md", True, 2, 128),)
+
+    api._cfg = {
+        "persist_dir": str(persist_dir),
+        "embed_api_key": "fake-embed-key",
+        "embed_base_url": "https://example.com/embed",
+        "embed_model": "fake-embed-model",
+        "llm_api_key": "fake-llm-key",
+        "llm_base_url": "https://example.com/llm",
+        "llm_model": "fake-llm-model",
+        "search_mode": "hybrid",
+    }
+    api._search_bundle = None
+    api._search_bundle_signature = None
+    api._graph_report_snapshot = None
+
+    monkeypatch.setattr(api, "_search_artifact_signature", lambda _persist_dir: refreshed_signature)
+    monkeypatch.setattr(api, "load_search_bundle", lambda **_kwargs: bundle)
+
+    refreshed = api._refresh_search_bundle_if_needed()
+
+    assert refreshed is bundle
+    assert api._graph_report_snapshot == {
+        "path": "reports/GRAPH_REPORT.md",
+        "content": "# 图谱报告\n\n稳定内容",
+        "exists": True,
+    }
+
+
+def test_graph_report_uses_cached_snapshot_instead_of_live_disk(monkeypatch, tmp_path: Path) -> None:
+    bundle = _fake_bundle(tmp_path)
+    api._graph_report_snapshot = {
+        "path": "reports/GRAPH_REPORT.md",
+        "content": "# 图谱报告\n\n快照内容",
+        "exists": True,
+    }
+
+    def fail_read_text(self: Path, *args, **kwargs):
+        raise AssertionError("graph_report() 不应直接读取磁盘文件")
+
+    monkeypatch.setattr(api, "_refresh_search_bundle_if_needed", lambda force=False: bundle)
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+
+    response = api.graph_report()
+
+    assert response["content"] == "# 图谱报告\n\n快照内容"
 
 
 def test_search_artifact_signature_tracks_runtime_wiki_pages(tmp_path: Path) -> None:
@@ -362,7 +439,7 @@ def test_refresh_reloads_bundle_when_only_runtime_wiki_page_changes(monkeypatch,
     page_path.write_text("# before\n", encoding="utf-8")
 
     first_bundle = object()
-    second_bundle = object()
+    second_bundle = _minimal_bundle(persist_dir)
     captured: dict[str, object] = {}
 
     api._cfg = {

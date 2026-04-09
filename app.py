@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 
 from ragbot import ask_stream as rag_ask_stream
 from ragbot import load_search_bundle
-from wiki import save_query_note
+from ragbot import search_bundle_artifact_signature
+from wiki import is_wiki_write_in_progress, save_query_note
 
 load_dotenv()
 
@@ -275,7 +276,9 @@ def get_search_bundle(
     embed_base_url: str,
     embed_model: str,
     persist_dir: str,
+    artifact_signature: tuple[tuple[str, bool, int, int], ...],
 ):
+    del artifact_signature
     return load_search_bundle(
         embed_api_key=embed_api_key,
         embed_base_url=embed_base_url,
@@ -285,9 +288,9 @@ def get_search_bundle(
 
 
 @st.cache_resource
-def _get_mtime_tracker() -> dict:
-    """进程级单例，跨所有会话共享索引 mtime 追踪状态"""
-    return {"last_mtime": 0.0}
+def _get_artifact_signature_tracker() -> dict:
+    """进程级单例，跨所有会话共享 SearchBundle 产物签名状态。"""
+    return {"last_signature": None}
 
 
 def read_runtime_config() -> dict[str, str]:
@@ -649,17 +652,22 @@ if not index_file.exists():
     st.info("请在终端运行上面的命令：先重建索引，再启动页面。")
     st.stop()
 
-# 热加载：索引文件 mtime 变化时清除全局缓存（进程级哨兵，跨所有会话生效）
+# 热加载：跟踪 SearchBundle 实际消费的产物签名。
 try:
     current_mtime = index_file.stat().st_mtime
 except FileNotFoundError:
     st.error("索引文件已被移除，请重新运行 start.py 重建索引。")
     st.stop()
-_mtime_tracker = _get_mtime_tracker()
-if current_mtime != _mtime_tracker["last_mtime"]:
-    get_search_bundle.clear()
-    load_structure_summary.clear()
-    _mtime_tracker["last_mtime"] = current_mtime
+current_bundle_signature = search_bundle_artifact_signature(cfg["persist_dir"])
+artifact_tracker = _get_artifact_signature_tracker()
+wiki_write_in_progress = is_wiki_write_in_progress(Path(cfg["persist_dir"]))
+last_stable_signature = artifact_tracker.get("last_signature")
+effective_bundle_signature = current_bundle_signature
+
+if wiki_write_in_progress and last_stable_signature is not None:
+    effective_bundle_signature = last_stable_signature
+elif not wiki_write_in_progress:
+    artifact_tracker["last_signature"] = current_bundle_signature
 
 structure_artifact_mtimes = get_structure_artifact_mtimes(cfg["persist_dir"])
 structure_summary = load_structure_summary(
@@ -668,15 +676,23 @@ structure_summary = load_structure_summary(
     artifact_mtimes=structure_artifact_mtimes,
 )
 
+if wiki_write_in_progress and last_stable_signature is None:
+    st.warning("Wiki 页面正在重建，请稍后刷新。")
+    st.stop()
+
 search_bundle = get_search_bundle(
     embed_api_key=cfg["embed_api_key"],
     embed_base_url=cfg["embed_base_url"],
     embed_model=cfg["embed_model"],
     persist_dir=cfg["persist_dir"],
+    artifact_signature=effective_bundle_signature,
 )
 
 if search_bundle is None:
-    st.error("索引加载失败，请重启应用后重试。")
+    if wiki_write_in_progress:
+        st.warning("Wiki 页面正在重建，请稍后刷新。")
+    else:
+        st.error("索引加载失败，请重启应用后重试。")
     st.stop()
 
 render_structure_summary(structure_summary)
