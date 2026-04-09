@@ -394,6 +394,11 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
     bridges = community_index.get("bridges", [])
     lint_report = summary.get("lint_report")
     lint_summary = lint_report.get("summary", {}) if isinstance(lint_report, dict) else {}
+    semantic_summary = (
+        community_index.get("semantic_summary")
+        if isinstance(community_index.get("semantic_summary"), dict)
+        else {}
+    )
     lint_issue_count = sum(
         int(lint_summary.get(key, 0) or 0)
         for key in ("stale_pages", "orphan_pages", "missing_links")
@@ -419,6 +424,11 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
             "连接多个上下文的高频枢纽",
         ),
         (
+            "语义节点",
+            str(int(semantic_summary.get("semantic_node_count") or 0)),
+            "LLM 抽取出的 concept / decision 节点",
+        ),
+        (
             "健康检查",
             str(lint_issue_count),
             "wiki / query note / 链接的待处理问题",
@@ -437,7 +447,7 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
 
     with st.expander("查看知识结构摘要", expanded=False):
         st.caption("这些摘要来自离线生成的 community index、lint report 和结构报告，不参与本轮检索排序。")
-        tabs = st.tabs(["核心社区", "关键枢纽", "桥接关系", "健康检查", "结构报告"])
+        tabs = st.tabs(["核心社区", "关键枢纽", "桥接关系", "健康检查", "语义抽取", "结构报告"])
 
         with tabs[0]:
             top_communities = [item for item in communities if isinstance(item, dict)][:3]
@@ -458,6 +468,16 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                         for item in community.get("top_symbols", [])
                         if isinstance(item, dict) and item.get("name")
                     ][:3]
+                    top_concepts = [
+                        str(item.get("name", ""))
+                        for item in community.get("top_concepts", [])
+                        if isinstance(item, dict) and item.get("name")
+                    ][:2]
+                    top_decisions = [
+                        str(item.get("name", ""))
+                        for item in community.get("top_decisions", [])
+                        if isinstance(item, dict) and item.get("name")
+                    ][:2]
                     suggested_queries = [
                         str(item)
                         for item in community.get("suggested_queries", [])
@@ -471,8 +491,8 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
     <div class="community-meta">重点文件：{html.escape(top_files or '暂无')}</div>
     <div class="community-meta">推荐问题：{html.escape('；'.join(suggested_queries) or '暂无')}</div>
 </div>""",
-                            unsafe_allow_html=True,
-                        )
+                                unsafe_allow_html=True,
+                            )
                         if top_symbols:
                             st.markdown(
                                 "".join(
@@ -481,6 +501,10 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                                 ),
                                 unsafe_allow_html=True,
                             )
+                        if top_concepts:
+                            st.caption("语义概念：" + "、".join(top_concepts))
+                        if top_decisions:
+                            st.caption("语义决策：" + "、".join(top_decisions))
 
         with tabs[1]:
             if not god_nodes:
@@ -534,6 +558,26 @@ def render_structure_summary(summary: dict[str, Any]) -> None:
                 st.caption(f"健康检查路径：{lint_report_path}")
 
         with tabs[4]:
+            if not semantic_summary:
+                st.info("当前没有语义抽取统计。")
+            else:
+                enabled = bool(semantic_summary.get("enabled"))
+                status = "enabled" if enabled else "disabled"
+                st.markdown(f"- 状态：`{status}`")
+                disabled_reason = str(semantic_summary.get("disabled_reason") or "")
+                if disabled_reason:
+                    st.markdown(f"- 禁用原因：`{disabled_reason}`")
+                st.markdown(f"- Concepts：`{int(semantic_summary.get('concept_count') or 0)}`")
+                st.markdown(f"- Decisions：`{int(semantic_summary.get('decision_count') or 0)}`")
+                st.markdown(f"- 语义边：`{int(semantic_summary.get('semantic_edge_count') or 0)}`")
+                st.markdown(f"- API 调用：`{int(semantic_summary.get('api_calls') or 0)}`")
+                st.markdown(f"- 缓存命中 section：`{int(semantic_summary.get('cached_sections') or 0)}`")
+                st.markdown(f"- 新抽取 section：`{int(semantic_summary.get('extracted_sections') or 0)}`")
+                st.markdown(f"- 失败 section：`{int(semantic_summary.get('failed_sections') or 0)}`")
+                st.markdown(f"- 总 tokens：`{int(semantic_summary.get('total_tokens') or 0)}`")
+                st.markdown(f"- 耗时：`{float(semantic_summary.get('duration_seconds') or 0.0):.3f}s`")
+
+        with tabs[5]:
             if graph_report:
                 st.caption(f"结构报告路径：{graph_report_path}")
                 st.markdown(graph_report)

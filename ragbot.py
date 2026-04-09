@@ -2487,6 +2487,7 @@ def _build_community_index(
     indexed_files: list[IndexedFile],
     document_graph: dict[str, Any],
     entity_graph: dict[str, Any],
+    semantic_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     file_sources = sorted(
         {
@@ -2545,6 +2546,26 @@ def _build_community_index(
         for edge in entity_graph.get("edges", [])
         if isinstance(edge, dict)
     ]
+    semantic_attachment_files: dict[str, set[str]] = {}
+    semantic_edge_counts: dict[str, int] = {}
+    semantic_node_ids = {
+        node_id
+        for node_id, node in entity_nodes.items()
+        if node.get("type") in {"concept", "decision"}
+    }
+    for edge in entity_edges:
+        source_id = str(edge.get("source", "") or "")
+        target_id = str(edge.get("target", "") or "")
+        if source_id in semantic_node_ids:
+            semantic_edge_counts[source_id] = semantic_edge_counts.get(source_id, 0) + 1
+            target_file = _entity_node_file_source(entity_nodes.get(target_id, {}))
+            if target_file:
+                semantic_attachment_files.setdefault(source_id, set()).add(target_file)
+        if target_id in semantic_node_ids:
+            semantic_edge_counts[target_id] = semantic_edge_counts.get(target_id, 0) + 1
+            source_file = _entity_node_file_source(entity_nodes.get(source_id, {}))
+            if source_file:
+                semantic_attachment_files.setdefault(target_id, set()).add(source_file)
 
     communities: list[dict[str, Any]] = []
     for community_id, files in zip(community_ids, communities_raw):
@@ -2590,15 +2611,53 @@ def _build_community_index(
                 key=lambda item: (-item[1], str(item[0].get("qualified_name") or item[0].get("name") or "")),
             )
         ][:COMMUNITY_TOP_SYMBOLS]
+        top_concepts = [
+            {
+                "id": node_id,
+                "name": str(node.get("name") or ""),
+                "file_count": len(attached_files & file_set),
+                "score": len(attached_files & file_set) * 100 + semantic_edge_counts.get(node_id, 0),
+            }
+            for node_id, node in entity_nodes.items()
+            if node.get("type") == "concept"
+            and (attached_files := semantic_attachment_files.get(node_id, set()))
+            and attached_files & file_set
+        ]
+        top_concepts = sorted(
+            top_concepts,
+            key=lambda item: (-int(item["file_count"]), -int(item["score"]), str(item["name"])),
+        )[:COMMUNITY_TOP_SYMBOLS]
+        top_decisions = [
+            {
+                "id": node_id,
+                "name": str(node.get("name") or ""),
+                "file_count": len(attached_files & file_set),
+                "score": len(attached_files & file_set) * 100 + semantic_edge_counts.get(node_id, 0),
+            }
+            for node_id, node in entity_nodes.items()
+            if node.get("type") == "decision"
+            and (attached_files := semantic_attachment_files.get(node_id, set()))
+            and attached_files & file_set
+        ]
+        top_decisions = sorted(
+            top_decisions,
+            key=lambda item: (-int(item["file_count"]), -int(item["score"]), str(item["name"])),
+        )[:COMMUNITY_TOP_SYMBOLS]
 
         label = (
             top_symbols[0]["name"]
             if top_symbols
+            else top_concepts[0]["name"]
+            if top_concepts
             else Path(top_files[0]["source"]).stem if top_files else community_id
         )
         suggested_queries: list[str] = []
         if top_symbols:
             suggested_queries.append(f"{top_symbols[0]['name']} 在哪里实现？")
+        if top_concepts:
+            suggested_queries.append(f"{top_concepts[0]['name']} 在哪些文件里被讨论？")
+        if top_decisions:
+            suggested_queries.append(f"为什么采用 {top_decisions[0]['name']}？")
         if top_files:
             suggested_queries.append(f"{Path(top_files[0]['source']).stem} 相关流程是什么？")
         if kbs:
@@ -2613,7 +2672,9 @@ def _build_community_index(
                 "kbs": kbs,
                 "top_files": top_files,
                 "top_symbols": top_symbols,
-                "suggested_queries": suggested_queries,
+                "top_concepts": top_concepts,
+                "top_decisions": top_decisions,
+                "suggested_queries": suggested_queries[:3],
             }
         )
 
@@ -2663,12 +2724,33 @@ def _build_community_index(
             item["target"],
         )
     )
+    concept_count = sum(1 for node in entity_nodes.values() if node.get("type") == "concept")
+    decision_count = sum(1 for node in entity_nodes.values() if node.get("type") == "decision")
+    semantic_summary = {
+        "enabled": bool((semantic_stats or {}).get("enabled")),
+        "disabled_reason": str((semantic_stats or {}).get("disabled_reason", "") or ""),
+        "concept_count": concept_count,
+        "decision_count": decision_count,
+        "semantic_node_count": concept_count + decision_count,
+        "semantic_edge_count": sum(
+            1
+            for edge in entity_edges
+            if str(edge.get("type", "") or "") in {"semantically_related", "rationale_for"}
+        ),
+        "cached_sections": int((semantic_stats or {}).get("cached_sections") or 0),
+        "extracted_sections": int((semantic_stats or {}).get("extracted_sections") or 0),
+        "failed_sections": int((semantic_stats or {}).get("failed_sections") or 0),
+        "api_calls": int((semantic_stats or {}).get("api_calls") or 0),
+        "total_tokens": int((semantic_stats or {}).get("total_tokens") or 0),
+        "duration_seconds": float((semantic_stats or {}).get("duration_seconds") or 0.0),
+    }
 
     return {
         "version": 1,
         "file_count": len(file_sources),
         "relationship_count": len(relationships),
         "community_count": len(communities),
+        "semantic_summary": semantic_summary,
         "communities": communities,
         "file_to_community": file_to_community,
         "god_nodes": god_nodes,
@@ -2694,8 +2776,13 @@ def _render_graph_report(
     communities = community_index.get("communities", [])
     god_nodes = community_index.get("god_nodes", [])
     bridges = community_index.get("bridges", [])
+    semantic_summary = (
+        community_index.get("semantic_summary")
+        if isinstance(community_index.get("semantic_summary"), dict)
+        else {}
+    )
 
-    lines = [
+    semantic_lines = [
         "# 图谱报告",
         "",
         "此报告由构建阶段自动生成，当前用于帮助理解知识库结构。",
@@ -2706,9 +2793,28 @@ def _render_graph_report(
         f"- 社区数量：{community_count}",
         f"- 关系总数：{relationship_count}",
         "",
+        "## 语义抽取",
+        "",
+        f"- 启用状态：{'enabled' if semantic_summary.get('enabled') else 'disabled'}",
+    ]
+    if semantic_summary.get("disabled_reason"):
+        semantic_lines.append(f"- 禁用原因：{semantic_summary.get('disabled_reason')}")
+    semantic_lines.extend(
+        [
+        f"- 语义节点：{int(semantic_summary.get('semantic_node_count') or 0)}",
+        f"- Concepts：{int(semantic_summary.get('concept_count') or 0)}",
+        f"- Decisions：{int(semantic_summary.get('decision_count') or 0)}",
+        f"- 语义边：{int(semantic_summary.get('semantic_edge_count') or 0)}",
+        f"- API 调用：{int(semantic_summary.get('api_calls') or 0)}",
+        f"- 缓存命中 section：{int(semantic_summary.get('cached_sections') or 0)}",
+        f"- 总 tokens：{int(semantic_summary.get('total_tokens') or 0)}",
+        f"- 耗时：{float(semantic_summary.get('duration_seconds') or 0.0):.3f}s",
+        "",
         "## God Nodes",
         "",
-    ]
+        ]
+    )
+    lines = semantic_lines
 
     god_node_lines = [
         f"{item.get('source', '')} (degree={item.get('degree', 0)})"
@@ -2750,6 +2856,20 @@ def _render_graph_report(
                 if isinstance(item, dict) and item.get("name")
             ]
             lines.extend(_format_report_list(top_symbol_lines, "暂无符号摘要"))
+            lines.append("- Top Concepts:")
+            top_concept_lines = [
+                f"{item.get('name', '')} (files={item.get('file_count', 0)}, score={item.get('score', 0)})"
+                for item in community.get("top_concepts", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            lines.extend(_format_report_list(top_concept_lines, "暂无语义概念"))
+            lines.append("- Top Decisions:")
+            top_decision_lines = [
+                f"{item.get('name', '')} (files={item.get('file_count', 0)}, score={item.get('score', 0)})"
+                for item in community.get("top_decisions", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+            lines.extend(_format_report_list(top_decision_lines, "暂无语义决策"))
             lines.append("- Suggested Questions:")
             suggested_query_lines = [
                 str(item)
@@ -2887,6 +3007,7 @@ def _write_index_artifacts(
         indexed_files=indexed_files,
         document_graph=document_graph,
         entity_graph=entity_graph,
+        semantic_stats=semantic_stats,
     )
     community_index_path = persist_path / COMMUNITY_INDEX_FILENAME
     community_index_path.write_text(

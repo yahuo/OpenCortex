@@ -33,6 +33,41 @@ class FakeEmbeddings:
         return self.embed_query(text)
 
 
+class FakeMessage:
+    def __init__(self, content: str):
+        self.content = content
+        self.usage_metadata = {"input_tokens": 18, "output_tokens": 7, "total_tokens": 25}
+
+
+class FakeSemanticLLM:
+    def invoke(self, prompt: str):
+        lowered = prompt.lower()
+        if "orchestration" in lowered:
+            return FakeMessage(
+                json.dumps(
+                    {
+                        "concepts": [
+                            {
+                                "name": "orchestration phase",
+                                "summary": "A shared orchestration concept across docs.",
+                                "aliases": [],
+                            }
+                        ],
+                        "decisions": [
+                            {
+                                "name": "deferred report archival",
+                                "summary": "Reporting work is deferred until orchestration completes.",
+                                "aliases": [],
+                                "rationale": ["orchestration phase"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
+
+
 def _write_community_corpus(root: Path) -> None:
     (root / "工程").mkdir(parents=True)
     (root / "报告").mkdir(parents=True)
@@ -116,3 +151,45 @@ def test_build_vectorstore_writes_community_index_with_bridges(
     assert "archive_report @ 报告/archive_report.py" in graph_report
     assert "工程/session_notes.md -> 报告/report_notes.md" in graph_report
     assert "bootstrap_session 在哪里实现？" in graph_report
+
+
+def test_build_vectorstore_surfaces_semantic_summary_in_community_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_community_corpus(docs_dir)
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeSemanticLLM())
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    community_index = json.loads((bundle.persist_dir / "community_index.json").read_text(encoding="utf-8"))
+    semantic_summary = community_index["semantic_summary"]
+    assert semantic_summary["enabled"] is True
+    assert semantic_summary["concept_count"] >= 1
+    assert semantic_summary["decision_count"] >= 1
+    assert semantic_summary["api_calls"] > 0
+
+    assert any(
+        any(item["name"] == "orchestration phase" for item in community.get("top_concepts", []))
+        for community in community_index["communities"]
+    )
+    assert any(
+        any(item["name"] == "deferred report archival" for item in community.get("top_decisions", []))
+        for community in community_index["communities"]
+    )
+
+    graph_report = (bundle.persist_dir / "reports" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "## 语义抽取" in graph_report
+    assert "orchestration phase" in graph_report
+    assert "deferred report archival" in graph_report

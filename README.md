@@ -80,10 +80,13 @@ In addition to the FAISS index, OpenCortex now writes a small set of offline art
 
 - `wiki/index.md` and `wiki/files/*.md` for human-readable file navigation
 - `wiki/queries/*.md` for explicitly accepted “save as knowledge” notes from the UI
+- `semantic_extract_cache.json` for cached LLM-assisted semantic extraction results
 - `community_index.json` and `reports/GRAPH_REPORT.md` for structure summaries
 - `lint_report.json` for wiki health checks (`stale_pages`, `orphan_pages`, `missing_links`)
 
 These artifacts are secondary knowledge, not the primary source of truth. Runtime answers should still be grounded in raw source citations first; query notes and wiki pages are there to help navigation, curation, and reuse.
+
+When `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` are available during rebuild, the compiler also runs a bounded semantic-extraction pass over sections and records cache hits, API calls, token usage, and duration in `index_manifest.json` / `community_index.json`.
 
 ### Request Flow
 

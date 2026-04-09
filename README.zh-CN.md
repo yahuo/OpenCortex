@@ -80,10 +80,13 @@ flowchart LR
 
 - `wiki/index.md` 和 `wiki/files/*.md`：面向人类的文件导航页
 - `wiki/queries/*.md`：在 UI 中显式点击“保存为知识”后生成的 query note
+- `semantic_extract_cache.json`：LLM-assisted 语义抽取缓存
 - `community_index.json` 和 `reports/GRAPH_REPORT.md`：结构摘要和社区报告
 - `lint_report.json`：wiki 健康检查结果，当前覆盖 `stale_pages`、`orphan_pages`、`missing_links`
 
 这些产物都是“二级知识”，不是最高优先级真相源。运行时回答仍然应优先回到原始文档和引用片段；wiki 和 query note 的价值在于导航、沉淀和复用。
+
+如果重建索引时提供了 `LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL`，编译阶段还会额外执行一轮有边界的语义抽取，并把缓存命中、API 调用、token 用量和耗时写进 `index_manifest.json` / `community_index.json`。
 
 ### 问答链路
 
