@@ -4904,6 +4904,42 @@ def _wiki_kind_priority(kind: str) -> int:
     return {"query": 4, "entity": 3, "community": 2, "file": 1, "index": 0}.get(kind, 0)
 
 
+def _wiki_source_ref_matches_query(source: str, query_plan: QueryPlan) -> bool:
+    source_lower = source.lower()
+    basename_lower = Path(source).name.lower()
+    specific_terms = _dedupe_strings(
+        term.lower()
+        for term in [*query_plan.keywords, *query_plan.symbols]
+        if isinstance(term, str) and term.strip() and any(marker in term for marker in (".", "/", "\\"))
+    )
+    specific_patterns = _dedupe_strings(
+        pattern.lower()
+        for pattern in query_plan.path_globs
+        if isinstance(pattern, str)
+        and pattern.strip()
+        and not (
+            pattern.strip("*").startswith(".")
+            and pattern.strip("*").count(".") == 1
+            and "/" not in pattern.strip("*")
+        )
+    )
+    if not specific_terms and not specific_patterns:
+        return True
+
+    for term in specific_terms:
+        if term in source_lower or term in basename_lower:
+            return True
+
+    for pattern in specific_patterns:
+        stripped = pattern.strip("*")
+        if fnmatch.fnmatch(source_lower, pattern) or fnmatch.fnmatch(basename_lower, pattern):
+            return True
+        if stripped and (stripped in source_lower or stripped in basename_lower):
+            return True
+
+    return False
+
+
 def _wiki_search(
     bundle: SearchBundle,
     question: str,
@@ -4936,6 +4972,8 @@ def _wiki_search(
         ]
         if valid_sources is not None:
             source_refs = [source for source in source_refs if source in valid_sources]
+        if source_refs:
+            source_refs = [source for source in source_refs if _wiki_source_ref_matches_query(source, query_plan)]
         if page_kind != "index" and not source_refs:
             continue
 

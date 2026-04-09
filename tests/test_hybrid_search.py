@@ -1344,8 +1344,11 @@ def test_retrieve_prefers_exact_non_ascii_filename_over_other_docx_files(tmp_pat
     )
 
     result = ragbot.retrieve("创业慧康基础门户系统操作手册.docx", bundle, kb="产品", mode="hybrid")
+    index_hits = [hit for hit in result["search_trace"][0]["wiki_hits"] if hit["kind"] == "index"]
 
     assert result["search_trace"][0]["query_plan"]["keywords"] == ["创业慧康基础门户系统操作手册.docx"]
+    assert result["search_trace"][0]["wiki_scope"] == ["产品/创业慧康基础门户系统操作手册.docx"]
+    assert index_hits and index_hits[0]["source_refs"] == ["产品/创业慧康基础门户系统操作手册.docx"]
     assert result["hits"][0].source == "产品/创业慧康基础门户系统操作手册.docx"
     assert all(hit.source != "聊天/华南大区群.md" for hit in result["hits"][:3])
 
