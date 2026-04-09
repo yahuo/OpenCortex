@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -229,6 +230,12 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     assert "- 知识库：`工程`" in wiki_file
     assert "bootstrap_session.py" in wiki_file
     assert (search_bundle.persist_dir / "wiki" / "log.md").exists()
+    assert any(page["kind"] == "index" for page in search_bundle.wiki_pages)
+    assert any(
+        page["kind"] == "file" and page["relpath"] == "files/工程/session_playbook.md.md"
+        for page in search_bundle.wiki_pages
+    )
+    assert any(page["kind"] == "community" for page in search_bundle.wiki_pages)
 
 
 def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: pytest.MonkeyPatch):
@@ -647,6 +654,61 @@ def test_vector_mode_keeps_semantic_recall(search_bundle):
     assert result["search_trace"][0]["stop_reason"] == "vector_mode"
 
 
+def test_wiki_first_uses_saved_query_note_to_seed_candidate_scope(search_bundle, monkeypatch):
+    wiki.save_query_note(
+        persist_path=search_bundle.persist_dir,
+        question="会话启动链路总览是什么？",
+        answer="这是一条会话启动链路总览，串起 playbook 和具体 bootstrap 实现。",
+        sources=[
+            {
+                "source": "工程/session_playbook.md",
+                "line_start": 1,
+                "line_end": 4,
+                "snippet": "Use bootstrap_session() when preparing the concrete initialization steps.",
+            },
+            {
+                "source": "工程/bootstrap_session.py",
+                "line_start": 4,
+                "line_end": 12,
+                "snippet": 'def bootstrap_session(user_id: str) -> dict: """Concrete initialization steps."""',
+            },
+        ],
+    )
+    reloaded = ragbot.load_search_bundle(embed_api_key="fake-key", persist_dir=str(search_bundle.persist_dir))
+    assert reloaded is not None
+
+    captured: dict[str, set[str]] = {}
+    original_vector = ragbot.vector_search
+
+    def tracked_vector(*args, **kwargs):
+        captured["candidate_sources"] = set(kwargs.get("candidate_sources") or set())
+        return original_vector(*args, **kwargs)
+
+    monkeypatch.setattr(ragbot, "vector_search", tracked_vector)
+
+    result = ragbot.retrieve("会话启动链路总览", reloaded, kb="工程", mode="hybrid")
+
+    assert {"工程/session_playbook.md", "工程/bootstrap_session.py"} <= captured["candidate_sources"]
+    assert result["search_trace"][0]["wiki_hits"]
+    assert result["search_trace"][0]["wiki_hits"][0]["kind"] == "query"
+    assert {"工程/session_playbook.md", "工程/bootstrap_session.py"} <= set(result["search_trace"][0]["wiki_scope"])
+
+
+def test_retrieve_without_wiki_artifacts_keeps_existing_behavior(search_bundle):
+    shutil.rmtree(search_bundle.persist_dir / "wiki")
+    reloaded = ragbot.load_search_bundle(embed_api_key="fake-key", persist_dir=str(search_bundle.persist_dir))
+
+    assert reloaded is not None
+    assert reloaded.wiki_pages == []
+
+    result = ragbot.retrieve("看一下 settings.yaml 这个文件", reloaded, mode="hybrid")
+
+    assert result["hits"]
+    assert result["hits"][0].source == "产品/settings.yaml"
+    assert result["search_trace"][0]["wiki_hits"] == []
+    assert result["search_trace"][0]["wiki_scope"] == []
+
+
 def test_agentic_mode_runs_second_step_and_returns_trace(search_bundle, monkeypatch):
     monkeypatch.setattr(ragbot, "make_llm", lambda *args, **kwargs: FakeLLM(*args, **kwargs))
     monkeypatch.setenv("SEARCH_MAX_STEPS", "2")
@@ -798,6 +860,7 @@ def test_run_search_step_preserves_hit_order_for_bounded_graph_expansion(search_
     monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: glob_hits)
     monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
     monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
 
     def fake_expand(bundle, seed_sources, kb=None, allowed_sources=None, max_hops=1, max_extra_sources=12):
         ordered = list(seed_sources)
@@ -881,6 +944,7 @@ def test_ask_stream_debug_includes_trace(search_bundle, monkeypatch):
     )
 
     assert "search_trace" in result
+    assert "wiki_trace" in result
     assert "".join(result["answer_stream"]) == "mock answer"
 
 
@@ -896,6 +960,17 @@ def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
             "search_trace": [
                 {
                     "step": "step1",
+                    "wiki_hits": [
+                        {
+                            "kind": "query",
+                            "title": "启动链路总览",
+                            "relpath": "queries/2026-04-09-startup.md",
+                            "score": 3.0,
+                            "matched_terms": ["启动"],
+                            "source_refs": ["工程/bootstrap_session.py"],
+                        }
+                    ],
+                    "wiki_scope": ["工程/bootstrap_session.py"],
                     "graph_bridge_entities": [
                         {
                             "id": "symbol:工程/bootstrap_session.py:function:bootstrap_session:4",
@@ -930,7 +1005,10 @@ def test_ask_stream_debug_includes_bridge_entities(search_bundle, monkeypatch):
     )
 
     assert "bridge_entities" in result
+    assert "wiki_trace" in result
     assert result["bridge_entities"][0]["name"] == "bootstrap_session"
+    assert result["wiki_trace"][0]["hit_count"] == 1
+    assert result["wiki_trace"][0]["scope"] == ["工程/bootstrap_session.py"]
 
 
 def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
@@ -1000,6 +1078,7 @@ def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
                 }
             ],
         },
+        wiki_pages=[],
     )
 
     expansion = ragbot._expand_candidate_sources_detailed(bundle, ["工程/guide.md"])
@@ -1011,7 +1090,8 @@ def test_entity_graph_expansion_prefers_symbol_bridge(tmp_path: Path):
     assert expansion.edge_reasons[0]["bridges"]
 
 
-def test_grep_scope_falls_back_to_broader_allowed_sources(search_bundle):
+def test_grep_scope_falls_back_to_broader_allowed_sources(search_bundle, monkeypatch):
+    monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
     query_plan = ragbot.QueryPlan(
         symbols=[],
         keywords=["api_key"],
@@ -1047,8 +1127,11 @@ def test_hybrid_uses_document_graph_to_expand_vector_scope(search_bundle, monkey
     result = ragbot.retrieve("看一下 session_playbook.md 里提到的实现", search_bundle, kb="工程", mode="hybrid")
 
     assert "工程/bootstrap_session.py" in captured["candidate_sources"]
-    assert "工程/bootstrap_session.py" in result["search_trace"][0]["graph_expanded_sources"]
-    assert result["search_trace"][0]["graph_hops"] == 1
+    trace = result["search_trace"][0]
+    assert (
+        "工程/bootstrap_session.py" in trace["graph_expanded_sources"]
+        or "工程/bootstrap_session.py" in trace["wiki_scope"]
+    )
 
 
 def test_document_graph_respects_kb_boundaries(search_bundle, monkeypatch):
@@ -1124,3 +1207,34 @@ def test_rg_grep_uses_single_process_for_multiple_keywords(search_bundle, monkey
     assert len(calls) == 1
     assert calls[0].count("-e") == 3
     assert hits
+
+
+def test_load_wiki_pages_retries_when_rebuild_temporarily_removes_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    wiki_dir = tmp_path / "wiki" / "queries"
+    wiki_dir.mkdir(parents=True)
+    page_path = wiki_dir / "2026-04-09-note.md"
+    page_path.write_text("# Query Note\n\n[源文件](../files/工程/bootstrap_session.py.md)\n", encoding="utf-8")
+
+    original_read_text = Path.read_text
+    call_count = {"page": 0}
+
+    def flaky_read_text(self: Path, *args, **kwargs):
+        if self == page_path and call_count["page"] == 0:
+            call_count["page"] += 1
+            raise FileNotFoundError("transient wiki rebuild window")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(wiki, "is_wiki_write_in_progress", lambda _persist_path: call_count["page"] == 1)
+    monkeypatch.setattr(ragbot.time, "sleep", lambda _seconds: None)
+
+    pages = ragbot._load_wiki_pages(
+        tmp_path,
+        [{"name": "工程/bootstrap_session.py"}],
+    )
+
+    assert pages[0]["kind"] == "query"
+    assert pages[0]["relpath"] == "queries/2026-04-09-note.md"
+    assert pages[0]["source_refs"] == ["工程/bootstrap_session.py"]

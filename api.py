@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
+from urllib.parse import unquote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -20,10 +23,14 @@ from ragbot import (
     LINT_REPORT_FILENAME,
     REPORTS_DIRNAME,
     SEARCH_MODES,
+    WIKI_DIRNAME,
+    _bundle_artifacts_summary,
     ask_stream as rag_ask_stream,
     list_kbs,
     load_search_bundle,
+    search_bundle_artifact_signature,
 )
+from wiki import is_wiki_write_in_progress, save_query_note
 
 load_dotenv()
 
@@ -50,56 +57,38 @@ def _read_config() -> dict[str, str]:
 
 _search_bundle = None
 _search_bundle_signature: tuple[tuple[str, bool, int, int], ...] | None = None
+_graph_report_snapshot: dict[str, Any] | None = None
 _cfg: dict[str, str] = {}
 _SEARCH_BUNDLE_RELOAD_RETRIES = 3
 _SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS = 0.05
 
 
 def _search_artifact_signature(persist_dir: str) -> tuple[tuple[str, bool, int, int], ...]:
-    persist_path = Path(persist_dir)
-    manifest_path = persist_path / "index_manifest.json"
-    manifest: dict[str, str] = {}
-    if manifest_path.exists():
-        try:
-            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_manifest, dict):
-                manifest = loaded_manifest
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
+    return search_bundle_artifact_signature(persist_dir)
 
-    relative_paths = [
-        "index.faiss",
-        "index.pkl",
-        "index_manifest.json",
-        str(manifest.get("document_graph_file", DOCUMENT_GRAPH_FILENAME) or DOCUMENT_GRAPH_FILENAME),
-        str(manifest.get("entity_graph_file", ENTITY_GRAPH_FILENAME) or ENTITY_GRAPH_FILENAME),
-        str(manifest.get("community_index_file", COMMUNITY_INDEX_FILENAME) or COMMUNITY_INDEX_FILENAME),
-        str(manifest.get("lint_report_file", LINT_REPORT_FILENAME) or LINT_REPORT_FILENAME),
-        str(
-            manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
-            or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
-        ),
-    ]
 
-    signature: list[tuple[str, bool, int, int]] = []
-    seen: set[str] = set()
-    for relative_path in relative_paths:
-        normalized = Path(relative_path).as_posix()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        artifact_path = persist_path / normalized
-        try:
-            stat = artifact_path.stat()
-        except OSError:
-            signature.append((normalized, False, 0, 0))
-            continue
-        signature.append((normalized, True, stat.st_mtime_ns, stat.st_size))
-    return tuple(signature)
+def _wiki_write_in_progress(persist_dir: str) -> bool:
+    try:
+        return is_wiki_write_in_progress(Path(persist_dir))
+    except OSError:
+        return False
+
+
+def _read_graph_report_snapshot(manifest: dict[str, Any], persist_dir: str) -> dict[str, Any]:
+    relpath = str(
+        manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
+        or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
+    )
+    report_path = Path(persist_dir) / Path(relpath)
+    try:
+        content = report_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"path": relpath, "content": None, "exists": False}
+    return {"path": relpath, "content": content, "exists": True}
 
 
 def _refresh_search_bundle_if_needed(force: bool = False):
-    global _search_bundle, _search_bundle_signature
+    global _search_bundle, _search_bundle_signature, _graph_report_snapshot
     current_signature = _search_artifact_signature(_cfg["persist_dir"])
     if not force and _search_bundle is not None and current_signature == _search_bundle_signature:
         return _search_bundle
@@ -107,6 +96,12 @@ def _refresh_search_bundle_if_needed(force: bool = False):
     previous_bundle = _search_bundle
     last_error: RuntimeError | None = None
     for attempt in range(_SEARCH_BUNDLE_RELOAD_RETRIES):
+        if _wiki_write_in_progress(_cfg["persist_dir"]):
+            last_error = RuntimeError("wiki 页面正在重建，请稍后重试。")
+            if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
+                time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
+                continue
+            break
         before_signature = _search_artifact_signature(_cfg["persist_dir"])
         try:
             bundle = load_search_bundle(
@@ -124,11 +119,28 @@ def _refresh_search_bundle_if_needed(force: bool = False):
         if bundle is None:
             last_error = RuntimeError("检索索引加载失败，请先运行 start.py 重建索引。")
             break
+        if _wiki_write_in_progress(_cfg["persist_dir"]):
+            last_error = RuntimeError("wiki 页面正在重建，请稍后重试。")
+            if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
+                time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
+                continue
+            break
         after_signature = _search_artifact_signature(_cfg["persist_dir"])
         if before_signature == after_signature:
-            _search_bundle = bundle
-            _search_bundle_signature = after_signature
-            return bundle
+            try:
+                graph_report_snapshot = _read_graph_report_snapshot(bundle.manifest, _cfg["persist_dir"])
+            except OSError as exc:
+                last_error = RuntimeError(f"结构报告快照读取失败：{exc}")
+                if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
+                    time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
+                    continue
+                break
+            final_signature = _search_artifact_signature(_cfg["persist_dir"])
+            if after_signature == final_signature:
+                _search_bundle = bundle
+                _search_bundle_signature = final_signature
+                _graph_report_snapshot = graph_report_snapshot
+                return bundle
         if attempt < _SEARCH_BUNDLE_RELOAD_RETRIES - 1:
             time.sleep(_SEARCH_BUNDLE_RELOAD_RETRY_DELAY_SECONDS)
 
@@ -156,6 +168,64 @@ class AskRequest(BaseModel):
     debug: bool = False
 
 
+class SaveQueryRequest(BaseModel):
+    question: str
+    answer: str
+    sources: list[dict[str, Any]]
+    tags: list[str] | None = None
+
+
+def _wiki_page_summary(page: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(page.get("id", "") or ""),
+        "kind": str(page.get("kind", "") or ""),
+        "title": str(page.get("title", "") or ""),
+        "relpath": str(page.get("relpath", "") or ""),
+        "source_refs": [
+            str(source)
+            for source in page.get("source_refs", [])
+            if isinstance(source, str) and source
+        ],
+    }
+
+
+def _wiki_page_payload(page: dict[str, Any]) -> dict[str, Any]:
+    payload = _wiki_page_summary(page)
+    payload["content"] = str(page.get("text", "") or "")
+    return payload
+
+
+def _normalize_wiki_page_relpath(page_path: str) -> str:
+    raw = unquote(str(page_path or "").strip()).replace("\\", "/")
+    if not raw or raw == ".":
+        return "index.md"
+    normalized = posixpath.normpath(raw).lstrip("/")
+    if normalized.startswith(f"{WIKI_DIRNAME}/"):
+        normalized = normalized[len(WIKI_DIRNAME) + 1 :]
+    if normalized in {"", "."}:
+        return "index.md"
+    if normalized == ".." or normalized.startswith("../"):
+        raise HTTPException(status_code=400, detail="wiki 页面路径非法")
+    return normalized
+
+
+def _find_wiki_page(search_bundle, relpath: str) -> dict[str, Any] | None:
+    normalized_relpath = _normalize_wiki_page_relpath(relpath)
+    for page in search_bundle.wiki_pages:
+        if not isinstance(page, dict):
+            continue
+        if str(page.get("relpath", "") or "") == normalized_relpath:
+            return page
+    return None
+
+
+def _graph_report_relpath(search_bundle) -> str:
+    return str(
+        search_bundle.manifest.get("graph_report_file", f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}")
+        or f"{REPORTS_DIRNAME}/{GRAPH_REPORT_FILENAME}"
+    )
+
+
 def _stream_response(result: dict):
     def event_generator():
         for chunk in result["answer_stream"]:
@@ -168,6 +238,16 @@ def _stream_response(result: dict):
             yield {
                 "event": "bridge_entities",
                 "data": json.dumps(result["bridge_entities"], ensure_ascii=False),
+            }
+        if result.get("wiki_trace") is not None:
+            yield {
+                "event": "wiki_trace",
+                "data": json.dumps(result["wiki_trace"], ensure_ascii=False),
+            }
+        if result.get("artifacts") is not None:
+            yield {
+                "event": "artifacts",
+                "data": json.dumps(result["artifacts"], ensure_ascii=False),
             }
         if result.get("search_trace") is not None:
             yield {
@@ -220,13 +300,87 @@ def ask(req: AskRequest):
         search_mode=search_mode,
         debug=req.debug,
     )
+    if req.debug and result.get("artifacts") is None:
+        result["artifacts"] = _bundle_artifacts_summary(search_bundle)
 
     if not req.stream:
         answer = "".join(result["answer_stream"])
         payload = {"answer": answer, "sources": result["sources"]}
         if req.debug:
             payload["bridge_entities"] = result.get("bridge_entities", [])
+            payload["wiki_trace"] = result.get("wiki_trace", [])
+            payload["artifacts"] = result.get("artifacts", {})
             payload["search_trace"] = result.get("search_trace", [])
         return payload
 
     return _stream_response(result)
+
+
+@app.get("/api/wiki/index")
+def wiki_index():
+    search_bundle = _refresh_search_bundle_if_needed()
+    artifacts = _bundle_artifacts_summary(search_bundle)
+    counts: dict[str, int] = {}
+    for page in search_bundle.wiki_pages:
+        if not isinstance(page, dict):
+            continue
+        kind = str(page.get("kind", "") or "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+
+    index_page = _find_wiki_page(search_bundle, "index.md")
+    return {
+        "index": _wiki_page_payload(index_page) if isinstance(index_page, dict) else None,
+        "pages": artifacts["wiki_pages"],
+        "counts": counts,
+        "artifacts": artifacts,
+    }
+
+
+@app.get("/api/wiki/page/{page_path:path}")
+def wiki_page(page_path: str):
+    search_bundle = _refresh_search_bundle_if_needed()
+    page = _find_wiki_page(search_bundle, page_path)
+    if page is None:
+        raise HTTPException(status_code=404, detail="wiki 页面不存在")
+    return {"page": _wiki_page_payload(page)}
+
+
+@app.post("/api/wiki/save-query")
+def save_query(req: SaveQueryRequest):
+    try:
+        result = save_query_note(
+            persist_path=Path(_cfg["persist_dir"]),
+            question=req.question,
+            answer=req.answer,
+            sources=req.sources,
+            tags=req.tags,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"保存 query note 失败：{exc}") from exc
+
+    search_bundle = _refresh_search_bundle_if_needed()
+    note_page = _find_wiki_page(search_bundle, result["note_relpath"])
+    return {
+        "note": result,
+        "page": _wiki_page_payload(note_page) if isinstance(note_page, dict) else None,
+        "artifacts": _bundle_artifacts_summary(search_bundle),
+    }
+
+
+@app.get("/api/graph/report")
+def graph_report():
+    search_bundle = _refresh_search_bundle_if_needed()
+    snapshot = _graph_report_snapshot
+    relpath = _graph_report_relpath(search_bundle)
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=503, detail="结构报告快照尚未就绪，请稍后重试。")
+    if not bool(snapshot.get("exists")):
+        raise HTTPException(status_code=404, detail="结构报告不存在")
+    content = str(snapshot.get("content", "") or "")
+    return {
+        "path": str(snapshot.get("path", "") or relpath),
+        "content": content,
+        "artifacts": _bundle_artifacts_summary(search_bundle),
+    }
