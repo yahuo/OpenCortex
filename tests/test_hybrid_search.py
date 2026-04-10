@@ -609,6 +609,142 @@ The bootstrap session should load config and then start the assistant.
     assert "bootstrap session" in documents[0].page_content
 
 
+def test_split_lines_into_chunks_uses_env_chunk_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHUNK_SIZE", "12")
+    monkeypatch.setenv("CHUNK_OVERLAP_LINES", "1")
+
+    chunks = ragbot._split_lines_into_chunks(["aaaaa", "bbbbb", "ccccc"])
+
+    assert [(chunk.line_start, chunk.line_end) for chunk in chunks] == [(1, 2), (2, 3)]
+
+
+def test_parse_wechat_messages_filters_export_noise() -> None:
+    content = """
+# 聊天记录: Demo
+
+> 导出时间: 2026-04-10 10:00:00
+
+---
+
+**系统提示** `[2024-01-01 10:00:00]`
+*]]></plain><br><template><![CDATA["$username$"邀请你加入了群聊]]></template><br><link_list>
+
+**张三** `[2024-01-01 10:01:00]`
+![图片](../images/demo.png)
+
+**李四** `[2024-01-01 10:02:00]`
+📸 `[加密高级图片: 微信 V2 协议封锁，请前往电脑端原生查看]`
+
+**王五** `[2024-01-01 10:03:00]`
+真实进展：服务已经恢复
+""".strip()
+
+    messages = ragbot._parse_md_messages_text(content)
+
+    assert len(messages) == 1
+    assert messages[0]["sender"] == "王五"
+    assert messages[0]["content"] == "真实进展：服务已经恢复"
+
+
+def test_parse_wechat_messages_drops_system_pattern_without_xml() -> None:
+    messages = ragbot._parse_md_messages_text(
+        """
+**系统提示** `[2024-01-01 10:00:00]`
+张三 撤回了一条消息
+""".strip()
+    )
+
+    assert messages == []
+
+
+def test_iter_chunks_from_cached_file_respects_max_chunks_per_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    path = tmp_path / "wechat.md"
+    path.write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+第一段
+
+**张三** `[2024-01-01 11:00:00]`
+第二段
+
+**张三** `[2024-01-01 12:00:00]`
+第三段
+""".strip(),
+        encoding="utf-8",
+    )
+
+    chunks = list(ragbot._iter_chunks_from_cached_file(path, ".md", "wechat_markdown"))
+
+    assert len(chunks) == 2
+    assert "第一段" not in chunks[0].text
+    assert "第二段" in chunks[0].text
+    assert "第三段" in chunks[1].text
+
+
+def test_iter_chunks_from_cached_file_filters_wechat_image_noise(tmp_path: Path) -> None:
+    path = tmp_path / "wechat-noise.md"
+    path.write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+![图片](../images/demo.png)
+真实内容
+""".strip(),
+        encoding="utf-8",
+    )
+
+    chunks = list(ragbot._iter_chunks_from_cached_file(path, ".md", "wechat_markdown"))
+
+    assert len(chunks) == 1
+    assert ".png" not in chunks[0].text
+    assert "真实内容" in chunks[0].text
+
+
+def test_build_vectorstore_records_truncated_files_in_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    index_dir = tmp_path / "index"
+    progress_messages: list[str] = []
+    (docs_dir / "wechat.md").write_text(
+        """
+**张三** `[2024-01-01 10:00:00]`
+第一段
+
+**张三** `[2024-01-01 11:00:00]`
+第二段
+
+**张三** `[2024-01-01 12:00:00]`
+第三段
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    monkeypatch.setenv("SKIP_GRAPH", "1")
+    monkeypatch.setenv("SKIP_SEMANTIC", "1")
+    monkeypatch.setenv("SKIP_WIKI", "1")
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-key",
+        persist_dir=str(index_dir),
+        progress_callback=lambda _current, _total, message: progress_messages.append(message),
+    )
+
+    file_entry = bundle.manifest["files"][0]
+    assert file_entry["chunks"] == 2
+    assert file_entry["original_chunks"] == 3
+    assert file_entry["truncated"] is True
+    assert any("MAX_CHUNKS_PER_FILE 被截断" in message for message in progress_messages)
+
+
 def test_markdown_heading_chunker_yields_before_consuming_entire_section(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -240,6 +240,7 @@ class IndexedFile:
     normalized_text_path: Path | None = None
     chunk_strategy: str = ""
     _chunk_total: int = 0
+    _original_chunk_total: int = 0
     _line_total: int = 0
 
     def get_normalized_text(self) -> str:
@@ -280,6 +281,16 @@ class IndexedFile:
         if self._line_total > 0:
             return self._line_total
         return max(1, sum(1 for _ in self.iter_normalized_lines()))
+
+    @property
+    def original_chunk_count(self) -> int:
+        if self._original_chunk_total > 0:
+            return self._original_chunk_total
+        return self.chunk_count
+
+    @property
+    def truncated(self) -> bool:
+        return self.original_chunk_count > self.chunk_count
 
     def write_normalized_text(self, target_path: Path) -> None:
         if self.normalized_text_path is not None and self.normalized_text is None:
@@ -378,6 +389,38 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value in SEMANTIC_GRAPH_DISABLED_VALUES:
         return False
     return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _configured_chunk_size() -> int:
+    return max(1, _env_int("CHUNK_SIZE", GENERIC_CHUNK_SIZE))
+
+
+def _configured_chunk_overlap_lines() -> int:
+    return max(0, _env_int("CHUNK_OVERLAP_LINES", GENERIC_CHUNK_OVERLAP_LINES))
+
+
+def _configured_max_chunks_per_file() -> int | None:
+    value = _env_int("MAX_CHUNKS_PER_FILE", 0)
+    if value <= 0:
+        return None
+    return value
+
+
+def _limit_prefers_tail(chunk_strategy: str) -> bool:
+    return chunk_strategy == "wechat_markdown"
 
 
 def make_embeddings(
@@ -715,12 +758,14 @@ def _iter_supported_files(source_dir: Path) -> list[Path]:
 def _split_lines_into_chunks(
     lines: list[str],
     start_line: int = 1,
-    chunk_size: int = GENERIC_CHUNK_SIZE,
-    overlap_lines: int = GENERIC_CHUNK_OVERLAP_LINES,
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
     label: str = "",
 ) -> list[ChunkSpec]:
     if not lines:
         return []
+    chunk_size = _configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = _configured_chunk_overlap_lines() if overlap_lines is None else max(0, overlap_lines)
 
     chunks: list[ChunkSpec] = []
     index = 0
@@ -751,10 +796,53 @@ def _split_lines_into_chunks(
     return chunks
 
 
-def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
+def _limit_chunk_specs(
+    chunks: Iterable[ChunkSpec],
+    max_chunks: int | None = None,
+    chunk_strategy: str = "",
+) -> list[ChunkSpec]:
+    limit = _configured_max_chunks_per_file() if max_chunks is None else max_chunks
+    items = list(chunks)
+    if limit is None or len(items) <= limit:
+        return items
+    if _limit_prefers_tail(chunk_strategy):
+        return items[-limit:]
+    return items[:limit]
+
+
+def _iter_limited_chunks(
+    chunks: Iterable[ChunkSpec],
+    max_chunks: int | None = None,
+    chunk_strategy: str = "",
+) -> Iterable[ChunkSpec]:
+    limit = _configured_max_chunks_per_file() if max_chunks is None else max_chunks
+    if limit is None:
+        yield from chunks
+        return
+    if _limit_prefers_tail(chunk_strategy):
+        tail: deque[ChunkSpec] = deque(maxlen=limit)
+        for chunk in chunks:
+            tail.append(chunk)
+        yield from tail
+        return
+    emitted = 0
+    for chunk in chunks:
+        if emitted >= limit:
+            break
+        emitted += 1
+        yield chunk
+
+
+def _ensure_chunk_size(
+    chunks: list[ChunkSpec],
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
+) -> list[ChunkSpec]:
+    chunk_size = _configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = _configured_chunk_overlap_lines() if overlap_lines is None else max(0, overlap_lines)
     results: list[ChunkSpec] = []
     for chunk in chunks:
-        if len(chunk.text) <= GENERIC_CHUNK_SIZE:
+        if len(chunk.text) <= chunk_size:
             results.append(chunk)
             continue
         lines = chunk.text.splitlines()
@@ -763,6 +851,8 @@ def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
             _split_lines_into_chunks(
                 lines=lines,
                 start_line=start_line,
+                chunk_size=chunk_size,
+                overlap_lines=overlap_lines,
                 label=chunk.label,
             )
         )
@@ -775,6 +865,67 @@ def _ensure_chunk_size(chunks: list[ChunkSpec]) -> list[ChunkSpec]:
 _HEADER_RE = re.compile(
     r"^\*\*(.+?)\*\*\s+`\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]`"
 )
+_WECHAT_IMAGE_LINE_RE = re.compile(r"^!\[[^\]]*\]\([^)]+\.(?:png|jpe?g|gif|webp|bmp)\)$", re.IGNORECASE)
+_WECHAT_SYSTEM_DROP_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"撤回了一条消息",
+        r"邀请你加入了群聊",
+        r"加入了群聊",
+        r"移出了群聊",
+        r"修改群名为",
+        r"更换了群头像",
+        r"拍了拍",
+        r"开启了群待办",
+        r"结束了群待办",
+    )
+]
+
+
+def _sanitize_wechat_message_lines(lines: Iterable[str]) -> list[str]:
+    sanitized: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line == "---" or line.startswith("> 导出时间"):
+            continue
+        if _WECHAT_IMAGE_LINE_RE.fullmatch(line):
+            continue
+        if line.startswith("📸 `") and "加密高级图片" in line:
+            continue
+        if line.startswith("📦 `") and "未知格式内建消息" in line:
+            continue
+        if "<![CDATA[" in line and any(
+            marker in line for marker in ("<template>", "<link_list>", "<memberlist>", "<plain>")
+        ):
+            continue
+        sanitized.append(line)
+    return sanitized
+
+
+def _build_wechat_message(
+    sender: str | None,
+    timestamp: datetime | None,
+    lines: list[str],
+    line_start: int | None,
+    line_end: int | None,
+) -> dict[str, Any] | None:
+    if sender is None or line_start is None:
+        return None
+    cleaned_lines = _sanitize_wechat_message_lines(lines)
+    if not cleaned_lines:
+        return None
+    body = "\n".join(cleaned_lines).strip()
+    if not body:
+        return None
+    if sender == "系统提示" and any(pattern.search(body) for pattern in _WECHAT_SYSTEM_DROP_PATTERNS):
+        return None
+    return {
+        "sender": sender,
+        "timestamp": timestamp,
+        "content": body,
+        "line_start": line_start,
+        "line_end": line_end or line_start,
+    }
 
 
 def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
@@ -786,20 +937,15 @@ def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
     current_end_line: int | None = None
 
     def flush():
-        if current_sender is None or current_start_line is None:
-            return
-        body = "\n".join(current_lines).strip()
-        if not body:
-            return
-        messages.append(
-            {
-                "sender": current_sender,
-                "timestamp": current_ts,
-                "content": body,
-                "line_start": current_start_line,
-                "line_end": current_end_line or current_start_line,
-            }
+        message = _build_wechat_message(
+            current_sender,
+            current_ts,
+            current_lines,
+            current_start_line,
+            current_end_line,
         )
+        if message is not None:
+            messages.append(message)
 
     for lineno, line in enumerate(content.splitlines(), start=1):
         match = _HEADER_RE.match(line)
@@ -819,7 +965,7 @@ def _parse_md_messages_text(content: str) -> list[dict[str, Any]]:
             continue
 
         stripped = line.strip()
-        if stripped and stripped not in ("---",) and not stripped.startswith("> 导出时间"):
+        if stripped:
             current_lines.append(stripped)
             current_end_line = lineno
 
@@ -998,10 +1144,12 @@ def _emit_line_chunk(
 
 def _iter_chunk_specs_from_line_stream(
     numbered_lines: Iterable[tuple[int, str]],
-    chunk_size: int = GENERIC_CHUNK_SIZE,
-    overlap_lines: int = GENERIC_CHUNK_OVERLAP_LINES,
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
     label: str = "",
 ) -> Iterable[ChunkSpec]:
+    chunk_size = _configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = _configured_chunk_overlap_lines() if overlap_lines is None else max(0, overlap_lines)
     window: list[str] = []
     window_start: int | None = None
     current_len = 0
@@ -1031,6 +1179,8 @@ def _iter_chunk_specs_from_line_stream(
 
 def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[ChunkSpec]:
     heading_re = re.compile(r"^\s{0,3}#{1,6}\s+")
+    chunk_size = _configured_chunk_size()
+    overlap_lines = _configured_chunk_overlap_lines()
     segment_lines: list[str] = []
     segment_start_line: int | None = None
     segment_label = "preface"
@@ -1040,12 +1190,12 @@ def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[ChunkSpec]:
     def push_line(line_no: int, line: str) -> Iterable[ChunkSpec]:
         nonlocal segment_lines, segment_start_line, current_len
         line_len = len(line) + 1
-        if segment_lines and current_len + line_len > GENERIC_CHUNK_SIZE:
+        if segment_lines and current_len + line_len > chunk_size:
             chunk = _emit_line_chunk(segment_lines, segment_start_line, label=segment_label)
             if chunk is not None:
                 yield chunk
-            if GENERIC_CHUNK_OVERLAP_LINES > 0:
-                segment_lines = segment_lines[-GENERIC_CHUNK_OVERLAP_LINES:]
+            if overlap_lines > 0:
+                segment_lines = segment_lines[-overlap_lines:]
                 current_len = sum(len(item) + 1 for item in segment_lines)
                 segment_start_line = line_no - len(segment_lines)
             else:
@@ -1097,18 +1247,13 @@ def _iter_wechat_markdown_chunks_from_file(
     chunk_index = 0
 
     def flush_message() -> dict[str, Any] | None:
-        if current_sender is None or current_start_line is None:
-            return None
-        body = "\n".join(current_lines).strip()
-        if not body:
-            return None
-        return {
-            "sender": current_sender,
-            "timestamp": current_ts,
-            "content": body,
-            "line_start": current_start_line,
-            "line_end": current_end_line or current_start_line,
-        }
+        return _build_wechat_message(
+            current_sender,
+            current_ts,
+            current_lines,
+            current_start_line,
+            current_end_line,
+        )
 
     def emit_chunk(messages: list[dict[str, Any]]) -> ChunkSpec | None:
         nonlocal chunk_index
@@ -1166,7 +1311,7 @@ def _iter_wechat_markdown_chunks_from_file(
             continue
 
         stripped = line.strip()
-        if stripped and stripped not in ("---",) and not stripped.startswith("> 导出时间"):
+        if stripped:
             current_lines.append(stripped)
             current_end_line = lineno
 
@@ -1196,13 +1341,16 @@ def _iter_chunks_from_cached_file(
     chunk_strategy: str,
 ) -> Iterable[ChunkSpec]:
     if chunk_strategy == "wechat_markdown":
-        return _iter_wechat_markdown_chunks_from_file(path)
+        return _iter_limited_chunks(_iter_wechat_markdown_chunks_from_file(path), chunk_strategy=chunk_strategy)
     if chunk_strategy == "markdown_heading":
-        return _iter_markdown_heading_chunks_from_file(path)
+        return _iter_limited_chunks(_iter_markdown_heading_chunks_from_file(path), chunk_strategy=chunk_strategy)
     if chunk_strategy in {"structured", "generic"}:
-        return _iter_chunk_specs_from_line_stream(enumerate(_iter_text_file_lines(path), start=1))
+        return _iter_limited_chunks(
+            _iter_chunk_specs_from_line_stream(enumerate(_iter_text_file_lines(path), start=1)),
+            chunk_strategy=chunk_strategy,
+        )
     if chunk_strategy == "python":
-        return iter(_chunk_python_code(path.read_text(encoding="utf-8")))
+        return iter(_limit_chunk_specs(_chunk_python_code(path.read_text(encoding="utf-8")), chunk_strategy=chunk_strategy))
     return iter(_chunks_for_indexed_text(path.read_text(encoding="utf-8"), suffix, chunk_strategy))
 
 
@@ -1375,7 +1523,7 @@ def _prepare_indexed_content(
     rel_path: str,
     suffix: str,
     normalized_raw: str,
-) -> tuple[str, list[ChunkSpec], list[dict[str, Any]], str, int]:
+) -> tuple[str, list[ChunkSpec], list[dict[str, Any]], str, int, int]:
     symbols: list[dict[str, Any]] = []
     chunk_strategy = "generic"
     if suffix in MARKDOWN_SUFFIXES or suffix in _BINARY_SUFFIXES:
@@ -1430,7 +1578,9 @@ def _prepare_indexed_content(
 
     if not chunks:
         chunks = _split_lines_into_chunks(normalized_text.splitlines())
-    return normalized_text, chunks, symbols, chunk_strategy, max(1, len(normalized_text.splitlines()))
+    original_chunk_total = len(chunks)
+    chunks = _limit_chunk_specs(chunks, chunk_strategy=chunk_strategy)
+    return normalized_text, chunks, symbols, chunk_strategy, max(1, len(normalized_text.splitlines())), original_chunk_total
 
 
 def _chunks_for_indexed_text(normalized_text: str, suffix: str, chunk_strategy: str = "") -> list[ChunkSpec]:
@@ -1475,8 +1625,8 @@ def _chunks_for_indexed_text(normalized_text: str, suffix: str, chunk_strategy: 
     else:
         chunks = _split_lines_into_chunks(normalized_text.splitlines())
     if chunks:
-        return chunks
-    return _split_lines_into_chunks(normalized_text.splitlines())
+        return _limit_chunk_specs(chunks, chunk_strategy=strategy)
+    return _limit_chunk_specs(_split_lines_into_chunks(normalized_text.splitlines()), chunk_strategy=strategy)
 
 
 def _read_source_text(file_path: Path, suffix: str) -> str | None:
@@ -1505,7 +1655,11 @@ def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
     if not normalized_raw:
         return None
 
-    normalized_text, chunks, symbols, chunk_strategy, line_total = _prepare_indexed_content(rel_path, suffix, normalized_raw)
+    normalized_text, chunks, symbols, chunk_strategy, line_total, original_chunk_total = _prepare_indexed_content(
+        rel_path,
+        suffix,
+        normalized_raw,
+    )
     if not chunks:
         return None
 
@@ -1518,6 +1672,7 @@ def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
         chunks=chunks,
         symbols=symbols,
         chunk_strategy=chunk_strategy,
+        _original_chunk_total=original_chunk_total,
         _line_total=line_total,
     )
 
@@ -1535,7 +1690,11 @@ def _process_source_file_to_cache(root: Path, file_path: Path, cache_root: Path)
     if not normalized_raw:
         return None
 
-    normalized_text, chunks, symbols, chunk_strategy, line_total = _prepare_indexed_content(rel_path, suffix, normalized_raw)
+    normalized_text, chunks, symbols, chunk_strategy, line_total, original_chunk_total = _prepare_indexed_content(
+        rel_path,
+        suffix,
+        normalized_raw,
+    )
     if not chunks:
         return None
 
@@ -1552,6 +1711,7 @@ def _process_source_file_to_cache(root: Path, file_path: Path, cache_root: Path)
         normalized_text_path=cache_path,
         chunk_strategy=chunk_strategy,
         _chunk_total=len(chunks),
+        _original_chunk_total=original_chunk_total,
         _line_total=line_total,
     )
 
@@ -4156,6 +4316,8 @@ def _write_index_artifacts(
                 "size_kb": round(stat.st_size / 1024, 1),
                 "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
                 "chunks": indexed.chunk_count,
+                "original_chunks": indexed.original_chunk_count,
+                "truncated": indexed.truncated,
                 "normalized_text": normalized_rel,
             }
         )
@@ -4420,6 +4582,17 @@ def _build_vectorstore_from_document_stream(
         )
 
     _cb(0, total_chunks + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total_chunks} 个分片。")
+    truncated_files = [indexed for indexed in indexed_files if indexed.truncated]
+    if truncated_files:
+        preview = "；".join(
+            f"{indexed.rel_path}: {indexed.original_chunk_count} -> {indexed.chunk_count}"
+            for indexed in truncated_files[:3]
+        )
+        _cb(
+            0,
+            total_chunks + 4,
+            f"注意：{len(truncated_files)} 个文件因 MAX_CHUNKS_PER_FILE 被截断。{preview}",
+        )
     embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
 
     batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))))
