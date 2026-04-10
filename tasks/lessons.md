@@ -1,5 +1,9 @@
 # Lessons
 
+- 2026-04-10: 做“流式大文件分块”时，不能为了区分 heading / non-heading 先预扫一遍整文件；像 markdown 这种本来就能在单次扫描里兼容两种路径的格式，预扫只会把无 heading 的大文件变成双倍 I/O。对这类优化要补“无 heading 输入只读一遍”的回归测试。
+- 2026-04-10: 给 embedding 增加并发后，不能把限流重试提示和节流语义留在串行路径里；并发模式下如果 worker 静默退避、主线程还继续 `sleep` 节流，用户会看到“卡住”而不是“在重试”，吞吐也会被主线程 sleep 抵消。对这类改动要补“并发限流仍有进度提示”和“并发模式忽略串行 sleep”的回归测试。
+- 2026-04-10: 做“大文件流式化”时，不能只把全局 `Document` 列表改成生成器就算完成；凡是按 section/heading 分块的子路径，也必须确认首个 chunk 能在读完整个 section 之前产出。对这类优化要补“`next(iterator)` 在超大单 section 输入上不会读到 EOF”的回归测试。
+- 2026-04-10: 给 query planner / wiki scope 增加“更精确的文件名过滤”时，不能把“包含点号的 token”一概视为路径；像 `requests.Session.send` 这种全限定符 symbol 会被误当文件名，直接砍掉 query/entity/community 页的 source refs。路径过滤只能接受真正像路径/文件名的 token，并补“dotted symbol 不会触发 source filter”的回归测试。
 - 2026-04-09: 排查 query planner 误召回时，不能只盯 `keywords`；凡是会被后续 retriever 复用的字段都要一起检查，尤其是 `symbols` 这种会被拼回 grep 查询的派生项。像文件名 `foo.docx` 这种 token，即使已经把 `docx` 从 `keywords` 里去掉，也可能因为“点号尾巴被当成 symbol”继续误召回。对这类修复必须用真实检索 trace 复测，而不只看 planner 输出。
 - 2026-03-28: 在 agentic / multi-step retrieval 场景下，最终融合阶段必须复用前面步骤已经产出的检索结果，不能为了做最终排序再把 retriever 全量重跑一遍。实现多步检索时要显式检查“每一步调用了多少次 retriever”，把性能路径纳入回归测试，而不只验证功能正确性。
 - 2026-04-07: 持久化会在查询时再按 scope（如 `kb`）过滤的数据结构时，不能先做全局截断再做 scope 过滤；截断策略必须优先保留同 scope 候选，并为“跨 scope 噪声耗尽预算”的最小复现场景补回归测试。

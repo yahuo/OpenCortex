@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import configparser
 import fnmatch
 import hashlib
@@ -18,8 +19,11 @@ import json
 import os
 import posixpath
 import re
+from queue import Empty, Queue
 import shutil
 import subprocess
+import tempfile
+from threading import local
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -230,9 +234,58 @@ class IndexedFile:
     suffix: str
     kb: str
     file_path: Path
-    normalized_text: str
-    chunks: list[ChunkSpec]
-    symbols: list[dict[str, Any]]
+    normalized_text: str | None = None
+    chunks: list[ChunkSpec] | None = None
+    symbols: list[dict[str, Any]] = field(default_factory=list)
+    normalized_text_path: Path | None = None
+    chunk_strategy: str = ""
+    _chunk_total: int = 0
+    _line_total: int = 0
+
+    def get_normalized_text(self) -> str:
+        if self.normalized_text is not None:
+            return self.normalized_text
+        if self.normalized_text_path is None:
+            return ""
+        return self.normalized_text_path.read_text(encoding="utf-8")
+
+    def iter_normalized_lines(self) -> Iterable[str]:
+        if self.normalized_text is not None:
+            return iter(self.normalized_text.splitlines())
+        if self.normalized_text_path is None:
+            return iter(())
+        return _iter_text_file_lines(self.normalized_text_path)
+
+    def iter_chunks(self) -> Iterable[ChunkSpec]:
+        if self.chunks is not None:
+            return iter(self.chunks)
+        if self.normalized_text_path is not None and self.normalized_text is None:
+            return _iter_chunks_from_cached_file(
+                self.normalized_text_path,
+                self.suffix,
+                self.chunk_strategy,
+            )
+        return iter(_chunks_for_indexed_text(self.get_normalized_text(), self.suffix, self.chunk_strategy))
+
+    @property
+    def chunk_count(self) -> int:
+        if self._chunk_total > 0:
+            return self._chunk_total
+        if self.chunks is not None:
+            return len(self.chunks)
+        return sum(1 for _ in self.iter_chunks())
+
+    @property
+    def line_count(self) -> int:
+        if self._line_total > 0:
+            return self._line_total
+        return max(1, sum(1 for _ in self.iter_normalized_lines()))
+
+    def write_normalized_text(self, target_path: Path) -> None:
+        if self.normalized_text_path is not None and self.normalized_text is None:
+            shutil.copyfile(self.normalized_text_path, target_path)
+            return
+        target_path.write_text(self.get_normalized_text(), encoding="utf-8")
 
 
 @dataclass(slots=True)
@@ -311,6 +364,20 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     """粗略识别第三方 embedding 服务的限流错误。"""
     message = str(exc).lower()
     return "429" in message or "rate limit" in message or "tpm limit" in message
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in SEMANTIC_GRAPH_ENABLED_VALUES:
+        return True
+    if value in SEMANTIC_GRAPH_DISABLED_VALUES:
+        return False
+    return default
 
 
 def make_embeddings(
@@ -902,6 +969,243 @@ def _chunk_markdown_by_heading(text: str) -> list[ChunkSpec]:
     return _ensure_chunk_size(chunks)
 
 
+def _iter_text_file_lines(path: Path) -> Iterable[str]:
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip("\n")
+            if line.endswith("\r"):
+                line = line[:-1]
+            yield line
+
+
+def _emit_line_chunk(
+    lines: list[str],
+    start_line: int | None,
+    label: str = "",
+) -> ChunkSpec | None:
+    if not lines or start_line is None:
+        return None
+    text = "\n".join(lines).strip()
+    if not text:
+        return None
+    return ChunkSpec(
+        text=text,
+        line_start=start_line,
+        line_end=start_line + len(lines) - 1,
+        label=label,
+    )
+
+
+def _iter_chunk_specs_from_line_stream(
+    numbered_lines: Iterable[tuple[int, str]],
+    chunk_size: int = GENERIC_CHUNK_SIZE,
+    overlap_lines: int = GENERIC_CHUNK_OVERLAP_LINES,
+    label: str = "",
+) -> Iterable[ChunkSpec]:
+    window: list[str] = []
+    window_start: int | None = None
+    current_len = 0
+
+    for line_no, line in numbered_lines:
+        line_len = len(line) + 1
+        if window and current_len + line_len > chunk_size:
+            chunk = _emit_line_chunk(window, window_start, label=label)
+            if chunk is not None:
+                yield chunk
+            if overlap_lines > 0:
+                window = window[-overlap_lines:]
+                current_len = sum(len(item) + 1 for item in window)
+                window_start = line_no - len(window)
+            else:
+                window = []
+                current_len = 0
+                window_start = None
+        if not window:
+            window_start = line_no
+        window.append(line)
+        current_len += line_len
+
+    chunk = _emit_line_chunk(window, window_start, label=label)
+    if chunk is not None:
+        yield chunk
+
+def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[ChunkSpec]:
+    heading_re = re.compile(r"^\s{0,3}#{1,6}\s+")
+    segment_lines: list[str] = []
+    segment_start_line: int | None = None
+    segment_label = "preface"
+    current_len = 0
+    saw_heading = False
+
+    def push_line(line_no: int, line: str) -> Iterable[ChunkSpec]:
+        nonlocal segment_lines, segment_start_line, current_len
+        line_len = len(line) + 1
+        if segment_lines and current_len + line_len > GENERIC_CHUNK_SIZE:
+            chunk = _emit_line_chunk(segment_lines, segment_start_line, label=segment_label)
+            if chunk is not None:
+                yield chunk
+            if GENERIC_CHUNK_OVERLAP_LINES > 0:
+                segment_lines = segment_lines[-GENERIC_CHUNK_OVERLAP_LINES:]
+                current_len = sum(len(item) + 1 for item in segment_lines)
+                segment_start_line = line_no - len(segment_lines)
+            else:
+                segment_lines = []
+                current_len = 0
+                segment_start_line = None
+        if not segment_lines:
+            segment_start_line = line_no
+        segment_lines.append(line)
+        current_len += line_len
+
+    def flush_segment() -> Iterable[ChunkSpec]:
+        nonlocal segment_lines, segment_start_line, current_len
+        chunk = _emit_line_chunk(segment_lines, segment_start_line, label=segment_label)
+        if chunk is not None:
+            yield chunk
+        segment_lines = []
+        segment_start_line = None
+        current_len = 0
+
+    for line_no, line in enumerate(_iter_text_file_lines(path), start=1):
+        if heading_re.match(line):
+            if segment_lines:
+                yield from flush_segment()
+            saw_heading = True
+            segment_label = line.strip().lstrip("#").strip() or "section"
+            yield from push_line(line_no, line)
+            continue
+
+        if not saw_heading:
+            segment_label = "preface"
+        yield from push_line(line_no, line)
+
+    if segment_lines:
+        yield from flush_segment()
+
+
+def _iter_wechat_markdown_chunks_from_file(
+    path: Path,
+    window_minutes: int = TIME_WINDOW_MINUTES,
+) -> Iterable[ChunkSpec]:
+    current_sender: str | None = None
+    current_ts: datetime | None = None
+    current_lines: list[str] = []
+    current_start_line: int | None = None
+    current_end_line: int | None = None
+    current_chunk: list[dict[str, Any]] = []
+    window_start: datetime | None = None
+    chunk_index = 0
+
+    def flush_message() -> dict[str, Any] | None:
+        if current_sender is None or current_start_line is None:
+            return None
+        body = "\n".join(current_lines).strip()
+        if not body:
+            return None
+        return {
+            "sender": current_sender,
+            "timestamp": current_ts,
+            "content": body,
+            "line_start": current_start_line,
+            "line_end": current_end_line or current_start_line,
+        }
+
+    def emit_chunk(messages: list[dict[str, Any]]) -> ChunkSpec | None:
+        nonlocal chunk_index
+        if not messages:
+            return None
+        chunk_index += 1
+        chunk_lines = []
+        for message in messages:
+            ts = message["timestamp"].strftime("%H:%M") if message.get("timestamp") else "?"
+            chunk_lines.append(f"[{ts}] {message['sender']}: {message['content']}")
+        text = "\n".join(chunk_lines).strip()
+        if not text:
+            return None
+        timestamps = [item["timestamp"] for item in messages if item.get("timestamp")]
+        start_t = timestamps[0].strftime("%Y-%m-%d %H:%M") if timestamps else ""
+        end_t = timestamps[-1].strftime("%H:%M") if timestamps else ""
+        label = f"{start_t} ~ {end_t}" if start_t else f"window {chunk_index}"
+        return ChunkSpec(
+            text=text,
+            line_start=messages[0].get("line_start"),
+            line_end=messages[-1].get("line_end"),
+            label=label,
+        )
+
+    for lineno, line in enumerate(_iter_text_file_lines(path), start=1):
+        match = _HEADER_RE.match(line)
+        if match:
+            message = flush_message()
+            if message is not None:
+                ts = message.get("timestamp")
+                if ts is None:
+                    current_chunk.append(message)
+                else:
+                    if window_start is None:
+                        window_start = ts
+                    if ts - window_start <= timedelta(minutes=window_minutes):
+                        current_chunk.append(message)
+                    else:
+                        chunk = emit_chunk(current_chunk)
+                        if chunk is not None:
+                            yield from _ensure_chunk_size([chunk])
+                        current_chunk = [message]
+                        window_start = ts
+            current_sender = match.group(1).strip()
+            try:
+                current_ts = datetime.strptime(match.group(2).strip(), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                current_ts = None
+            current_lines = []
+            current_start_line = lineno
+            current_end_line = lineno
+            continue
+
+        if current_sender is None:
+            continue
+
+        stripped = line.strip()
+        if stripped and stripped not in ("---",) and not stripped.startswith("> 导出时间"):
+            current_lines.append(stripped)
+            current_end_line = lineno
+
+    message = flush_message()
+    if message is not None:
+        ts = message.get("timestamp")
+        if ts is None:
+            current_chunk.append(message)
+        else:
+            if window_start is None or ts - window_start <= timedelta(minutes=window_minutes):
+                current_chunk.append(message)
+            else:
+                chunk = emit_chunk(current_chunk)
+                if chunk is not None:
+                    yield from _ensure_chunk_size([chunk])
+                current_chunk = [message]
+                window_start = ts
+
+    chunk = emit_chunk(current_chunk)
+    if chunk is not None:
+        yield from _ensure_chunk_size([chunk])
+
+
+def _iter_chunks_from_cached_file(
+    path: Path,
+    suffix: str,
+    chunk_strategy: str,
+) -> Iterable[ChunkSpec]:
+    if chunk_strategy == "wechat_markdown":
+        return _iter_wechat_markdown_chunks_from_file(path)
+    if chunk_strategy == "markdown_heading":
+        return _iter_markdown_heading_chunks_from_file(path)
+    if chunk_strategy in {"structured", "generic"}:
+        return _iter_chunk_specs_from_line_stream(enumerate(_iter_text_file_lines(path), start=1))
+    if chunk_strategy == "python":
+        return iter(_chunk_python_code(path.read_text(encoding="utf-8")))
+    return iter(_chunks_for_indexed_text(path.read_text(encoding="utf-8"), suffix, chunk_strategy))
+
+
 def _chunk_python_code(text: str) -> list[ChunkSpec]:
     normalized = _normalize_text(text)
     try:
@@ -1067,26 +1371,74 @@ def _extract_kb(rel_path: str) -> str:
     return ""
 
 
-def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
-    rel_path = _normalize_source_path(file_path.relative_to(root).as_posix())
-    kb = _extract_kb(rel_path)
-    suffix = file_path.suffix.lower()
-
-    try:
-        if suffix in _BINARY_SUFFIXES:
-            raw_text = _convert_binary_to_markdown(file_path)
-        else:
-            raw_text = file_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return None
-
-    normalized_raw = _normalize_text(raw_text)
-    if not normalized_raw:
-        return None
-
+def _prepare_indexed_content(
+    rel_path: str,
+    suffix: str,
+    normalized_raw: str,
+) -> tuple[str, list[ChunkSpec], list[dict[str, Any]], str, int]:
     symbols: list[dict[str, Any]] = []
+    chunk_strategy = "generic"
     if suffix in MARKDOWN_SUFFIXES or suffix in _BINARY_SUFFIXES:
         messages = _parse_md_messages_text(normalized_raw) if suffix in MARKDOWN_SUFFIXES else []
+        if messages:
+            chunk_strategy = "wechat_markdown"
+            chunk_specs: list[ChunkSpec] = []
+            for idx, chunk in enumerate(_chunk_by_time_window(messages), start=1):
+                chunk_lines = []
+                for message in chunk:
+                    ts = message["timestamp"].strftime("%H:%M") if message.get("timestamp") else "?"
+                    chunk_lines.append(f"[{ts}] {message['sender']}: {message['content']}")
+                text = "\n".join(chunk_lines).strip()
+                if not text:
+                    continue
+                timestamps = [item["timestamp"] for item in chunk if item.get("timestamp")]
+                start_t = timestamps[0].strftime("%Y-%m-%d %H:%M") if timestamps else ""
+                end_t = timestamps[-1].strftime("%H:%M") if timestamps else ""
+                label = f"{start_t} ~ {end_t}" if start_t else f"window {idx}"
+                line_start = chunk[0].get("line_start")
+                line_end = chunk[-1].get("line_end")
+                chunk_specs.append(
+                    ChunkSpec(
+                        text=text,
+                        line_start=line_start,
+                        line_end=line_end,
+                        label=label,
+                    )
+                )
+            chunks = _ensure_chunk_size(chunk_specs)
+        else:
+            if any(re.match(r"^\s{0,3}#{1,6}\s+", line) for line in normalized_raw.splitlines()):
+                chunk_strategy = "markdown_heading"
+                chunks = _chunk_markdown_by_heading(normalized_raw)
+            else:
+                chunk_strategy = "generic"
+                chunks = _split_lines_into_chunks(normalized_raw.splitlines())
+        normalized_text = normalized_raw
+    elif suffix in STRUCTURED_SUFFIXES:
+        chunk_strategy = "structured"
+        normalized_text = _normalize_structured_text(normalized_raw, suffix)
+        chunks = _chunk_structured_text(normalized_text)
+    elif suffix in PYTHON_SUFFIXES:
+        chunk_strategy = "python"
+        normalized_text = normalized_raw
+        chunks = _chunk_python_code(normalized_raw)
+        symbols = _extract_python_symbols(normalized_raw, rel_path)
+    else:
+        chunk_strategy = "generic"
+        normalized_text = normalized_raw
+        chunks = _split_lines_into_chunks(normalized_text.splitlines())
+
+    if not chunks:
+        chunks = _split_lines_into_chunks(normalized_text.splitlines())
+    return normalized_text, chunks, symbols, chunk_strategy, max(1, len(normalized_text.splitlines()))
+
+
+def _chunks_for_indexed_text(normalized_text: str, suffix: str, chunk_strategy: str = "") -> list[ChunkSpec]:
+    if not normalized_text:
+        return []
+    strategy = chunk_strategy.strip()
+    if strategy == "wechat_markdown" or ((suffix in MARKDOWN_SUFFIXES or suffix in _BINARY_SUFFIXES) and not strategy):
+        messages = _parse_md_messages_text(normalized_text) if suffix in MARKDOWN_SUFFIXES else []
         if messages:
             chunk_specs: list[ChunkSpec] = []
             for idx, chunk in enumerate(_chunk_by_time_window(messages), start=1):
@@ -1113,21 +1465,47 @@ def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
                 )
             chunks = _ensure_chunk_size(chunk_specs)
         else:
-            chunks = _chunk_markdown_by_heading(normalized_raw)
-        normalized_text = normalized_raw
-    elif suffix in STRUCTURED_SUFFIXES:
-        normalized_text = _normalize_structured_text(normalized_raw, suffix)
+            chunks = _chunk_markdown_by_heading(normalized_text)
+    elif strategy == "markdown_heading":
+        chunks = _chunk_markdown_by_heading(normalized_text)
+    elif strategy == "structured" or suffix in STRUCTURED_SUFFIXES:
         chunks = _chunk_structured_text(normalized_text)
-    elif suffix in PYTHON_SUFFIXES:
-        normalized_text = normalized_raw
-        chunks = _chunk_python_code(normalized_raw)
-        symbols = _extract_python_symbols(normalized_raw, rel_path)
+    elif strategy == "python" or suffix in PYTHON_SUFFIXES:
+        chunks = _chunk_python_code(normalized_text)
     else:
-        normalized_text = normalized_raw
         chunks = _split_lines_into_chunks(normalized_text.splitlines())
+    if chunks:
+        return chunks
+    return _split_lines_into_chunks(normalized_text.splitlines())
 
-    if not chunks:
-        chunks = _split_lines_into_chunks(normalized_text.splitlines())
+
+def _read_source_text(file_path: Path, suffix: str) -> str | None:
+    try:
+        if suffix in _BINARY_SUFFIXES:
+            return _convert_binary_to_markdown(file_path)
+        return file_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def _normalized_cache_path(cache_root: Path, rel_path: str) -> Path:
+    return cache_root / f"{rel_path}.txt"
+
+
+def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
+    rel_path = _normalize_source_path(file_path.relative_to(root).as_posix())
+    kb = _extract_kb(rel_path)
+    suffix = file_path.suffix.lower()
+
+    raw_text = _read_source_text(file_path, suffix)
+    if raw_text is None:
+        return None
+
+    normalized_raw = _normalize_text(raw_text)
+    if not normalized_raw:
+        return None
+
+    normalized_text, chunks, symbols, chunk_strategy, line_total = _prepare_indexed_content(rel_path, suffix, normalized_raw)
     if not chunks:
         return None
 
@@ -1139,6 +1517,42 @@ def _process_source_file(root: Path, file_path: Path) -> IndexedFile | None:
         normalized_text=normalized_text,
         chunks=chunks,
         symbols=symbols,
+        chunk_strategy=chunk_strategy,
+        _line_total=line_total,
+    )
+
+
+def _process_source_file_to_cache(root: Path, file_path: Path, cache_root: Path) -> IndexedFile | None:
+    rel_path = _normalize_source_path(file_path.relative_to(root).as_posix())
+    kb = _extract_kb(rel_path)
+    suffix = file_path.suffix.lower()
+
+    raw_text = _read_source_text(file_path, suffix)
+    if raw_text is None:
+        return None
+
+    normalized_raw = _normalize_text(raw_text)
+    if not normalized_raw:
+        return None
+
+    normalized_text, chunks, symbols, chunk_strategy, line_total = _prepare_indexed_content(rel_path, suffix, normalized_raw)
+    if not chunks:
+        return None
+
+    cache_path = _normalized_cache_path(cache_root, rel_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(normalized_text, encoding="utf-8")
+
+    return IndexedFile(
+        rel_path=rel_path,
+        suffix=suffix,
+        kb=kb,
+        file_path=file_path,
+        symbols=symbols,
+        normalized_text_path=cache_path,
+        chunk_strategy=chunk_strategy,
+        _chunk_total=len(chunks),
+        _line_total=line_total,
     )
 
 
@@ -1172,6 +1586,40 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[IndexedFile]
     return documents, indexed_files
 
 
+_ORIGINAL_BUILD_DOCUMENTS = _build_documents
+
+
+def _index_source_files(source_dir: str, cache_root: Path) -> tuple[list[IndexedFile], int]:
+    root = Path(source_dir)
+    indexed_files: list[IndexedFile] = []
+    total_chunks = 0
+
+    for file_path in _iter_supported_files(root):
+        processed = _process_source_file_to_cache(root, file_path, cache_root)
+        if processed is None:
+            continue
+        indexed_files.append(processed)
+        total_chunks += processed.chunk_count
+
+    return indexed_files, total_chunks
+
+
+def _iter_documents_for_indexed_files(indexed_files: Iterable[IndexedFile]) -> Iterable[Document]:
+    for indexed in indexed_files:
+        for idx, chunk in enumerate(indexed.iter_chunks()):
+            yield Document(
+                page_content=chunk.text,
+                metadata={
+                    "source": indexed.rel_path,
+                    "kb": indexed.kb,
+                    "chunk_index": idx,
+                    "time_range": _chunk_location_label(chunk, f"chunk {idx + 1}"),
+                    "line_start": chunk.line_start,
+                    "line_end": chunk.line_end,
+                },
+            )
+
+
 def _normalize_graph_token(token: str) -> str | None:
     clean = token.strip().strip("`\"'").rstrip("()")
     if len(clean) < GRAPH_SHARED_TOKEN_MIN_LENGTH:
@@ -1194,27 +1642,26 @@ def _extract_shared_tokens(indexed: IndexedFile) -> set[str]:
                 if token:
                     tokens.add(token)
 
-    if indexed.suffix in STRUCTURED_SUFFIXES:
-        for line in indexed.normalized_text.splitlines():
-            if " = " not in line:
-                continue
-            key = line.split(" = ", 1)[0].strip()
-            if re.fullmatch(r"[A-Za-z0-9_.-]{3,}", key):
-                tokens.add(key.lower())
-            for piece in re.split(r"[.\[\]-]+", key):
-                token = _normalize_graph_token(piece)
-                if token:
-                    tokens.add(token)
+    for line in indexed.iter_normalized_lines():
+        if indexed.suffix in STRUCTURED_SUFFIXES:
+            if " = " in line:
+                key = line.split(" = ", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z0-9_.-]{3,}", key):
+                    tokens.add(key.lower())
+                for piece in re.split(r"[.\[\]-]+", key):
+                    token = _normalize_graph_token(piece)
+                    if token:
+                        tokens.add(token)
 
-    for match in CODE_SPAN_RE.findall(indexed.normalized_text):
-        token = _normalize_graph_token(match)
-        if token:
-            tokens.add(token)
+        for match in CODE_SPAN_RE.findall(line):
+            token = _normalize_graph_token(match)
+            if token:
+                tokens.add(token)
 
-    for match in CALL_RE.findall(indexed.normalized_text):
-        token = _normalize_graph_token(match)
-        if token:
-            tokens.add(token)
+        for match in CALL_RE.findall(line):
+            token = _normalize_graph_token(match)
+            if token:
+                tokens.add(token)
 
     return tokens
 
@@ -1238,6 +1685,29 @@ def _iter_local_path_references(text: str) -> list[tuple[str, str]]:
             seen.add(item)
             refs.append(item)
     return refs
+
+
+def _iter_local_path_references_in_lines(lines: Iterable[str]) -> Iterable[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        for ref in MARKDOWN_LINK_RE.findall(line):
+            item = ("links_to", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
+        for ref in HTML_HREF_RE.findall(line):
+            item = ("links_to", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
+        for ref in PATHISH_RE.findall(line):
+            item = ("mentions_path", ref)
+            if item in seen:
+                continue
+            seen.add(item)
+            yield item
 
 
 def _resolve_document_reference(
@@ -1319,7 +1789,7 @@ def _build_document_graph(indexed_files: list[IndexedFile]) -> dict[str, Any]:
         source = _normalize_source_path(indexed.rel_path)
         if not source:
             continue
-        for kind, reference in _iter_local_path_references(indexed.normalized_text):
+        for kind, reference in _iter_local_path_references_in_lines(indexed.iter_normalized_lines()):
             target = _resolve_document_reference(
                 source,
                 reference,
@@ -2162,17 +2632,16 @@ def _upsert_semantic_node(
     return node_id
 
 
-def _iter_semantic_sections(indexed_files: list[IndexedFile]) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
+def _iter_semantic_sections(indexed_files: list[IndexedFile]) -> Iterable[dict[str, Any]]:
     for indexed in indexed_files:
         source = _normalize_source_path(indexed.rel_path)
         if not source:
             continue
-        for chunk_index, chunk in enumerate(indexed.chunks):
+        for chunk_index, chunk in enumerate(indexed.iter_chunks()):
             text = chunk.text.strip()
             if not text:
                 continue
-            sections.append(
+            yield (
                 {
                     "source": source,
                     "kb": indexed.kb,
@@ -2184,7 +2653,6 @@ def _iter_semantic_sections(indexed_files: list[IndexedFile]) -> list[dict[str, 
                     "text": text,
                 }
             )
-    return sections
 
 
 def _extract_semantic_sections(
@@ -2215,8 +2683,7 @@ def _extract_semantic_sections(
         "total_tokens": 0,
         "duration_seconds": 0.0,
     }
-    sections = _iter_semantic_sections(indexed_files)
-    stats["sections_total"] = len(sections)
+    stats["sections_total"] = sum(indexed.chunk_count for indexed in indexed_files)
     if not enabled:
         return [], stats
 
@@ -2234,7 +2701,7 @@ def _extract_semantic_sections(
     next_entries: dict[str, Any] = {}
     extracted_sections: list[dict[str, Any]] = []
 
-    for section in sections:
+    for section in _iter_semantic_sections(indexed_files):
         cache_key = _entity_section_node_id(str(section["source"]), int(section["chunk_index"]))
         fingerprint = _semantic_section_fingerprint(
             source=str(section["source"]),
@@ -2344,7 +2811,7 @@ def _build_entity_graph(
     pending_rationale_edges: list[dict[str, Any]] = []
 
     for source, indexed in sorted(normalized_files, key=lambda item: item[0]):
-        total_lines = max(1, len(indexed.normalized_text.splitlines()))
+        total_lines = indexed.line_count
         kb = _extract_kb(source) or indexed.kb
         _add_entity_node(
             nodes,
@@ -2364,7 +2831,7 @@ def _build_entity_graph(
         nodes_by_id[_entity_file_node_id(source)] = nodes[-1]
 
         section_records: list[dict[str, Any]] = []
-        for chunk_index, chunk in enumerate(indexed.chunks):
+        for chunk_index, chunk in enumerate(indexed.iter_chunks()):
             label = chunk.label or f"chunk {chunk_index + 1}"
             section_id = _entity_section_node_id(source, chunk_index)
             section_line_start = chunk.line_start or 1
@@ -3605,12 +4072,27 @@ def _render_graph_report(
 # ─────────────────────────────────────────────────────────
 # 向量库 / SearchBundle 操作
 # ─────────────────────────────────────────────────────────
+def _clear_generated_wiki_artifacts(persist_path: Path) -> None:
+    wiki_dir = persist_path / WIKI_DIRNAME
+    if not wiki_dir.exists():
+        return
+    for dirname in ("files", "communities", "entities"):
+        generated_dir = wiki_dir / dirname
+        if generated_dir.exists():
+            shutil.rmtree(generated_dir)
+    for filename in ("index.md", "log.md"):
+        page_path = wiki_dir / filename
+        if page_path.exists():
+            page_path.unlink()
+
+
 def _write_index_artifacts(
     persist_path: Path,
     indexed_files: list[IndexedFile],
     embed_model: str,
     source_dir: str,
     total_chunks: int,
+    staged_normalized_dir: Path | None = None,
     llm_api_key: str = "",
     llm_model: str = "",
     llm_base_url: str = "",
@@ -3618,9 +4100,19 @@ def _write_index_artifacts(
     normalized_dir = persist_path / NORMALIZED_TEXT_DIRNAME
     if normalized_dir.exists():
         shutil.rmtree(normalized_dir)
-    normalized_dir.mkdir(parents=True, exist_ok=True)
 
-    symbol_records: list[dict[str, Any]] = []
+    if staged_normalized_dir is not None and staged_normalized_dir.exists():
+        normalized_dir.parent.mkdir(parents=True, exist_ok=True)
+        staged_normalized_dir.rename(normalized_dir)
+        for indexed in indexed_files:
+            if indexed.normalized_text_path is not None and indexed.normalized_text is None:
+                indexed.normalized_text_path = normalized_dir / f"{indexed.rel_path}.txt"
+    else:
+        normalized_dir.mkdir(parents=True, exist_ok=True)
+
+    skip_graph = _env_flag("SKIP_GRAPH")
+    skip_semantic = skip_graph or _env_flag("SKIP_SEMANTIC")
+    skip_wiki = _env_flag("SKIP_WIKI")
     manifest = {
         "build_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "embed_model": embed_model,
@@ -3637,14 +4129,23 @@ def _write_index_artifacts(
         "lint_report_file": LINT_REPORT_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", DEFAULT_SEARCH_MODE).strip() or DEFAULT_SEARCH_MODE,
         "semantic_graph_stats": {},
+        "build_flags": {
+            "skip_graph": skip_graph,
+            "skip_semantic": skip_semantic,
+            "skip_wiki": skip_wiki,
+        },
         "files": [],
     }
 
+    symbol_index_path = persist_path / SYMBOL_INDEX_FILENAME
+    symbol_handle = None
+    wrote_symbols = False
     for indexed in indexed_files:
         normalized_rel = f"{indexed.rel_path}.txt"
         cache_path = normalized_dir / normalized_rel
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(indexed.normalized_text, encoding="utf-8")
+        if not cache_path.exists():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            indexed.write_normalized_text(cache_path)
 
         stat = indexed.file_path.stat()
         manifest["files"].append(
@@ -3654,42 +4155,64 @@ def _write_index_artifacts(
                 "suffix": indexed.suffix,
                 "size_kb": round(stat.st_size / 1024, 1),
                 "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-                "chunks": len(indexed.chunks),
+                "chunks": indexed.chunk_count,
                 "normalized_text": normalized_rel,
             }
         )
-        symbol_records.extend(indexed.symbols)
+        for record in indexed.symbols:
+            if symbol_handle is None:
+                symbol_index_path.parent.mkdir(parents=True, exist_ok=True)
+                symbol_handle = symbol_index_path.open("w", encoding="utf-8")
+            symbol_handle.write(json.dumps(record, ensure_ascii=False))
+            symbol_handle.write("\n")
+            wrote_symbols = True
 
-    symbol_index_path = persist_path / SYMBOL_INDEX_FILENAME
-    if symbol_records:
-        symbol_index_path.write_text(
-            "\n".join(json.dumps(record, ensure_ascii=False) for record in symbol_records),
-            encoding="utf-8",
-        )
-    elif symbol_index_path.exists():
+    if symbol_handle is not None:
+        symbol_handle.close()
+    if not wrote_symbols and symbol_index_path.exists():
         symbol_index_path.unlink()
 
-    document_graph = _build_document_graph(indexed_files)
+    file_sources = [_normalize_source_path(indexed.rel_path) for indexed in indexed_files]
+    if skip_graph:
+        document_graph = {"version": 1, "edge_count": 0, "neighbors": {}}
+    else:
+        document_graph = _build_document_graph(indexed_files)
     document_graph_path = persist_path / DOCUMENT_GRAPH_FILENAME
     document_graph_path.write_text(
         json.dumps(document_graph, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    semantic_sections, semantic_stats = _extract_semantic_sections(
-        indexed_files=indexed_files,
-        persist_path=persist_path,
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-    )
+    semantic_sections: list[dict[str, Any]] = []
+    if skip_semantic:
+        _write_semantic_cache(persist_path, {"version": 1, "entries": {}})
+        semantic_stats = {
+            "enabled": False,
+            "reason": "skipped_by_graph" if skip_graph else "skipped_by_env",
+            "api_calls": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "concept_count": 0,
+            "decision_count": 0,
+        }
+    else:
+        semantic_sections, semantic_stats = _extract_semantic_sections(
+            indexed_files=indexed_files,
+            persist_path=persist_path,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+        )
     manifest["semantic_graph_stats"] = semantic_stats
 
-    entity_graph = _build_entity_graph(
-        indexed_files,
-        document_graph=document_graph,
-        semantic_sections=semantic_sections,
-    )
+    if skip_graph:
+        entity_graph = _build_file_only_entity_graph(file_sources, document_graph)
+    else:
+        entity_graph = _build_entity_graph(
+            indexed_files,
+            document_graph=document_graph,
+            semantic_sections=semantic_sections,
+        )
     entity_graph = _merge_query_notes_into_entity_graph(
         entity_graph,
         _load_query_note_records(persist_path),
@@ -3700,7 +4223,6 @@ def _write_index_artifacts(
         encoding="utf-8",
     )
 
-    file_sources = [_normalize_source_path(indexed.rel_path) for indexed in indexed_files]
     community_index = _build_community_index(
         file_sources=file_sources,
         document_graph=document_graph,
@@ -3800,6 +4322,276 @@ def refresh_query_note_graph_artifacts(persist_path: Path) -> None:
     )
 
 
+def _iter_document_batches(documents: Iterable[Document], batch_size: int) -> Iterable[list[Document]]:
+    batch: list[Document] = []
+    for document in documents:
+        batch.append(document)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _document_batch_ids(batch: list[Document]) -> list[str] | None:
+    ids = [getattr(document, "id", None) for document in batch]
+    if any(ids):
+        return [str(doc_id or "") for doc_id in ids]
+    return None
+
+
+def _embed_texts_with_retries(
+    *,
+    texts: list[str],
+    embeddings_factory: Callable[[], OpenAIEmbeddings],
+    max_retries: int,
+    retry_base_seconds: float,
+    rate_limit_callback: Callable[[float, int, int], None] | None = None,
+) -> list[list[float]]:
+    for attempt in range(max_retries + 1):
+        try:
+            return embeddings_factory().embed_documents(texts)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                raise
+            delay = retry_base_seconds * (2**attempt)
+            if rate_limit_callback is not None:
+                rate_limit_callback(delay, attempt + 1, max_retries)
+            time.sleep(delay)
+    raise RuntimeError("embedding 批处理在重试后仍未成功。")
+
+
+def _add_embedded_batch(
+    *,
+    batch: list[Document],
+    embedded_texts: list[list[float]],
+    embeddings: OpenAIEmbeddings,
+    vectorstore: FAISS | None,
+) -> FAISS:
+    texts = [document.page_content for document in batch]
+    metadatas = [document.metadata for document in batch]
+    ids = _document_batch_ids(batch)
+    text_embeddings = zip(texts, embedded_texts)
+    if vectorstore is None:
+        # 兼容测试 / 外部插件把模块级 `FAISS` 替换成极简假对象的场景。
+        if not hasattr(FAISS, "from_embeddings"):
+            return FAISS.from_documents(batch, embeddings)
+        return FAISS.from_embeddings(
+            text_embeddings,
+            embeddings,
+            metadatas=metadatas,
+            ids=ids,
+        )
+    # 同上：若外部替换了 `FAISS` 实现，只退回到旧的 document-based 接口。
+    if not hasattr(vectorstore, "add_embeddings"):
+        vectorstore.add_documents(batch)
+        return vectorstore
+    vectorstore.add_embeddings(
+        text_embeddings,
+        metadatas=metadatas,
+        ids=ids,
+    )
+    return vectorstore
+
+
+def _build_vectorstore_from_document_stream(
+    *,
+    indexed_files: list[IndexedFile],
+    documents: Iterable[Document],
+    total_chunks: int,
+    md_dir: str,
+    embed_api_key: str,
+    embed_base_url: str,
+    embed_model: str,
+    persist_dir: str,
+    staged_normalized_dir: Path | None,
+    progress_callback: Callable[[int, int, str], None] | None,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: str,
+) -> SearchBundle:
+    def _cb(current: int, total: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(current, total, message)
+
+    if total_chunks == 0:
+        raise ValueError(
+            f"在 {md_dir} 中未找到可索引文本。支持后缀: {', '.join(sorted(SUPPORTED_TEXT_SUFFIXES))}"
+        )
+
+    _cb(0, total_chunks + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total_chunks} 个分片。")
+    embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
+
+    batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))))
+    # 默认不做固定节流；仅在真正触发限流时才指数退避，避免大语料重建被 sleep 吞掉数小时。
+    batch_sleep_seconds = max(
+        0.0,
+        float(os.getenv("EMBED_BATCH_SLEEP_SECONDS", str(DEFAULT_EMBED_BATCH_SLEEP_SECONDS))),
+    )
+    embed_concurrency = max(1, int(os.getenv("EMBED_CONCURRENCY", "1")))
+    max_retries = max(0, int(os.getenv("EMBED_MAX_RETRIES", "8")))
+    retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
+
+    vectorstore: FAISS | None = None
+    total_steps = total_chunks + 4
+    processed_chunks = 0
+    rate_limit_events: Queue[str] = Queue()
+
+    def _emit_rate_limit_event(delay: float, attempt: int, retry_limit: int) -> None:
+        message = f"触发 embedding 限流，{delay:.1f}s 后重试第 {attempt}/{retry_limit} 次..."
+        if embed_concurrency <= 1:
+            _cb(processed_chunks, total_steps, message)
+            return
+        rate_limit_events.put(message)
+
+    def _drain_rate_limit_events() -> None:
+        while True:
+            try:
+                message = rate_limit_events.get_nowait()
+            except Empty:
+                break
+            _cb(processed_chunks, total_steps, message)
+
+    if embed_concurrency <= 1:
+        for batch in _iter_document_batches(documents, batch_size):
+            embedded_texts = _embed_texts_with_retries(
+                texts=[document.page_content for document in batch],
+                embeddings_factory=lambda: embeddings,
+                max_retries=max_retries,
+                retry_base_seconds=retry_base_seconds,
+                rate_limit_callback=_emit_rate_limit_event,
+            )
+            vectorstore = _add_embedded_batch(
+                batch=batch,
+                embedded_texts=embedded_texts,
+                embeddings=embeddings,
+                vectorstore=vectorstore,
+            )
+            processed_chunks += len(batch)
+            _cb(processed_chunks, total_steps, f"向量化中 {processed_chunks}/{total_chunks}...")
+            if batch_sleep_seconds > 0 and processed_chunks < total_chunks:
+                time.sleep(batch_sleep_seconds)
+    else:
+        worker_state = local()
+        if batch_sleep_seconds > 0:
+            _cb(
+                processed_chunks,
+                total_steps,
+                "EMBED_BATCH_SLEEP_SECONDS 仅在串行 embedding 下生效；并发模式下已忽略。",
+            )
+
+        def _worker_embeddings() -> OpenAIEmbeddings:
+            client = getattr(worker_state, "client", None)
+            if client is None:
+                client = make_embeddings(
+                    api_key=embed_api_key,
+                    base_url=embed_base_url,
+                    model=embed_model,
+                )
+                worker_state.client = client
+            return client
+
+        def _submit_embed_batch(
+            executor: ThreadPoolExecutor,
+            pending: dict[int, tuple[list[Document], Future[list[list[float]]]]],
+            batch_iter: Iterable[list[Document]],
+            seq: int,
+        ) -> tuple[bool, int]:
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                return False, seq
+            pending[seq] = (
+                batch,
+                executor.submit(
+                    _embed_texts_with_retries,
+                    texts=[document.page_content for document in batch],
+                    embeddings_factory=_worker_embeddings,
+                    max_retries=max_retries,
+                    retry_base_seconds=retry_base_seconds,
+                    rate_limit_callback=_emit_rate_limit_event,
+                ),
+            )
+            return True, seq + 1
+
+        batch_iter = iter(_iter_document_batches(documents, batch_size))
+        pending: dict[int, tuple[list[Document], Future[list[list[float]]]]] = {}
+        next_seq = 0
+        expected_seq = 0
+        with ThreadPoolExecutor(max_workers=embed_concurrency) as executor:
+            while len(pending) < embed_concurrency:
+                submitted, next_seq = _submit_embed_batch(executor, pending, batch_iter, next_seq)
+                if not submitted:
+                    break
+
+            while pending:
+                batch, future = pending.pop(expected_seq)
+                while True:
+                    try:
+                        embedded_texts = future.result(timeout=0.1)
+                        break
+                    except FutureTimeoutError:
+                        _drain_rate_limit_events()
+                _drain_rate_limit_events()
+                vectorstore = _add_embedded_batch(
+                    batch=batch,
+                    embedded_texts=embedded_texts,
+                    embeddings=embeddings,
+                    vectorstore=vectorstore,
+                )
+                processed_chunks += len(batch)
+                _cb(processed_chunks, total_steps, f"向量化中 {processed_chunks}/{total_chunks}...")
+                expected_seq += 1
+
+                while len(pending) < embed_concurrency:
+                    submitted, next_seq = _submit_embed_batch(executor, pending, batch_iter, next_seq)
+                    if not submitted:
+                        break
+
+    if vectorstore is None:
+        raise RuntimeError("未生成任何向量分片。")
+
+    persist_path = Path(persist_dir)
+    persist_path.mkdir(parents=True, exist_ok=True)
+    vectorstore.save_local(str(persist_path))
+    _cb(total_chunks + 1, total_steps, "正在写入检索辅助索引...")
+
+    manifest = _write_index_artifacts(
+        persist_path=persist_path,
+        indexed_files=indexed_files,
+        embed_model=embed_model,
+        source_dir=md_dir,
+        total_chunks=total_chunks,
+        staged_normalized_dir=staged_normalized_dir,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
+    if manifest.get("build_flags", {}).get("skip_wiki"):
+        _clear_generated_wiki_artifacts(persist_path)
+        _cb(total_chunks + 2, total_steps, "已按配置跳过离线 wiki 生成。")
+    else:
+        _cb(total_chunks + 2, total_steps, "正在生成离线 wiki 导航...")
+        from wiki import generate_wiki
+
+        generate_wiki(persist_path=persist_path, manifest=manifest)
+    _read_cached_text.cache_clear()
+    _cb(total_chunks + 3, total_steps, "正在加载检索 bundle...")
+
+    bundle = load_search_bundle(
+        embed_api_key=embed_api_key,
+        embed_base_url=embed_base_url,
+        embed_model=embed_model,
+        persist_dir=persist_dir,
+    )
+    if bundle is None:
+        raise RuntimeError("索引文件写入成功，但 SearchBundle 回读失败。")
+
+    _cb(total_chunks + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
+    bundle.manifest = manifest
+    return bundle
+
+
 def build_vectorstore(
     md_dir: str,
     embed_api_key: str,
@@ -3820,86 +4612,45 @@ def build_vectorstore(
             progress_callback(current, total, message)
 
     _cb(0, 1, "正在扫描目录并解析文本文件...")
-    documents, indexed_files = _build_documents(md_dir)
-    total = len(documents)
-
-    if total == 0:
-        raise ValueError(
-            f"在 {md_dir} 中未找到可索引文本。支持后缀: {', '.join(sorted(SUPPORTED_TEXT_SUFFIXES))}"
+    # 仅兼容外部测试 / 插件 monkeypatch `_build_documents` 的旧入口。
+    if _build_documents is not _ORIGINAL_BUILD_DOCUMENTS:
+        documents, indexed_files = _build_documents(md_dir)
+        return _build_vectorstore_from_document_stream(
+            indexed_files=indexed_files,
+            documents=documents,
+            total_chunks=len(documents),
+            md_dir=md_dir,
+            embed_api_key=embed_api_key,
+            embed_base_url=embed_base_url,
+            embed_model=embed_model,
+            persist_dir=persist_dir,
+            staged_normalized_dir=None,
+            progress_callback=progress_callback,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
         )
-
-    _cb(0, total + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total} 个分片。")
-    embeddings = make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
-
-    batch_size = max(1, int(os.getenv("EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))))
-    # 默认不做固定节流；仅在真正触发限流时才指数退避，避免大语料重建被 sleep 吞掉数小时。
-    batch_sleep_seconds = max(
-        0.0,
-        float(os.getenv("EMBED_BATCH_SLEEP_SECONDS", str(DEFAULT_EMBED_BATCH_SLEEP_SECONDS))),
-    )
-    max_retries = max(0, int(os.getenv("EMBED_MAX_RETRIES", "8")))
-    retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
-
-    vectorstore: FAISS | None = None
-    total_steps = total + 4
-    for i in range(0, total, batch_size):
-        batch = documents[i : i + batch_size]
-        for attempt in range(max_retries + 1):
-            try:
-                if vectorstore is None:
-                    vectorstore = FAISS.from_documents(batch, embeddings)
-                else:
-                    vectorstore.add_documents(batch)
-                break
-            except Exception as exc:
-                if not _is_rate_limit_error(exc) or attempt >= max_retries:
-                    raise
-                delay = retry_base_seconds * (2**attempt)
-                _cb(
-                    i,
-                    total_steps,
-                    f"触发 embedding 限流，{delay:.1f}s 后重试第 {attempt + 1}/{max_retries} 次...",
-                )
-                time.sleep(delay)
-        done = min(i + batch_size, total)
-        _cb(done, total_steps, f"向量化中 {done}/{total}...")
-        if batch_sleep_seconds > 0 and done < total:
-            time.sleep(batch_sleep_seconds)
 
     persist_path = Path(persist_dir)
     persist_path.mkdir(parents=True, exist_ok=True)
-    vectorstore.save_local(str(persist_path))  # type: ignore[union-attr]
-    _cb(total + 1, total_steps, "正在写入检索辅助索引...")
-
-    manifest = _write_index_artifacts(
-        persist_path=persist_path,
-        indexed_files=indexed_files,
-        embed_model=embed_model,
-        source_dir=md_dir,
-        total_chunks=total,
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-    )
-    _cb(total + 2, total_steps, "正在生成离线 wiki 导航...")
-    from wiki import generate_wiki
-
-    generate_wiki(persist_path=persist_path, manifest=manifest)
-    _read_cached_text.cache_clear()
-    _cb(total + 3, total_steps, "正在加载检索 bundle...")
-
-    bundle = load_search_bundle(
-        embed_api_key=embed_api_key,
-        embed_base_url=embed_base_url,
-        embed_model=embed_model,
-        persist_dir=persist_dir,
-    )
-    if bundle is None:
-        raise RuntimeError("索引文件写入成功，但 SearchBundle 回读失败。")
-
-    _cb(total + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
-    bundle.manifest = manifest
-    return bundle
+    with tempfile.TemporaryDirectory(prefix=".opencortex-build-", dir=str(persist_path)) as tmpdir:
+        cache_root = Path(tmpdir) / NORMALIZED_TEXT_DIRNAME
+        indexed_files, total_chunks = _index_source_files(md_dir, cache_root)
+        return _build_vectorstore_from_document_stream(
+            indexed_files=indexed_files,
+            documents=_iter_documents_for_indexed_files(indexed_files),
+            total_chunks=total_chunks,
+            md_dir=md_dir,
+            embed_api_key=embed_api_key,
+            embed_base_url=embed_base_url,
+            embed_model=embed_model,
+            persist_dir=persist_dir,
+            staged_normalized_dir=cache_root,
+            progress_callback=progress_callback,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+        )
 
 
 def load_search_bundle(
@@ -4159,6 +4910,27 @@ def _bundle_sources(
     return results
 
 
+def _has_supported_file_suffix(token: str) -> bool:
+    clean = str(token).strip().lower()
+    return any(clean.endswith(suffix) and len(clean) > len(suffix) for suffix in SUPPORTED_TEXT_SUFFIXES)
+
+
+def _looks_like_explicit_source_term(token: str) -> bool:
+    clean = str(token).strip()
+    if not clean:
+        return False
+    if "*" in clean or "/" in clean or "\\" in clean:
+        return True
+    if clean.startswith(".") and clean.count(".") == 1 and len(clean) <= 8:
+        return True
+    return _has_supported_file_suffix(clean)
+
+
+def _is_extension_only_glob(pattern: str) -> bool:
+    stripped = str(pattern).strip().strip("*")
+    return stripped.startswith(".") and stripped.count(".") == 1 and "/" not in stripped and "\\" not in stripped
+
+
 def _extract_query_plan(question: str) -> QueryPlan:
     quoted = re.findall(r"`([^`]+)`", question)
     quoted += re.findall(r'"([^"]+)"', question)
@@ -4179,13 +4951,11 @@ def _extract_query_plan(question: str) -> QueryPlan:
         clean = token.strip().strip(".,:;!?()[]{}")
         if not clean:
             continue
-        has_supported_suffix = any(
-            clean.lower().endswith(suffix) and len(clean) > len(suffix) for suffix in SUPPORTED_TEXT_SUFFIXES
-        )
+        has_supported_suffix = _has_supported_file_suffix(clean)
         if clean.lower() not in _EXTENSION_ALIASES:
             keywords.append(clean)
 
-        if PATHISH_RE.fullmatch(clean) or has_supported_suffix or "/" in clean or "*" in clean:
+        if _looks_like_explicit_source_term(clean):
             if clean.startswith(".") and clean.count(".") == 1 and "/" not in clean:
                 path_globs.append(f"*{clean}")
             elif "*" in clean:
@@ -4910,18 +5680,15 @@ def _wiki_source_ref_matches_query(source: str, query_plan: QueryPlan) -> bool:
     specific_terms = _dedupe_strings(
         term.lower()
         for term in [*query_plan.keywords, *query_plan.symbols]
-        if isinstance(term, str) and term.strip() and any(marker in term for marker in (".", "/", "\\"))
+        if isinstance(term, str) and _looks_like_explicit_source_term(term)
     )
     specific_patterns = _dedupe_strings(
         pattern.lower()
         for pattern in query_plan.path_globs
         if isinstance(pattern, str)
         and pattern.strip()
-        and not (
-            pattern.strip("*").startswith(".")
-            and pattern.strip("*").count(".") == 1
-            and "/" not in pattern.strip("*")
-        )
+        and not _is_extension_only_glob(pattern)
+        and _looks_like_explicit_source_term(pattern.strip("*"))
     )
     if not specific_terms and not specific_patterns:
         return True
