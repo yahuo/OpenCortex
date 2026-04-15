@@ -34,13 +34,8 @@ from ragbot_artifacts import (
     source_snapshot_from_indexed_files,
 )
 from ragbot_build import (
-    _add_embedded_batch,
     _build_document_graph,
-    _build_vectorstore_from_document_stream,
     _clear_generated_wiki_artifacts,
-    _document_batch_ids,
-    _embed_texts_with_retries,
-    _iter_document_batches,
     _write_index_artifacts,
     build_vectorstore,
 )
@@ -71,6 +66,13 @@ from ragbot_sources import (
     _iter_documents_for_indexed_files,
     _iter_supported_files,
     _should_ignore_relative_path,
+)
+from ragbot_pipeline import (
+    _add_embedded_batch,
+    _build_vectorstore_from_document_stream,
+    _document_batch_ids,
+    _embed_texts_with_retries,
+    _iter_document_batches,
 )
 from ragbot_graph import (
     _build_community_index,
