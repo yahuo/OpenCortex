@@ -5,7 +5,7 @@ import os
 from queue import Empty, Queue
 from threading import local
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
@@ -111,6 +111,19 @@ def _build_vectorstore_from_document_stream(
 ) -> SearchBundle:
     core = _core()
 
+    skip_graph = core._env_flag("SKIP_GRAPH")
+    skip_semantic = skip_graph or core._env_flag("SKIP_SEMANTIC")
+    semantic_enabled = False
+    if not skip_semantic:
+        semantic_enabled, _semantic_reason = core._semantic_graph_enabled(
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+        )
+    semantic_section_total = total_chunks if semantic_enabled else 0
+
+    total_steps = total_chunks + semantic_section_total + 4
+
     def _cb(current: int, total: int, message: str) -> None:
         if progress_callback:
             progress_callback(current, total, message)
@@ -120,7 +133,7 @@ def _build_vectorstore_from_document_stream(
             f"在 {md_dir} 中未找到可索引文本。支持后缀: {', '.join(sorted(core.SUPPORTED_TEXT_SUFFIXES))}"
         )
 
-    _cb(0, total_chunks + 4, f"解析完毕，共 {len(indexed_files)} 个文件，{total_chunks} 个分片。")
+    _cb(0, total_steps, f"解析完毕，共 {len(indexed_files)} 个文件，{total_chunks} 个分片。")
     truncated_files = [indexed for indexed in indexed_files if indexed.truncated]
     if truncated_files:
         preview = "；".join(
@@ -129,7 +142,7 @@ def _build_vectorstore_from_document_stream(
         )
         _cb(
             0,
-            total_chunks + 4,
+            total_steps,
             f"注意：{len(truncated_files)} 个文件因 MAX_CHUNKS_PER_FILE 被截断。{preview}",
         )
     embeddings = core.make_embeddings(api_key=embed_api_key, base_url=embed_base_url, model=embed_model)
@@ -144,7 +157,6 @@ def _build_vectorstore_from_document_stream(
     retry_base_seconds = max(0.5, float(os.getenv("EMBED_RETRY_BASE_SECONDS", "5")))
 
     vectorstore: FAISS | None = None
-    total_steps = total_chunks + 4
     processed_chunks = 0
     rate_limit_events: Queue[str] = Queue()
 
@@ -278,17 +290,26 @@ def _build_vectorstore_from_document_stream(
         llm_api_key=llm_api_key,
         llm_model=llm_model,
         llm_base_url=llm_base_url,
+        semantic_progress_callback=(
+            lambda processed, total, message: _cb(
+                total_chunks + 1 + processed,
+                total_steps,
+                message,
+            )
+        )
+        if semantic_section_total > 0
+        else None,
     )
     if manifest.get("build_flags", {}).get("skip_wiki"):
         core._clear_generated_wiki_artifacts(persist_path)
-        _cb(total_chunks + 2, total_steps, "已按配置跳过离线 wiki 生成。")
+        _cb(total_chunks + semantic_section_total + 2, total_steps, "已按配置跳过离线 wiki 生成。")
     else:
-        _cb(total_chunks + 2, total_steps, "正在生成离线 wiki 导航...")
+        _cb(total_chunks + semantic_section_total + 2, total_steps, "正在生成离线 wiki 导航...")
         from wiki import generate_wiki
 
         generate_wiki(persist_path=persist_path, manifest=manifest)
     core._read_cached_text.cache_clear()
-    _cb(total_chunks + 3, total_steps, "正在加载检索 bundle...")
+    _cb(total_chunks + semantic_section_total + 3, total_steps, "正在加载检索 bundle...")
 
     bundle = core.load_search_bundle(
         embed_api_key=embed_api_key,
@@ -299,6 +320,6 @@ def _build_vectorstore_from_document_stream(
     if bundle is None:
         raise RuntimeError("索引文件写入成功，但 SearchBundle 回读失败。")
 
-    _cb(total_chunks + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
+    _cb(total_chunks + semantic_section_total + 4, total_steps, f"✅ 索引构建完成，已保存到 {persist_dir}")
     bundle.manifest = manifest
     return bundle

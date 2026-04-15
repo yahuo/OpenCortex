@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
 import posixpath
 import re
+from threading import local
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
+
+from ragbot_artifacts import atomic_write_text
 
 if TYPE_CHECKING:
     from ragbot import IndexedFile
@@ -208,9 +212,23 @@ def _load_semantic_cache(persist_path: Path) -> dict[str, Any]:
 
 
 def _write_semantic_cache(persist_path: Path, cache_payload: dict[str, Any]) -> None:
-    _semantic_cache_path(persist_path).write_text(
+    atomic_write_text(
+        _semantic_cache_path(persist_path),
         json.dumps(cache_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    )
+
+
+def _semantic_cache_key(section: dict[str, Any]) -> str:
+    core = _core()
+    return core._entity_section_node_id(str(section["source"]), int(section["chunk_index"]))
+
+
+def _semantic_progress_message(processed: int, total: int, stats: dict[str, Any]) -> str:
+    return (
+        f"语义抽取中 {processed}/{total}"
+        f"（缓存 {int(stats.get('cached_sections') or 0)}"
+        f" / 新抽取 {int(stats.get('extracted_sections') or 0)}"
+        f" / 失败 {int(stats.get('failed_sections') or 0)}）..."
     )
 
 
@@ -406,6 +424,8 @@ def _extract_semantic_sections(
     llm_api_key: str,
     llm_model: str,
     llm_base_url: str,
+    sections: list[dict[str, Any]] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     core = _core()
     normalized_llm_base_url = llm_base_url.strip().rstrip("/")
@@ -428,39 +448,149 @@ def _extract_semantic_sections(
         "completion_tokens": 0,
         "total_tokens": 0,
         "duration_seconds": 0.0,
+        "concurrency": 1,
+        "cache_flushes": 0,
     }
-    sections = _iter_semantic_sections(indexed_files)
+    sections = _iter_semantic_sections(indexed_files) if sections is None else sections
     stats["sections_total"] = len(sections)
     if not enabled:
         return [], stats
 
     started = time.perf_counter()
-    llm = core.make_llm(
-        api_key=llm_api_key,
-        model=llm_model,
-        base_url=llm_base_url,
-        temperature=0.0,
-    )
     cache = _load_semantic_cache(persist_path)
     previous_entries = cache.get("entries", {})
     if not isinstance(previous_entries, dict):
         previous_entries = {}
-    next_entries: dict[str, Any] = {}
-    extracted_sections: list[dict[str, Any]] = []
-
-    for section in sections:
-        cache_key = core._entity_section_node_id(str(section["source"]), int(section["chunk_index"]))
-        fingerprint = _semantic_section_fingerprint(
-            source=str(section["source"]),
-            chunk_index=int(section["chunk_index"]),
-            text=str(section["text"]),
-            llm_model=llm_model,
-            llm_base_url=normalized_llm_base_url,
+    section_payloads: list[dict[str, Any]] = [
+        {"concepts": [], "decisions": []} for _ in sections
+    ]
+    section_specs: list[dict[str, Any]] = []
+    current_keys: set[str] = set()
+    for index, section in enumerate(sections):
+        cache_key = _semantic_cache_key(section)
+        current_keys.add(cache_key)
+        section_specs.append(
+            {
+                "index": index,
+                "section": section,
+                "cache_key": cache_key,
+                "fingerprint": _semantic_section_fingerprint(
+                    source=str(section["source"]),
+                    chunk_index=int(section["chunk_index"]),
+                    text=str(section["text"]),
+                    llm_model=llm_model,
+                    llm_base_url=normalized_llm_base_url,
+                ),
+            }
         )
+
+    next_entries: dict[str, Any] = {
+        key: value
+        for key, value in previous_entries.items()
+        if key in current_keys and isinstance(value, dict)
+    }
+    processed_sections = 0
+    cache_flush_interval = max(1, int(os.getenv("SEMANTIC_CACHE_FLUSH_INTERVAL", "25")))
+    progress_interval = max(1, int(os.getenv("SEMANTIC_PROGRESS_INTERVAL", "10")))
+    last_progress_at = 0.0
+    dirty_cache = False
+
+    def persist_cache(force: bool = False) -> None:
+        nonlocal dirty_cache
+        if not dirty_cache:
+            return
+        _write_semantic_cache(
+            persist_path,
+            {
+                "version": 1,
+                "prompt_version": core.SEMANTIC_PROMPT_VERSION,
+                "llm_model": llm_model,
+                "llm_base_url": normalized_llm_base_url,
+                "entries": next_entries,
+            },
+        )
+        stats["cache_flushes"] += 1
+        dirty_cache = False
+
+    def emit_progress(force: bool = False) -> None:
+        nonlocal last_progress_at
+        if progress_callback is None or not sections:
+            return
+        now = time.perf_counter()
+        if not force:
+            if processed_sections == 0:
+                return
+            if processed_sections < len(sections):
+                if processed_sections % progress_interval != 0 and now - last_progress_at < 0.5:
+                    return
+        progress_callback(
+            processed_sections,
+            len(sections),
+            _semantic_progress_message(processed_sections, len(sections), stats),
+        )
+        last_progress_at = now
+
+    emit_progress(force=True)
+
+    def record_result(
+        *,
+        index: int,
+        cache_key: str,
+        fingerprint: str,
+        payload: dict[str, Any],
+        usage: dict[str, int] | None = None,
+        error: str | None = None,
+        cached_entry: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal processed_sections, dirty_cache
+        normalized_payload = payload if isinstance(payload, dict) else {"concepts": [], "decisions": []}
+        section_payloads[index] = normalized_payload
+        if cached_entry is not None:
+            stats["cached_sections"] += 1
+            next_entries[cache_key] = cached_entry
+        elif error is None:
+            usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            stats["api_calls"] += 1
+            stats["extracted_sections"] += 1
+            stats["prompt_tokens"] += usage["prompt_tokens"]
+            stats["completion_tokens"] += usage["completion_tokens"]
+            stats["total_tokens"] += usage["total_tokens"]
+            next_entries[cache_key] = {
+                "status": "ok",
+                "fingerprint": fingerprint,
+                "prompt_version": core.SEMANTIC_PROMPT_VERSION,
+                "llm_model": llm_model,
+                "llm_base_url": normalized_llm_base_url,
+                "payload": normalized_payload,
+                "usage": usage,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            dirty_cache = True
+        else:
+            stats["failed_sections"] += 1
+            next_entries[cache_key] = {
+                "status": "error",
+                "fingerprint": fingerprint,
+                "prompt_version": core.SEMANTIC_PROMPT_VERSION,
+                "llm_model": llm_model,
+                "llm_base_url": normalized_llm_base_url,
+                "payload": normalized_payload,
+                "error": error,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            dirty_cache = True
+        processed_sections += 1
+        if dirty_cache and processed_sections % cache_flush_interval == 0:
+            persist_cache()
+        emit_progress()
+
+    misses: list[dict[str, Any]] = []
+    for spec in section_specs:
+        cache_key = str(spec["cache_key"])
         cached_entry = previous_entries.get(cache_key)
         if (
             isinstance(cached_entry, dict)
-            and cached_entry.get("fingerprint") == fingerprint
+            and cached_entry.get("fingerprint") == spec["fingerprint"]
             and cached_entry.get("prompt_version") == core.SEMANTIC_PROMPT_VERSION
             and cached_entry.get("llm_model") == llm_model
             and str(cached_entry.get("llm_base_url", "") or "") == normalized_llm_base_url
@@ -469,41 +599,104 @@ def _extract_semantic_sections(
             payload = cached_entry.get("payload", {})
             if not isinstance(payload, dict):
                 payload = {"concepts": [], "decisions": []}
-            stats["cached_sections"] += 1
-            next_entries[cache_key] = cached_entry
+            record_result(
+                index=int(spec["index"]),
+                cache_key=cache_key,
+                fingerprint=str(spec["fingerprint"]),
+                payload=payload,
+                cached_entry=cached_entry,
+            )
         else:
-            try:
-                response = llm.invoke(_semantic_extraction_prompt(section))
-                payload = _parse_semantic_payload(core._chunk_to_text(response))
-                usage = _response_token_usage(response)
-                stats["api_calls"] += 1
-                stats["extracted_sections"] += 1
-                stats["prompt_tokens"] += usage["prompt_tokens"]
-                stats["completion_tokens"] += usage["completion_tokens"]
-                stats["total_tokens"] += usage["total_tokens"]
-                next_entries[cache_key] = {
-                    "status": "ok",
-                    "fingerprint": fingerprint,
-                    "prompt_version": core.SEMANTIC_PROMPT_VERSION,
-                    "llm_model": llm_model,
-                    "llm_base_url": normalized_llm_base_url,
-                    "payload": payload,
-                    "usage": usage,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+            misses.append(spec)
+
+    semantic_concurrency = max(1, int(os.getenv("SEMANTIC_CONCURRENCY", "1")))
+    if misses:
+        if semantic_concurrency <= 1:
+            stats["concurrency"] = 1
+            llm = core.make_llm(
+                api_key=llm_api_key,
+                model=llm_model,
+                base_url=llm_base_url,
+                temperature=0.0,
+            )
+            for spec in misses:
+                try:
+                    response = llm.invoke(_semantic_extraction_prompt(spec["section"]))
+                    payload = _parse_semantic_payload(core._chunk_to_text(response))
+                    usage = _response_token_usage(response)
+                    record_result(
+                        index=int(spec["index"]),
+                        cache_key=str(spec["cache_key"]),
+                        fingerprint=str(spec["fingerprint"]),
+                        payload=payload,
+                        usage=usage,
+                    )
+                except Exception as exc:
+                    record_result(
+                        index=int(spec["index"]),
+                        cache_key=str(spec["cache_key"]),
+                        fingerprint=str(spec["fingerprint"]),
+                        payload={"concepts": [], "decisions": []},
+                        error=str(exc),
+                    )
+        else:
+            worker_state = local()
+            stats["concurrency"] = min(semantic_concurrency, len(misses))
+
+            def worker_llm() -> Any:
+                client = getattr(worker_state, "client", None)
+                if client is None:
+                    client = core.make_llm(
+                        api_key=llm_api_key,
+                        model=llm_model,
+                        base_url=llm_base_url,
+                        temperature=0.0,
+                    )
+                    worker_state.client = client
+                return client
+
+            def extract_one(spec: dict[str, Any]) -> dict[str, Any]:
+                try:
+                    response = worker_llm().invoke(_semantic_extraction_prompt(spec["section"]))
+                    return {
+                        "index": int(spec["index"]),
+                        "cache_key": str(spec["cache_key"]),
+                        "fingerprint": str(spec["fingerprint"]),
+                        "payload": _parse_semantic_payload(core._chunk_to_text(response)),
+                        "usage": _response_token_usage(response),
+                        "error": None,
+                    }
+                except Exception as exc:
+                    return {
+                        "index": int(spec["index"]),
+                        "cache_key": str(spec["cache_key"]),
+                        "fingerprint": str(spec["fingerprint"]),
+                        "payload": {"concepts": [], "decisions": []},
+                        "usage": None,
+                        "error": str(exc),
+                    }
+
+            with ThreadPoolExecutor(max_workers=stats["concurrency"]) as executor:
+                future_to_spec = {
+                    executor.submit(extract_one, spec): spec
+                    for spec in misses
                 }
-            except Exception as exc:
-                payload = {"concepts": [], "decisions": []}
-                stats["failed_sections"] += 1
-                next_entries[cache_key] = {
-                    "status": "error",
-                    "fingerprint": fingerprint,
-                    "prompt_version": core.SEMANTIC_PROMPT_VERSION,
-                    "llm_model": llm_model,
-                    "llm_base_url": normalized_llm_base_url,
-                    "payload": payload,
-                    "error": str(exc),
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                }
+                for future in as_completed(future_to_spec):
+                    result = future.result()
+                    record_result(
+                        index=int(result["index"]),
+                        cache_key=str(result["cache_key"]),
+                        fingerprint=str(result["fingerprint"]),
+                        payload=result["payload"],
+                        usage=result.get("usage"),
+                        error=result.get("error"),
+                    )
+
+    stats["duration_seconds"] = round(time.perf_counter() - started, 3)
+    persist_cache(force=True)
+    emit_progress(force=True)
+    extracted_sections: list[dict[str, Any]] = []
+    for section, payload in zip(sections, section_payloads):
         if payload.get("concepts") or payload.get("decisions"):
             extracted_sections.append(
                 {
@@ -515,18 +708,6 @@ def _extract_semantic_sections(
                     "payload": payload,
                 }
             )
-
-    stats["duration_seconds"] = round(time.perf_counter() - started, 3)
-    _write_semantic_cache(
-        persist_path,
-        {
-            "version": 1,
-            "prompt_version": core.SEMANTIC_PROMPT_VERSION,
-            "llm_model": llm_model,
-            "llm_base_url": normalized_llm_base_url,
-            "entries": next_entries,
-        },
-    )
     return extracted_sections, stats
 
 

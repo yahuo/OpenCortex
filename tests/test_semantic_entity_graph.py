@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 
 import ragbot
+import ragbot_semantic
 import wiki
 
 
@@ -73,6 +76,34 @@ class FakeSemanticLLM:
                 )
             )
         return FakeMessage(json.dumps({"concepts": [], "decisions": []}, ensure_ascii=False))
+
+
+class SlowConcurrentSemanticLLM(FakeSemanticLLM):
+    def __init__(
+        self,
+        call_log: list[str],
+        metrics: dict[str, int | threading.Lock],
+        delay_seconds: float = 0.05,
+    ):
+        super().__init__(call_log)
+        self.metrics = metrics
+        self.delay_seconds = delay_seconds
+
+    def invoke(self, prompt: str) -> FakeMessage:
+        lock = self.metrics["lock"]
+        assert not isinstance(lock, int)
+        with lock:
+            self.metrics["active"] = int(self.metrics["active"]) + 1
+            self.metrics["max_active"] = max(
+                int(self.metrics["max_active"]),
+                int(self.metrics["active"]),
+            )
+        try:
+            time.sleep(self.delay_seconds)
+            return super().invoke(prompt)
+        finally:
+            with lock:
+                self.metrics["active"] = int(self.metrics["active"]) - 1
 
 
 class SplitSemanticLLM:
@@ -423,6 +454,7 @@ def test_build_vectorstore_writes_semantic_cache_and_stats(tmp_path: Path, monke
     assert stats["enabled"] is True
     assert stats["api_calls"] > 0
     assert stats["total_tokens"] > 0
+    assert stats["concurrency"] == 1
     assert (index_dir / "semantic_extract_cache.json").exists()
 
     entity_graph = json.loads((index_dir / "entity_graph.json").read_text(encoding="utf-8"))
@@ -433,6 +465,36 @@ def test_build_vectorstore_writes_semantic_cache_and_stats(tmp_path: Path, monke
     assert "semantically_related" in edge_types
     assert "rationale_for" in edge_types
     assert llm_calls
+
+
+def test_semantic_progress_callback_reports_section_progress(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_semantic_corpus(docs_dir)
+    llm_calls: list[str] = []
+    progress_messages: list[str] = []
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(
+        ragbot,
+        "make_llm",
+        lambda *args, **kwargs: FakeSemanticLLM(llm_calls),
+    )
+
+    ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+        progress_callback=lambda _current, _total, message: progress_messages.append(message),
+    )
+
+    semantic_messages = [message for message in progress_messages if message.startswith("语义抽取中 ")]
+    assert semantic_messages
+    assert semantic_messages[0].startswith("语义抽取中 0/2")
+    assert semantic_messages[-1].startswith("语义抽取中 2/2")
 
 
 def test_semantic_cache_hits_on_rebuild(tmp_path: Path, monkeypatch) -> None:
@@ -470,6 +532,7 @@ def test_semantic_cache_hits_on_rebuild(tmp_path: Path, monkeypatch) -> None:
     second_stats = bundle.manifest["semantic_graph_stats"]
     assert second_stats["cached_sections"] > 0
     assert second_stats["api_calls"] == 0
+    assert second_stats["cache_flushes"] == 0
     assert len(llm_calls) == first_call_count
 
 
@@ -509,6 +572,80 @@ def test_semantic_cache_invalidates_when_base_url_changes(tmp_path: Path, monkey
     assert second_stats["cached_sections"] == 0
     assert second_stats["api_calls"] > 0
     assert len(llm_calls) > first_call_count
+
+
+def test_semantic_cache_flushes_incrementally(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_ambiguous_alias_semantic_corpus(docs_dir)
+    llm_calls: list[str] = []
+    write_calls: list[int] = []
+
+    monkeypatch.setenv("SEMANTIC_CACHE_FLUSH_INTERVAL", "1")
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(
+        ragbot,
+        "make_llm",
+        lambda *args, **kwargs: FakeSemanticLLM(llm_calls),
+    )
+
+    original_write_semantic_cache = ragbot_semantic._write_semantic_cache
+
+    def tracked_write_semantic_cache(persist_path: Path, cache_payload: dict[str, object]) -> None:
+        entries = cache_payload.get("entries", {})
+        assert isinstance(entries, dict)
+        write_calls.append(len(entries))
+        original_write_semantic_cache(persist_path, cache_payload)
+
+    monkeypatch.setattr(ragbot_semantic, "_write_semantic_cache", tracked_write_semantic_cache)
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    stats = bundle.manifest["semantic_graph_stats"]
+    assert write_calls == [1, 2, 3]
+    assert stats["cache_flushes"] == len(write_calls)
+    assert stats["api_calls"] == 3
+
+
+def test_semantic_extraction_uses_configured_concurrency(tmp_path: Path, monkeypatch) -> None:
+    docs_dir = tmp_path / "docs"
+    index_dir = tmp_path / "index"
+    _write_semantic_corpus(docs_dir)
+    llm_calls: list[str] = []
+    metrics: dict[str, int | threading.Lock] = {
+        "active": 0,
+        "max_active": 0,
+        "lock": threading.Lock(),
+    }
+
+    monkeypatch.setenv("SEMANTIC_CONCURRENCY", "2")
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+    monkeypatch.setattr(
+        ragbot,
+        "make_llm",
+        lambda *args, **kwargs: SlowConcurrentSemanticLLM(llm_calls, metrics),
+    )
+
+    bundle = ragbot.build_vectorstore(
+        md_dir=str(docs_dir),
+        embed_api_key="fake-embed-key",
+        persist_dir=str(index_dir),
+        llm_api_key="fake-llm-key",
+        llm_model="fake-semantic-model",
+        llm_base_url="https://example.com/v1",
+    )
+
+    stats = bundle.manifest["semantic_graph_stats"]
+    assert stats["concurrency"] == 2
+    assert int(metrics["max_active"]) >= 2
+    assert stats["api_calls"] == 2
 
 
 def test_semantic_entity_graph_expansion_adds_cross_file_candidate(tmp_path: Path, monkeypatch) -> None:

@@ -5,7 +5,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from ragbot_artifacts import (
     _source_snapshot_from_file_records,
@@ -49,6 +49,7 @@ def _write_index_artifacts(
     llm_api_key: str = "",
     llm_model: str = "",
     llm_base_url: str = "",
+    semantic_progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     core = _core()
     normalized_dir = persist_path / core.NORMALIZED_TEXT_DIRNAME
@@ -169,7 +170,7 @@ def _write_index_artifacts(
         encoding="utf-8",
     )
 
-    semantic_sections: list[dict[str, Any]] = []
+    extracted_semantic_sections: list[dict[str, Any]] = []
     if skip_semantic:
         core._write_semantic_cache(persist_path, {"version": 1, "entries": {}})
         semantic_stats = {
@@ -182,12 +183,13 @@ def _write_index_artifacts(
             "decision_count": 0,
         }
     else:
-        semantic_sections, semantic_stats = core._extract_semantic_sections(
+        extracted_semantic_sections, semantic_stats = core._extract_semantic_sections(
             indexed_files=indexed_files,
             persist_path=persist_path,
             llm_api_key=llm_api_key,
             llm_model=llm_model,
             llm_base_url=llm_base_url,
+            progress_callback=semantic_progress_callback,
         )
     manifest["semantic_graph_stats"] = semantic_stats
 
@@ -197,7 +199,7 @@ def _write_index_artifacts(
         entity_graph = core._build_entity_graph(
             indexed_files,
             document_graph=document_graph,
-            semantic_sections=semantic_sections,
+            semantic_sections=extracted_semantic_sections,
         )
     entity_graph = core._merge_query_notes_into_entity_graph(
         entity_graph,
