@@ -36,35 +36,41 @@ from ragbot_artifacts import (
 from ragbot_build import (
     _add_embedded_batch,
     _build_document_graph,
-    _build_documents,
     _build_vectorstore_from_document_stream,
-    _chunk_markdown_by_heading,
-    _chunks_for_indexed_text,
-    _chunk_python_code,
-    _chunk_structured_text,
     _clear_generated_wiki_artifacts,
-    _convert_binary_to_markdown,
     _document_batch_ids,
     _embed_texts_with_retries,
+    _iter_document_batches,
+    _write_index_artifacts,
+    build_vectorstore,
+)
+from ragbot_chunking import (
+    _chunk_markdown_by_heading,
+    _chunk_python_code,
+    _chunk_structured_text,
     _extract_python_symbols,
-    _index_source_files,
     _iter_chunk_specs_from_line_stream,
     _iter_chunks_from_cached_file,
-    _iter_document_batches,
-    _iter_documents_for_indexed_files,
     _iter_markdown_heading_chunks_from_file,
     _iter_text_file_lines,
     _iter_wechat_markdown_chunks_from_file,
-    _iter_supported_files,
+)
+from ragbot_ingest import (
+    _chunks_for_indexed_text,
+    _convert_binary_to_markdown,
     _normalized_cache_path,
     _normalize_structured_text,
     _prepare_indexed_content,
     _process_source_file,
     _process_source_file_to_cache,
     _read_source_text,
+)
+from ragbot_sources import (
+    _build_documents,
+    _index_source_files,
+    _iter_documents_for_indexed_files,
+    _iter_supported_files,
     _should_ignore_relative_path,
-    _write_index_artifacts,
-    build_vectorstore,
 )
 from ragbot_graph import (
     _build_community_index,
