@@ -34,9 +34,6 @@ from ragbot_artifacts import (
     source_snapshot_from_indexed_files,
 )
 from ragbot_build import (
-    _build_document_graph,
-    _clear_generated_wiki_artifacts,
-    _write_index_artifacts,
     build_vectorstore,
 )
 from ragbot_chunking import (
@@ -66,6 +63,11 @@ from ragbot_sources import (
     _iter_documents_for_indexed_files,
     _iter_supported_files,
     _should_ignore_relative_path,
+)
+from ragbot_docgraph import _build_document_graph
+from ragbot_index_artifacts import (
+    _clear_generated_wiki_artifacts,
+    _write_index_artifacts,
 )
 from ragbot_pipeline import (
     _add_embedded_batch,
