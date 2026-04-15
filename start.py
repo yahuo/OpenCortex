@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -12,17 +11,22 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from ragbot import (
-    FULLTEXT_INDEX_FILENAME,
-    build_vectorstore,
+from ragbot import build_vectorstore
+from ragbot_artifacts import (
+    BASE_RUNTIME_INDEX_ARTIFACTS,
+    compare_stored_source_snapshot,
     current_build_config_snapshot,
     current_build_snapshot,
     current_source_snapshot,
+    fulltext_index_path,
+    load_fulltext_index_payload,
+    load_index_manifest,
+    runtime_index_artifacts,
+    source_snapshot_file_state,
+    stored_build_config_snapshot,
 )
-from ragbot_runtime import load_fulltext_index_payload
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-BASE_RUNTIME_INDEX_ARTIFACTS = ("index.faiss", "index.pkl", "index_manifest.json")
 
 
 def read_runtime_config() -> dict[str, str]:
@@ -72,50 +76,21 @@ def validate_rebuild_runtime(cfg: dict[str, str]) -> None:
 
 
 def ensure_index_artifacts(cfg: dict[str, str]) -> None:
-    required = runtime_index_artifacts(cfg)
+    required = runtime_index_artifacts(cfg["persist_dir"])
     missing = [path.name for path in required if not path.exists()]
     if missing:
         raise ValueError(
             "缺少索引文件，请先执行 `python start.py --rebuild-only`："
             + ", ".join(missing)
         )
-    manifest = load_index_manifest(cfg)
+    manifest = load_index_manifest(cfg["persist_dir"])
     if manifest is None:
         raise ValueError("索引 manifest 无法解析，请先执行 `python start.py --rebuild-only`。")
     validate_fulltext_index_artifact(cfg, manifest=manifest)
 
 
-def load_index_manifest(cfg: dict[str, str]) -> dict | None:
-    manifest_path = Path(cfg["persist_dir"]) / "index_manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def runtime_index_artifacts(cfg: dict[str, str], manifest: dict | None = None) -> list[Path]:
-    persist_dir = Path(cfg["persist_dir"])
-    artifacts = [persist_dir / name for name in BASE_RUNTIME_INDEX_ARTIFACTS]
-    resolved_manifest = manifest if manifest is not None else load_index_manifest(cfg)
-    fulltext_relpath = FULLTEXT_INDEX_FILENAME
-    if isinstance(resolved_manifest, dict):
-        fulltext_relpath = str(
-            resolved_manifest.get("fulltext_index_file", FULLTEXT_INDEX_FILENAME)
-            or FULLTEXT_INDEX_FILENAME
-        )
-    artifacts.append(persist_dir / Path(fulltext_relpath))
-    return artifacts
-
-
-def fulltext_index_path(cfg: dict[str, str], manifest: dict | None = None) -> Path:
-    return runtime_index_artifacts(cfg, manifest=manifest)[-1]
-
-
 def validate_fulltext_index_artifact(cfg: dict[str, str], manifest: dict | None = None) -> None:
-    load_fulltext_index_payload(fulltext_index_path(cfg, manifest=manifest))
+    load_fulltext_index_payload(fulltext_index_path(cfg["persist_dir"], manifest=manifest))
 
 
 def build_config_snapshot(cfg: dict[str, str]) -> dict[str, object]:
@@ -129,111 +104,16 @@ def build_config_snapshot(cfg: dict[str, str]) -> dict[str, object]:
     )
 
 
-def stored_build_config_snapshot(
-    previous_snapshot: dict[str, object],
-    current_snapshot: dict[str, object],
-) -> dict[str, object]:
-    return {key: previous_snapshot.get(key) for key in current_snapshot}
-
-
-def compare_stored_source_snapshot(
-    source_dir: str,
-    source_snapshot: dict[str, object],
-) -> str:
-    root = Path(source_dir).expanduser()
-    raw_files = source_snapshot.get("files")
-    raw_dirs = source_snapshot.get("dirs")
-    if not isinstance(raw_files, list) or not isinstance(raw_dirs, list):
-        return "invalid"
-
-    dir_mismatch = False
-    for entry in raw_dirs:
-        if not isinstance(entry, dict):
-            return "invalid"
-        rel_dir = str(entry.get("path", "") or ".")
-        dir_path = root if rel_dir in {"", "."} else root / rel_dir
-        try:
-            stat = dir_path.stat()
-        except OSError:
-            return "changed"
-        try:
-            expected_mtime = int(entry.get("mtime_ns", 0) or 0)
-        except (TypeError, ValueError):
-            return "invalid"
-        if int(stat.st_mtime_ns) != expected_mtime:
-            dir_mismatch = True
-
-    for entry in raw_files:
-        if not isinstance(entry, dict):
-            return "invalid"
-        rel_path = str(entry.get("path", "") or "")
-        if not rel_path:
-            return "invalid"
-        file_path = root / rel_path
-        try:
-            stat = file_path.stat()
-        except OSError:
-            return "changed"
-        try:
-            expected_size = int(entry.get("size", 0) or 0)
-            expected_mtime = int(entry.get("mtime_ns", 0) or 0)
-        except (TypeError, ValueError):
-            return "invalid"
-        if int(stat.st_size) != expected_size or int(stat.st_mtime_ns) != expected_mtime:
-            return "changed"
-
-    return "dir_mismatch" if dir_mismatch else "match"
-
-
-def source_snapshot_file_state(
-    source_snapshot: dict[str, object],
-) -> dict[str, object] | None:
-    raw_files = source_snapshot.get("files")
-    if not isinstance(raw_files, list):
-        return None
-
-    files: list[dict[str, object]] = []
-    for entry in raw_files:
-        if not isinstance(entry, dict):
-            return None
-        rel_path = str(entry.get("path", "") or "")
-        if not rel_path:
-            return None
-        try:
-            size = int(entry.get("size", 0) or 0)
-            mtime_ns = int(entry.get("mtime_ns", 0) or 0)
-        except (TypeError, ValueError):
-            return None
-        files.append(
-            {
-                "path": rel_path,
-                "size": size,
-                "mtime_ns": mtime_ns,
-            }
-        )
-
-    try:
-        file_count = int(source_snapshot.get("file_count", len(files)) or len(files))
-    except (TypeError, ValueError):
-        return None
-
-    return {
-        "file_count": file_count,
-        "source_digest": str(source_snapshot.get("source_digest", "") or ""),
-        "files": files,
-    }
-
-
 def index_rebuild_state(cfg: dict[str, str]) -> tuple[bool, str]:
     persist_dir = Path(cfg["persist_dir"])
     required = [persist_dir / name for name in BASE_RUNTIME_INDEX_ARTIFACTS]
     if any(not path.exists() for path in required):
         return True, "missing_index"
 
-    manifest = load_index_manifest(cfg)
+    manifest = load_index_manifest(cfg["persist_dir"])
     if manifest is None:
         return True, "invalid_manifest"
-    required = runtime_index_artifacts(cfg, manifest=manifest)
+    required = runtime_index_artifacts(cfg["persist_dir"], manifest=manifest)
     if any(not path.exists() for path in required):
         return True, "missing_index"
     try:

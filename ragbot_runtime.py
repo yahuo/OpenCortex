@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from langchain_community.vectorstores import FAISS
+from ragbot_artifacts import load_fulltext_index_payload
 
 
 def _core():
@@ -61,23 +62,6 @@ def _runtime_wiki_artifact_paths(persist_path: Path) -> list[str]:
             continue
         paths.append(relative)
     return paths
-
-
-def load_fulltext_index_payload(fulltext_index_path: Path) -> dict[str, Any]:
-    if not fulltext_index_path.exists():
-        raise ValueError(f"缺少全文索引文件：{fulltext_index_path.name}")
-    try:
-        payload = json.loads(fulltext_index_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"全文索引文件损坏：{fulltext_index_path.name}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"全文索引格式无效：{fulltext_index_path.name}")
-
-    raw_chunks = payload.get("chunks")
-    raw_postings = payload.get("postings")
-    if not isinstance(raw_chunks, list) or not isinstance(raw_postings, dict):
-        raise ValueError(f"全文索引格式无效：{fulltext_index_path.name}")
-    return payload
 
 
 def search_bundle_artifact_signature(

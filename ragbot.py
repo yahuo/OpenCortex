@@ -27,6 +27,12 @@ from typing import Any, Callable, Iterable
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from ragbot_artifacts import (
+    current_build_config_snapshot,
+    current_build_snapshot,
+    current_source_snapshot,
+    source_snapshot_from_indexed_files,
+)
 from ragbot_build import (
     _add_embedded_batch,
     _build_document_graph,
@@ -58,11 +64,7 @@ from ragbot_build import (
     _read_source_text,
     _should_ignore_relative_path,
     _write_index_artifacts,
-    current_build_config_snapshot,
-    current_source_snapshot,
-    source_snapshot_from_indexed_files,
     build_vectorstore,
-    current_build_snapshot,
 )
 from ragbot_graph import (
     _build_community_index,

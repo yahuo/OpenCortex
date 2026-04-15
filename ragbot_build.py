@@ -4,7 +4,6 @@ import ast
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import configparser
 import fnmatch
-import hashlib
 import json
 import os
 from queue import Empty, Queue
@@ -21,6 +20,11 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
+from ragbot_artifacts import (
+    _source_snapshot_from_file_records,
+    atomic_write_text,
+    current_build_config_snapshot,
+)
 
 try:
     import yaml
@@ -75,212 +79,6 @@ def _should_ignore_relative_path(rel_path: Path, extra_patterns: list[str]) -> b
         if fnmatch.fnmatch(posix_path, pattern) or fnmatch.fnmatch(rel_path.name, pattern):
             return True
     return False
-
-
-def current_build_snapshot(
-    source_dir: str,
-    *,
-    embed_base_url: str,
-    embed_model: str,
-    llm_api_key: str = "",
-    llm_model: str = "",
-    llm_base_url: str = "",
-) -> dict[str, Any]:
-    snapshot = current_build_config_snapshot(
-        source_dir,
-        embed_base_url=embed_base_url,
-        embed_model=embed_model,
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-    )
-    source_snapshot = current_source_snapshot(source_dir)
-    snapshot.update(
-        {
-            "file_count": int(source_snapshot.get("file_count") or 0),
-            "source_digest": str(source_snapshot.get("source_digest", "") or ""),
-        }
-    )
-    return snapshot
-
-
-def current_build_config_snapshot(
-    source_dir: str,
-    *,
-    embed_base_url: str,
-    embed_model: str,
-    llm_api_key: str = "",
-    llm_model: str = "",
-    llm_base_url: str = "",
-) -> dict[str, Any]:
-    core = _core()
-    root = Path(source_dir).expanduser()
-    semantic_enabled, semantic_reason = core._semantic_graph_enabled(
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-    )
-    return {
-        "version": 1,
-        "source_dir": str(root),
-        "embed_model": embed_model.strip(),
-        "embed_base_url": embed_base_url.strip().rstrip("/"),
-        "llm_model": llm_model.strip(),
-        "llm_base_url": llm_base_url.strip().rstrip("/"),
-        "chunk_size": core._configured_chunk_size(),
-        "chunk_overlap_lines": core._configured_chunk_overlap_lines(),
-        "max_chunks_per_file": core._configured_max_chunks_per_file(),
-        "exclude_globs": sorted(core._load_extra_exclude_globs()),
-        "skip_graph": core._env_flag("SKIP_GRAPH"),
-        "skip_semantic": core._env_flag("SKIP_GRAPH") or core._env_flag("SKIP_SEMANTIC"),
-        "skip_wiki": core._env_flag("SKIP_WIKI"),
-        "semantic_graph_enabled": semantic_enabled,
-        "semantic_graph_reason": semantic_reason,
-    }
-
-
-def _source_snapshot_from_file_records(
-    source_dir: str,
-    file_records: Iterable[dict[str, int | str]],
-) -> dict[str, Any]:
-    core = _core()
-    root = Path(source_dir).expanduser()
-    digest = hashlib.sha256()
-    files: list[dict[str, Any]] = []
-    dir_paths: set[Path] = {Path(".")}
-
-    normalized_records: list[dict[str, Any]] = []
-    for record in file_records:
-        rel_path = core._normalize_source_path(str(record.get("path", "") or ""))
-        if not rel_path:
-            continue
-        try:
-            size = int(record.get("size", 0) or 0)
-            mtime_ns = int(record.get("mtime_ns", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        normalized_records.append(
-            {
-                "path": rel_path,
-                "size": size,
-                "mtime_ns": mtime_ns,
-            }
-        )
-
-    normalized_records.sort(key=lambda item: str(item["path"]))
-    for record in normalized_records:
-        rel_path = str(record["path"])
-        digest.update(rel_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["size"]).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(record["mtime_ns"]).encode("utf-8"))
-        digest.update(b"\0")
-        files.append(record)
-
-        parent = Path(rel_path).parent
-        while True:
-            normalized_parent = Path(".") if str(parent) in {"", "."} else parent
-            dir_paths.add(normalized_parent)
-            if normalized_parent == Path("."):
-                break
-            parent = normalized_parent.parent
-
-    dirs: list[dict[str, Any]] = []
-    for rel_dir in sorted(dir_paths, key=lambda path: path.as_posix()):
-        dir_path = root if rel_dir == Path(".") else root / rel_dir
-        try:
-            stat = dir_path.stat()
-        except OSError:
-            continue
-        rel_dir_text = "." if rel_dir == Path(".") else core._normalize_source_path(rel_dir.as_posix())
-        dirs.append(
-            {
-                "path": rel_dir_text,
-                "mtime_ns": int(stat.st_mtime_ns),
-            }
-        )
-
-    return {
-        "version": 1,
-        "file_count": len(files),
-        "source_digest": digest.hexdigest(),
-        "files": files,
-        "dirs": dirs,
-    }
-
-
-def current_source_snapshot(source_dir: str) -> dict[str, Any]:
-    core = _core()
-    root = Path(source_dir).expanduser()
-    file_records: list[dict[str, Any]] = []
-    for path in core._iter_supported_files(root):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        rel_path = core._normalize_source_path(path.relative_to(root).as_posix())
-        if not rel_path:
-            continue
-        file_records.append(
-            {
-                "path": rel_path,
-                "size": int(stat.st_size),
-                "mtime_ns": int(stat.st_mtime_ns),
-            }
-        )
-    return _source_snapshot_from_file_records(source_dir, file_records)
-
-
-def source_snapshot_from_indexed_files(
-    indexed_files: list[Any],
-    source_dir: str,
-) -> dict[str, Any]:
-    core = _core()
-    root = Path(source_dir).expanduser()
-    file_records: list[dict[str, Any]] = []
-    for indexed in indexed_files:
-        try:
-            stat = indexed.file_path.stat()
-        except OSError:
-            continue
-        try:
-            rel_path = indexed.file_path.relative_to(root).as_posix()
-        except ValueError:
-            rel_path = indexed.rel_path
-        normalized_rel_path = core._normalize_source_path(rel_path)
-        if not normalized_rel_path:
-            continue
-        file_records.append(
-            {
-                "path": normalized_rel_path,
-                "size": int(stat.st_size),
-                "mtime_ns": int(stat.st_mtime_ns),
-            }
-        )
-    return _source_snapshot_from_file_records(source_dir, file_records)
-
-
-def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding=encoding) as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        tmp_path.replace(path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def _iter_supported_files(source_dir: Path) -> list[Path]:
@@ -1702,7 +1500,7 @@ def _write_index_artifacts(
     skip_graph = core._env_flag("SKIP_GRAPH")
     skip_semantic = skip_graph or core._env_flag("SKIP_SEMANTIC")
     skip_wiki = core._env_flag("SKIP_WIKI")
-    build_snapshot = core.current_build_config_snapshot(
+    build_snapshot = current_build_config_snapshot(
         source_dir,
         embed_base_url=embed_base_url,
         embed_model=embed_model,
@@ -1787,7 +1585,7 @@ def _write_index_artifacts(
 
     fulltext_index_path = persist_path / core.FULLTEXT_INDEX_FILENAME
     fulltext_index = core._build_fulltext_index(indexed_files)
-    _atomic_write_text(
+    atomic_write_text(
         fulltext_index_path,
         json.dumps(fulltext_index, ensure_ascii=False, separators=(",", ":")),
     )
