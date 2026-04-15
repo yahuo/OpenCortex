@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -33,6 +33,8 @@ class SearchBundle:
     entity_nodes_by_id: dict[str, dict[str, Any]]
     entity_edges_by_source: dict[str, list[dict[str, Any]]]
     wiki_pages: list[dict[str, Any]]
+    fulltext_index: dict[str, Any] = field(default_factory=dict)
+    query_expansion_index: dict[str, Any] = field(default_factory=dict)
 
     def cache_path_for(self, source: str) -> Path | None:
         entry = self.files_by_source.get(source)
@@ -61,6 +63,23 @@ def _runtime_wiki_artifact_paths(persist_path: Path) -> list[str]:
     return paths
 
 
+def load_fulltext_index_payload(fulltext_index_path: Path) -> dict[str, Any]:
+    if not fulltext_index_path.exists():
+        raise ValueError(f"缺少全文索引文件：{fulltext_index_path.name}")
+    try:
+        payload = json.loads(fulltext_index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"全文索引文件损坏：{fulltext_index_path.name}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"全文索引格式无效：{fulltext_index_path.name}")
+
+    raw_chunks = payload.get("chunks")
+    raw_postings = payload.get("postings")
+    if not isinstance(raw_chunks, list) or not isinstance(raw_postings, dict):
+        raise ValueError(f"全文索引格式无效：{fulltext_index_path.name}")
+    return payload
+
+
 def search_bundle_artifact_signature(
     persist_dir: str | Path,
 ) -> tuple[tuple[str, bool, int, int], ...]:
@@ -86,6 +105,10 @@ def search_bundle_artifact_signature(
             or core.DOCUMENT_GRAPH_FILENAME
         ),
         str(manifest.get("entity_graph_file", core.ENTITY_GRAPH_FILENAME) or core.ENTITY_GRAPH_FILENAME),
+        str(
+            manifest.get("fulltext_index_file", core.FULLTEXT_INDEX_FILENAME)
+            or core.FULLTEXT_INDEX_FILENAME
+        ),
         str(
             manifest.get("community_index_file", core.COMMUNITY_INDEX_FILENAME)
             or core.COMMUNITY_INDEX_FILENAME
@@ -315,6 +338,10 @@ def load_search_bundle(
         "entity_graph_file",
         core.ENTITY_GRAPH_FILENAME,
     )
+    fulltext_index_path = Path(resolved_persist_dir) / manifest.get(
+        "fulltext_index_file",
+        core.FULLTEXT_INDEX_FILENAME,
+    )
 
     symbol_index: list[dict[str, Any]] = []
     if symbol_index_path.exists():
@@ -450,8 +477,79 @@ def load_search_bundle(
         "edge_count": len(entity_edges),
     }
 
+    fulltext_index: dict[str, Any] = {
+        "version": 1,
+        "doc_count": 0,
+        "avg_chunk_length": 0.0,
+        "chunks": {},
+        "postings": {},
+    }
+    raw_fulltext_index = load_fulltext_index_payload(fulltext_index_path)
+
+    chunks_by_id: dict[int, dict[str, Any]] = {}
+    raw_chunks = raw_fulltext_index["chunks"]
+    for raw_chunk in raw_chunks:
+        if not isinstance(raw_chunk, dict):
+            continue
+        try:
+            chunk_id = int(raw_chunk.get("id"))
+        except (TypeError, ValueError):
+            continue
+        source = core._normalize_source_path(raw_chunk.get("source", ""))
+        if not source:
+            continue
+        chunks_by_id[chunk_id] = {
+            "id": chunk_id,
+            "source": source,
+            "chunk_index": int(raw_chunk.get("chunk_index") or 0),
+            "line_start": raw_chunk.get("line_start"),
+            "line_end": raw_chunk.get("line_end"),
+            "label": str(raw_chunk.get("label", "") or ""),
+            "length": max(1, int(raw_chunk.get("length") or 1)),
+        }
+    postings: dict[str, list[tuple[int, int]]] = {}
+    raw_postings = raw_fulltext_index["postings"]
+    for raw_term, raw_entries in raw_postings.items():
+        term = str(raw_term).strip().lower()
+        if not term or not isinstance(raw_entries, list):
+            continue
+        normalized_entries: list[tuple[int, int]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, list | tuple) or len(raw_entry) < 2:
+                continue
+            try:
+                chunk_id = int(raw_entry[0])
+                tf = int(raw_entry[1])
+            except (TypeError, ValueError):
+                continue
+            if tf <= 0 or chunk_id not in chunks_by_id:
+                continue
+            normalized_entries.append((chunk_id, tf))
+        if normalized_entries:
+            postings[term] = normalized_entries
+    doc_count = int(raw_fulltext_index.get("doc_count") or len(chunks_by_id))
+    if doc_count <= 0:
+        doc_count = len(chunks_by_id)
+    avg_chunk_length = float(raw_fulltext_index.get("avg_chunk_length") or 0.0)
+    if avg_chunk_length <= 0 and chunks_by_id:
+        avg_chunk_length = sum(
+            int(chunk.get("length") or 1) for chunk in chunks_by_id.values()
+        ) / len(chunks_by_id)
+    fulltext_index = {
+        "version": int(raw_fulltext_index.get("version") or 1),
+        "doc_count": doc_count,
+        "avg_chunk_length": avg_chunk_length,
+        "chunks": chunks_by_id,
+        "postings": postings,
+    }
+
     source_dir = manifest.get("source_dir")
     wiki_pages = _load_wiki_pages(Path(resolved_persist_dir), files)
+    query_expansion_index = core._build_query_expansion_index(
+        files=files,
+        symbol_index=symbol_index,
+        entity_nodes=entity_nodes,
+    )
     return SearchBundle(
         vectorstore=vectorstore,
         persist_dir=Path(resolved_persist_dir),
@@ -467,6 +565,8 @@ def load_search_bundle(
         entity_nodes_by_id=entity_nodes_by_id,
         entity_edges_by_source=entity_edges_by_source,
         wiki_pages=wiki_pages,
+        fulltext_index=fulltext_index,
+        query_expansion_index=query_expansion_index,
     )
 
 

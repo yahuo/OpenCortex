@@ -423,6 +423,7 @@ def test_search_artifact_signature_tracks_runtime_wiki_pages(tmp_path: Path) -> 
     signature = api._search_artifact_signature(str(tmp_path))
     signature_paths = {item[0] for item in signature}
 
+    assert "fulltext_index.json" in signature_paths
     assert "wiki/index.md" in signature_paths
     assert "wiki/queries/2026-04-09-note.md" in signature_paths
     assert "wiki/communities/community-1.md" in signature_paths

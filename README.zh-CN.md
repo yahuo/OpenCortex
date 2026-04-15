@@ -18,7 +18,7 @@
 - **微信导出支持** — 原生解析微信导出的 Markdown，按时间窗口分片
 - **LLM 和 Embedding 可插拔** — 任意 OpenAI 兼容接口：硅基流动、Gemini、DeepSeek、Kimi、GLM 等
 - **本地 FAISS 向量库** — 无云端依赖，数据不离本机
-- **Hybrid / Agentic Search** — `glob + grep + AST + vector` 混合检索，支持有边界的二跳检索
+- **Hybrid / Agentic Search** — `glob + grep + AST + BM25 + vector + query expansion` 混合检索，支持标题词 / 文件名 / 术语别名扩展与有边界的二跳检索
 - **多知识库** — `docs/` 下的子目录自动成为独立知识库，API 可指定知识库检索或全量检索
 - **HTTP API** — FastAPI 端点（`/api/ask`、`/api/kbs`、`/api/health`），支持 `search_mode` 和 SSE 流式输出
 - **索引热加载** — 更新文档后重建索引，无需重启服务，刷新页面即生效
@@ -36,13 +36,13 @@ flowchart LR
 
     subgraph Build["索引构建"]
         Parse["ragbot.build_vectorstore()<br/>解析与标准化<br/>Markdown / JSON / YAML / PDF / DOCX / XLSX / code"]
-        Chunk["分片策略<br/>标题分段 / 微信时间窗口 / 代码块 / 固定大小"]
+        Chunk["分片策略<br/>标题分段 / 段落与列表块 / 会议发言块 / 微信时间窗口 / 代码块"]
         Embed["OpenAI 兼容 Embedding API"]
         Persist["本地持久化产物<br/>index.faiss / index.pkl<br/>index_manifest.json<br/>normalized_texts/<br/>symbol_index.jsonl"]
     end
 
     subgraph Runtime["运行时服务"]
-        Bundle["ragbot.load_search_bundle()<br/>加载向量库 + manifest + 标准化文本 + 符号索引"]
+        Bundle["ragbot.load_search_bundle()<br/>加载向量库 + manifest + 标准化文本 + 符号索引 + 查询扩展索引"]
         App["app.py<br/>Streamlit UI :8501<br/>全量检索 + 索引热加载"]
         API["api.py<br/>FastAPI :8502<br/>/api/ask /api/kbs /api/health"]
     end
@@ -111,7 +111,7 @@ flowchart LR
     subgraph Current["当前实现"]
         NQ["用户问题"]
         NP["规则规划<br/>symbols / keywords / path_globs"]
-        NG["glob / grep / AST"]
+        NG["glob / grep / AST / BM25"]
         NV["受限向量召回"]
         NF["RRF 融合排序"]
         NA["可选二跳规划<br/>仅 agentic 模式"]
@@ -232,10 +232,10 @@ docker compose up -d      # 重新启动
 
 | 扩展名 | 分片策略 |
 |---|---|
-| `.md`、`.markdown`、`.mdx` | 微信导出格式 → 时间窗口分片；其他 Markdown → 固定大小分片 |
-| `.txt`、`.rst`、`.log` | 固定大小分片（含重叠） |
+| `.md`、`.markdown`、`.mdx` | 微信导出格式 → 时间窗口分片；其他 Markdown → 标题分段或段落 / 列表块分片 |
+| `.txt`、`.rst`、`.log` | 段落块分片；检测到会议纪要 / 发言记录时按发言块分片 |
 | `.csv`、`.json`、`.yaml`、`.yml` | 固定大小分片（含重叠） |
-| `.docx`、`.xlsx`、`.pdf` | markitdown 转 Markdown → 固定大小分片（含重叠） |
+| `.docx`、`.xlsx`、`.pdf` | markitdown 转 Markdown → 标题分段或段落 / 列表块分片 |
 
 ---
 

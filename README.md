@@ -18,7 +18,7 @@
 - **WeChat export support** — natively parses WeChat-exported Markdown with time-window chunking
 - **Pluggable LLM & embeddings** — any OpenAI-compatible API: SiliconFlow, Gemini, DeepSeek, Kimi, GLM, etc.
 - **Local FAISS vector store** — no cloud dependency, data stays on your machine
-- **Hybrid / Agentic Search** — combines `glob + grep + AST + vector`, with a bounded second retrieval hop
+- **Hybrid / Agentic Search** — combines `glob + grep + AST + BM25 + vector + query expansion`, with title/file/alias expansion and a bounded second retrieval hop
 - **Multi-knowledge-base** — subdirectories under `docs/` become named knowledge bases; API can target a specific KB or search globally
 - **HTTP API** — FastAPI endpoints (`/api/ask`, `/api/kbs`, `/api/health`) with `search_mode` and SSE streaming support
 - **Hot-reload** — update your docs and trigger re-indexing without restarting the server
@@ -36,13 +36,13 @@ flowchart LR
 
     subgraph Build["Index Build"]
         Parse["ragbot.build_vectorstore()<br/>parse and normalize<br/>Markdown / JSON / YAML / PDF / DOCX / XLSX / code"]
-        Chunk["chunking strategies<br/>headings / WeChat time windows / code blocks / fixed-size"]
+        Chunk["chunking strategies<br/>headings / paragraph-list blocks / meeting turns / WeChat time windows / code blocks"]
         Embed["OpenAI-compatible Embedding API"]
         Persist["local artifacts<br/>index.faiss / index.pkl<br/>index_manifest.json<br/>normalized_texts/<br/>symbol_index.jsonl"]
     end
 
     subgraph Runtime["Runtime Services"]
-        Bundle["ragbot.load_search_bundle()<br/>load vector store + manifest + normalized texts + symbol index"]
+        Bundle["ragbot.load_search_bundle()<br/>load vector store + manifest + normalized texts + symbol index + query expansion index"]
         App["app.py<br/>Streamlit UI :8501<br/>global search + hot reload"]
         API["api.py<br/>FastAPI :8502<br/>/api/ask /api/kbs /api/health"]
     end
@@ -111,7 +111,7 @@ flowchart LR
     subgraph Current["Current Implementation"]
         NQ["User question"]
         NP["Rule planning<br/>symbols / keywords / path_globs"]
-        NG["glob / grep / AST"]
+        NG["glob / grep / AST / BM25"]
         NV["Scoped vector recall"]
         NF["RRF fusion ranking"]
         NA["Optional second-hop planning<br/>agentic mode only"]
@@ -232,10 +232,10 @@ Copy `.env.example` to `.env` and fill in the required values.
 
 | Extension | Chunking strategy |
 |---|---|
-| `.md`, `.markdown`, `.mdx` | WeChat format → time-window chunks; otherwise fixed-size |
-| `.txt`, `.rst`, `.log` | Fixed-size with overlap |
+| `.md`, `.markdown`, `.mdx` | WeChat format → time-window chunks; otherwise heading-aware or paragraph/list block chunks |
+| `.txt`, `.rst`, `.log` | Paragraph-block chunks; meeting notes / speaker turns are chunked by turn |
 | `.csv`, `.json`, `.yaml`, `.yml` | Fixed-size with overlap |
-| `.docx`, `.xlsx`, `.pdf` | markitdown → Markdown → fixed-size with overlap |
+| `.docx`, `.xlsx`, `.pdf` | markitdown → Markdown → heading-aware or paragraph/list block chunks |
 
 ---
 

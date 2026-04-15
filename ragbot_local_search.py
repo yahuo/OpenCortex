@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from functools import lru_cache
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -53,6 +55,278 @@ def _bundle_sources(
             continue
         results.append(source)
     return results
+
+
+def _fulltext_terms(text: str) -> list[str]:
+    core = _core()
+    normalized = core._normalize_text(text)
+    if not normalized:
+        return []
+
+    terms: list[str] = []
+    for token in core.FULLTEXT_ASCII_TOKEN_RE.findall(normalized):
+        clean = token.strip().strip("`\"'.,:;!?()[]{}").lower()
+        if len(clean) < 2:
+            continue
+        pieces = [
+            piece
+            for piece in re.split(r"[_./:-]+", clean)
+            if len(piece) >= 2 and piece not in core.GRAPH_STOPWORDS
+        ]
+        if pieces:
+            terms.extend(pieces)
+        elif clean not in core.GRAPH_STOPWORDS:
+            terms.append(clean)
+
+    for run in core.FULLTEXT_CJK_RUN_RE.findall(normalized):
+        compact = run.strip()
+        if len(compact) < 2:
+            continue
+        terms.extend(compact[index : index + 2] for index in range(len(compact) - 1))
+        if len(compact) <= 6:
+            terms.append(compact)
+
+    return terms
+
+
+def _fulltext_query_terms(question: str, query_plan: QueryPlan | None = None) -> list[str]:
+    core = _core()
+    query_texts = [question]
+    if query_plan is not None:
+        query_texts.extend(query_plan.keywords)
+        query_texts.extend(query_plan.symbols)
+    return core._dedupe_strings(
+        term
+        for text in query_texts
+        for term in _fulltext_terms(text)
+    )
+
+
+def _query_expansion_variants(text: str) -> list[str]:
+    core = _core()
+    raw = str(text).strip()
+    if not raw:
+        return []
+
+    variants = [raw]
+    path_name = Path(raw).name
+    if path_name and path_name != raw:
+        variants.append(path_name)
+
+    stem = Path(path_name or raw).stem
+    if stem and stem.lower() != raw.lower():
+        variants.append(stem)
+
+    humanized = re.sub(r"[_./:-]+", " ", stem or raw).strip()
+    if humanized:
+        variants.append(humanized)
+
+    return core._dedupe_strings(value for value in variants if value)
+
+
+def _query_expansion_priority(kind: str) -> int:
+    return {
+        "symbol": 5,
+        "file": 4,
+        "section": 3,
+        "concept": 3,
+        "decision": 3,
+    }.get(kind, 1)
+
+
+def _register_query_expansion_item(
+    items: list[dict[str, Any]],
+    postings: dict[str, list[int]],
+    seen: set[tuple[str, str, str, str, str]],
+    *,
+    kind: str,
+    text: str,
+    source: str = "",
+    kb: str = "",
+    symbol: str = "",
+    path_glob: str = "",
+) -> None:
+    core = _core()
+    clean_text = str(text).strip()
+    clean_source = core._normalize_source_path(source)
+    clean_symbol = str(symbol).strip()
+    clean_glob = str(path_glob).strip()
+    clean_kb = str(kb).strip() or (core._extract_kb(clean_source) if clean_source else "")
+    if not clean_text:
+        return
+
+    item_key = (
+        str(kind).strip(),
+        clean_source,
+        clean_text.lower(),
+        clean_symbol.lower(),
+        clean_glob.lower(),
+    )
+    if item_key in seen:
+        return
+
+    terms = core._dedupe_strings(
+        term
+        for variant in _query_expansion_variants(clean_text)
+        for term in _fulltext_terms(variant)
+    )
+    if not terms:
+        return
+
+    seen.add(item_key)
+    item_id = len(items)
+    items.append(
+        {
+            "kind": str(kind).strip(),
+            "text": clean_text,
+            "source": clean_source,
+            "kb": clean_kb,
+            "symbol": clean_symbol,
+            "path_glob": clean_glob,
+            "tokens": terms,
+            "priority": _query_expansion_priority(kind),
+        }
+    )
+    for term in terms:
+        postings.setdefault(term, []).append(item_id)
+
+
+def _build_query_expansion_index(
+    files: list[dict[str, Any]],
+    symbol_index: list[dict[str, Any]],
+    entity_nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    core = _core()
+    items: list[dict[str, Any]] = []
+    postings: dict[str, list[int]] = {}
+    seen: set[tuple[str, str, str, str, str]] = set()
+
+    for entry in files:
+        source = core._normalize_source_path(str(entry.get("name", "") or ""))
+        if not source:
+            continue
+        basename = Path(source).name
+        stem = Path(source).stem
+        path_glob = f"*{basename}*"
+        kb = str(entry.get("kb", "") or "")
+        _register_query_expansion_item(
+            items,
+            postings,
+            seen,
+            kind="file",
+            text=basename,
+            source=source,
+            kb=kb,
+            path_glob=path_glob,
+        )
+        if stem and stem.lower() != basename.lower():
+            _register_query_expansion_item(
+                items,
+                postings,
+                seen,
+                kind="file",
+                text=stem,
+                source=source,
+                kb=kb,
+                path_glob=path_glob,
+            )
+
+    for record in symbol_index:
+        source = core._normalize_source_path(str(record.get("source", "") or ""))
+        if not source:
+            continue
+        name = str(record.get("name", "") or "").strip()
+        qualified_name = str(record.get("qualified_name") or name).strip()
+        if name:
+            _register_query_expansion_item(
+                items,
+                postings,
+                seen,
+                kind="symbol",
+                text=name,
+                source=source,
+                symbol=name,
+            )
+        if qualified_name and qualified_name != name:
+            _register_query_expansion_item(
+                items,
+                postings,
+                seen,
+                kind="symbol",
+                text=qualified_name,
+                source=source,
+                symbol=qualified_name,
+            )
+
+    for node in entity_nodes:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type", "") or "").strip()
+        if not node_type or node_type in {"file", "query_note"}:
+            continue
+        source = core._entity_node_file_source(node)
+        kb = str(node.get("kb", "") or "") or (core._extract_kb(source) if source else "")
+        path_glob = f"*{Path(source).name}*" if source else ""
+        aliases = node.get("aliases", [])
+        surface_values = [str(node.get("name", "") or "").strip()]
+        if isinstance(aliases, list):
+            surface_values.extend(str(alias).strip() for alias in aliases if str(alias).strip())
+        for surface in core._dedupe_strings(value for value in surface_values if value):
+            _register_query_expansion_item(
+                items,
+                postings,
+                seen,
+                kind=node_type,
+                text=surface,
+                source=source,
+                kb=kb,
+                path_glob=path_glob,
+            )
+
+    return {
+        "version": 1,
+        "items": items,
+        "postings": postings,
+    }
+
+
+def _build_fulltext_index(indexed_files: list[Any]) -> dict[str, Any]:
+    core = _core()
+    chunks: list[dict[str, Any]] = []
+    postings: dict[str, list[list[int]]] = {}
+    total_terms = 0
+    doc_count = 0
+
+    for indexed in indexed_files:
+        for chunk_index, chunk in enumerate(indexed.iter_chunks()):
+            term_counts = Counter(_fulltext_terms(chunk.text))
+            if not term_counts:
+                continue
+            chunk_id = doc_count
+            length = sum(term_counts.values())
+            total_terms += length
+            chunks.append(
+                {
+                    "id": chunk_id,
+                    "source": indexed.rel_path,
+                    "chunk_index": chunk_index,
+                    "line_start": chunk.line_start,
+                    "line_end": chunk.line_end,
+                    "label": core._chunk_location_label(chunk, f"chunk {chunk_index + 1}"),
+                    "length": length,
+                }
+            )
+            for term, tf in term_counts.items():
+                postings.setdefault(term, []).append([chunk_id, int(tf)])
+            doc_count += 1
+
+    return {
+        "version": 1,
+        "doc_count": doc_count,
+        "avg_chunk_length": 0.0 if doc_count == 0 else total_terms / doc_count,
+        "chunks": chunks,
+        "postings": postings,
+    }
 
 
 def _has_supported_file_suffix(token: str) -> bool:
@@ -151,7 +425,7 @@ def _extract_query_plan(question: str) -> QueryPlan:
 
 
 def _hit_priority(match_kind: str) -> int:
-    order = {"ast": 4, "grep": 3, "vector": 2, "glob": 1}
+    order = {"ast": 5, "grep": 4, "bm25": 3, "vector": 2, "glob": 1}
     return order.get(match_kind, 0)
 
 
@@ -321,6 +595,104 @@ def _grep_hits_from_matches(
             )
         )
     return sorted(hits, key=lambda item: (item.score, -int(item.line_start or 0)), reverse=True)
+
+
+def _chunk_snippet(
+    bundle: SearchBundle,
+    source: str,
+    line_start: int | None,
+    line_end: int | None,
+) -> str:
+    core = _core()
+    cache_path = bundle.cache_path_for(source)
+    if cache_path is None or not cache_path.exists():
+        return ""
+    lines = core._read_cached_text(str(cache_path)).splitlines()
+    if not lines:
+        return ""
+    start = max(1, int(line_start or 1))
+    end = max(start, int(line_end or start))
+    end = min(end, len(lines))
+    return "\n".join(lines[start - 1 : end]).strip()
+
+
+def bm25_search(
+    bundle: SearchBundle,
+    question: str,
+    query_plan: QueryPlan | None = None,
+    kb: str | None = None,
+    allowed_sources: set[str] | None = None,
+    top_k: int = 6,
+) -> list[SearchHit]:
+    core = _core()
+    index = bundle.fulltext_index or {}
+    postings = index.get("postings")
+    chunks = index.get("chunks")
+    if not isinstance(postings, dict) or not isinstance(chunks, dict):
+        return []
+
+    query_terms = _fulltext_query_terms(question, query_plan=query_plan)
+    if not query_terms:
+        return []
+
+    valid_sources = set(core._bundle_sources(bundle, kb=kb, allowed_sources=allowed_sources))
+    doc_count = int(index.get("doc_count") or len(chunks))
+    avg_chunk_length = float(index.get("avg_chunk_length") or 0.0) or 1.0
+    query_tf = Counter(query_terms)
+    scores: dict[int, float] = {}
+    matched_terms: dict[int, set[str]] = {}
+
+    for term, qf in query_tf.items():
+        raw_postings = postings.get(term)
+        if not isinstance(raw_postings, list) or not raw_postings:
+            continue
+        df = len(raw_postings)
+        idf = math.log1p((doc_count - df + 0.5) / (df + 0.5))
+        for chunk_id, tf in raw_postings:
+            chunk = chunks.get(chunk_id)
+            if not isinstance(chunk, dict):
+                continue
+            source = str(chunk.get("source", "") or "")
+            if valid_sources and source not in valid_sources:
+                continue
+            length = max(1, int(chunk.get("length") or 1))
+            norm = tf + core.FULLTEXT_BM25_K1 * (
+                1 - core.FULLTEXT_BM25_B + core.FULLTEXT_BM25_B * length / avg_chunk_length
+            )
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + idf * (
+                tf * (core.FULLTEXT_BM25_K1 + 1) / norm
+            ) * (1 + 0.1 * max(0, qf - 1))
+            matched_terms.setdefault(chunk_id, set()).add(term)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    hits: list[SearchHit] = []
+    for chunk_id, score in ranked:
+        chunk = chunks.get(chunk_id)
+        if not isinstance(chunk, dict):
+            continue
+        source = str(chunk.get("source", "") or "")
+        line_start = chunk.get("line_start")
+        line_end = chunk.get("line_end")
+        snippet = _chunk_snippet(bundle, source, line_start, line_end)
+        if not snippet:
+            continue
+        hits.append(
+            core.SearchHit(
+                source=source,
+                match_kind="bm25",
+                snippet=snippet,
+                score=score,
+                line_start=line_start,
+                line_end=line_end,
+                metadata={
+                    "matched_terms": sorted(matched_terms.get(chunk_id, set())),
+                    "time_range": str(chunk.get("label", "") or ""),
+                },
+            )
+        )
+        if len(hits) >= top_k:
+            break
+    return hits
 
 
 def _grep_search_with_rg(

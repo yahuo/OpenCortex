@@ -270,6 +270,16 @@ def get_structure_artifact_mtimes(persist_dir: str) -> tuple[float, float, float
     return tuple(mtimes)
 
 
+def render_rebuild_hint() -> None:
+    if Path("/.dockerenv").exists():
+        st.code(
+            "docker compose run --rm app python start.py --rebuild-only",
+            language="bash",
+        )
+    else:
+        st.code("python3 start.py", language="bash")
+
+
 @st.cache_resource(show_spinner=False)
 def get_search_bundle(
     embed_api_key: str,
@@ -642,13 +652,7 @@ if missing_env:
 index_file = Path(cfg["persist_dir"]) / "index.faiss"
 if not index_file.exists():
     st.error("未检测到向量索引。")
-    if Path("/.dockerenv").exists():
-        st.code(
-            "docker compose run --rm app python start.py --rebuild-only",
-            language="bash",
-        )
-    else:
-        st.code("python3 start.py", language="bash")
+    render_rebuild_hint()
     st.info("请在终端运行上面的命令：先重建索引，再启动页面。")
     st.stop()
 
@@ -680,19 +684,29 @@ if wiki_write_in_progress and last_stable_signature is None:
     st.warning("Wiki 页面正在重建，请稍后刷新。")
     st.stop()
 
-search_bundle = get_search_bundle(
-    embed_api_key=cfg["embed_api_key"],
-    embed_base_url=cfg["embed_base_url"],
-    embed_model=cfg["embed_model"],
-    persist_dir=cfg["persist_dir"],
-    artifact_signature=effective_bundle_signature,
-)
+try:
+    search_bundle = get_search_bundle(
+        embed_api_key=cfg["embed_api_key"],
+        embed_base_url=cfg["embed_base_url"],
+        embed_model=cfg["embed_model"],
+        persist_dir=cfg["persist_dir"],
+        artifact_signature=effective_bundle_signature,
+    )
+except Exception as exc:
+    if wiki_write_in_progress:
+        st.warning("Wiki 页面正在重建，请稍后刷新。")
+    else:
+        st.error(f"索引加载失败：{exc}")
+        render_rebuild_hint()
+        st.info("请在终端重新运行上面的命令重建索引后，再刷新页面。")
+    st.stop()
 
 if search_bundle is None:
     if wiki_write_in_progress:
         st.warning("Wiki 页面正在重建，请稍后刷新。")
     else:
         st.error("索引加载失败，请重启应用后重试。")
+        render_rebuild_hint()
     st.stop()
 
 render_structure_summary(structure_summary)

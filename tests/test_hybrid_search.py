@@ -212,6 +212,16 @@ def test_build_vectorstore_writes_search_artifacts(search_bundle):
     graph_report = graph_report_path.read_text(encoding="utf-8")
     assert search_bundle.manifest["graph_report_file"] == "reports/GRAPH_REPORT.md"
     assert "# 图谱报告" in graph_report
+    fulltext_index_path = search_bundle.persist_dir / "fulltext_index.json"
+    assert fulltext_index_path.exists()
+    assert search_bundle.manifest["fulltext_index_file"] == "fulltext_index.json"
+    assert search_bundle.fulltext_index["doc_count"] >= len(search_bundle.files)
+    assert "startup" in search_bundle.fulltext_index["postings"]
+    assert search_bundle.query_expansion_index["items"]
+    assert any(
+        item["kind"] == "symbol" and item["text"] == "bootstrap_session"
+        for item in search_bundle.query_expansion_index["items"]
+    )
     lint_report_path = search_bundle.persist_dir / "lint_report.json"
     assert lint_report_path.exists()
     lint_report = json.loads(lint_report_path.read_text(encoding="utf-8"))
@@ -787,6 +797,146 @@ def test_markdown_heading_chunker_reads_no_heading_file_once(monkeypatch: pytest
     assert chunks[0].label == "preface"
 
 
+def test_markdown_structure_chunker_preserves_list_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHUNK_SIZE", "70")
+    monkeypatch.setenv("CHUNK_OVERLAP_LINES", "0")
+
+    text = """
+第一段介绍当前背景，长度足够让后续 block 需要单独成块。
+
+- 第一项任务说明
+- 第二项任务说明
+- 第三项任务说明
+
+最后一段总结下一步动作。
+""".strip()
+
+    chunks = ragbot._chunks_for_indexed_text(text, ".md", "markdown_structure")
+
+    assert len(chunks) >= 2
+    list_chunks = [chunk for chunk in chunks if "- 第一项任务说明" in chunk.text]
+    assert len(list_chunks) == 1
+    assert "- 第二项任务说明" in list_chunks[0].text
+    assert "- 第三项任务说明" in list_chunks[0].text
+    assert chunks[0].label == "preface"
+    assert chunks[0].section_path == ("preface",)
+
+
+def test_prepare_indexed_content_detects_meeting_notes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CHUNK_SIZE", "120")
+    monkeypatch.setenv("CHUNK_OVERLAP_LINES", "0")
+
+    normalized = """
+10:00 Alice: recap yesterday decisions
+Action items remain open for the API rollout.
+
+10:05 Bob: confirm staging verification
+Need to keep the migration guarded behind the feature flag.
+
+10:10 Carol: assign follow-up owners
+Document the rollback steps before production release.
+""".strip()
+
+    _, chunks, _symbols, chunk_strategy, _line_total, _original = ragbot._prepare_indexed_content(
+        "meeting.txt",
+        ".txt",
+        normalized,
+    )
+
+    assert chunk_strategy == "meeting_notes"
+    assert len(chunks) >= 2
+    assert chunks[0].kind == "meeting"
+    assert "Action items remain open" in chunks[0].text
+    assert "10:05 Bob:" not in chunks[0].text
+
+
+def test_prepare_indexed_content_keeps_log_files_out_of_meeting_chunking() -> None:
+    normalized = """
+INFO: boot sequence started
+ERROR: dependency timeout during warmup
+WARN: retrying background sync
+Traceback (most recent call last):
+  File "worker.py", line 1, in <module>
+    raise RuntimeError("boom")
+""".strip()
+
+    _, chunks, _symbols, chunk_strategy, _line_total, _original = ragbot._prepare_indexed_content(
+        "service.log",
+        ".log",
+        normalized,
+    )
+
+    assert chunk_strategy == "plain_text_structure"
+    assert chunks
+    assert all(chunk.kind != "meeting" for chunk in chunks)
+
+
+def test_prepare_indexed_content_keeps_mixed_case_log_files_out_of_meeting_chunking() -> None:
+    normalized = """
+Info: boot sequence started
+Error: dependency timeout during warmup
+Warning: retrying background sync
+Traceback (most recent call last):
+  File "worker.py", line 1, in <module>
+    raise RuntimeError("boom")
+""".strip()
+
+    _, chunks, _symbols, chunk_strategy, _line_total, _original = ragbot._prepare_indexed_content(
+        "service.log",
+        ".log",
+        normalized,
+    )
+
+    assert chunk_strategy == "plain_text_structure"
+    assert chunks
+    assert all(chunk.kind != "meeting" for chunk in chunks)
+
+
+def test_prepare_indexed_content_keeps_metadata_headers_out_of_meeting_chunking() -> None:
+    normalized = """
+Title: Session bootstrap overview
+Author: OpenCortex team
+Version: 2
+
+This document explains the startup orchestration flow and the related recovery steps.
+""".strip()
+
+    _, chunks, _symbols, chunk_strategy, _line_total, _original = ragbot._prepare_indexed_content(
+        "overview.txt",
+        ".txt",
+        normalized,
+    )
+
+    assert chunk_strategy == "plain_text_structure"
+    assert chunks
+    assert all(chunk.kind != "meeting" for chunk in chunks)
+
+
+def test_document_metadata_includes_section_path_and_chunk_kind() -> None:
+    indexed = ragbot.IndexedFile(
+        rel_path="notes.md",
+        suffix=".md",
+        kb="",
+        file_path=Path("notes.md"),
+        chunks=[
+            ragbot.ChunkSpec(
+                text="Architecture decisions",
+                line_start=3,
+                line_end=6,
+                label="Architecture",
+                section_path=("Architecture",),
+                kind="section",
+            )
+        ],
+    )
+
+    document = next(ragbot._iter_documents_for_indexed_files([indexed]))
+
+    assert document.metadata["heading"] == "Architecture"
+    assert document.metadata["section_path"] == ["Architecture"]
+    assert document.metadata["chunk_kind"] == "section"
+
+
 def test_build_vectorstore_stages_cache_under_persist_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -873,6 +1023,48 @@ def test_load_search_bundle_normalizes_entity_graph(search_bundle, monkeypatch: 
     ) == 1
     assert all("\\" not in edge["source"] for edge in reloaded.entity_graph["edges"])
     assert all("\\" not in edge["target"] for edge in reloaded.entity_graph["edges"])
+
+
+def test_load_search_bundle_rejects_invalid_fulltext_index(search_bundle, monkeypatch: pytest.MonkeyPatch):
+    fulltext_index_path = search_bundle.persist_dir / "fulltext_index.json"
+    fulltext_index_path.write_text("{", encoding="utf-8")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+
+    with pytest.raises(ValueError, match="全文索引文件损坏"):
+        ragbot.load_search_bundle(
+            embed_api_key="fake-key",
+            persist_dir=str(search_bundle.persist_dir),
+        )
+
+
+def test_load_search_bundle_rejects_structurally_invalid_fulltext_index(
+    search_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fulltext_index_path = search_bundle.persist_dir / "fulltext_index.json"
+    fulltext_index_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+
+    with pytest.raises(ValueError, match="全文索引格式无效"):
+        ragbot.load_search_bundle(
+            embed_api_key="fake-key",
+            persist_dir=str(search_bundle.persist_dir),
+        )
+
+
+def test_load_search_bundle_requires_fulltext_index(search_bundle, monkeypatch: pytest.MonkeyPatch):
+    fulltext_index_path = search_bundle.persist_dir / "fulltext_index.json"
+    fulltext_index_path.unlink()
+
+    monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
+
+    with pytest.raises(ValueError, match="缺少全文索引文件"):
+        ragbot.load_search_bundle(
+            embed_api_key="fake-key",
+            persist_dir=str(search_bundle.persist_dir),
+        )
 
 
 def test_generate_wiki_escapes_markdown_link_metacharacters(tmp_path: Path):
@@ -1234,6 +1426,158 @@ def test_vector_mode_keeps_semantic_recall(search_bundle):
     assert result["search_trace"][0]["stop_reason"] == "vector_mode"
 
 
+def test_corpus_query_expansion_adds_matching_file_hints(search_bundle):
+    question = "session playbook 在哪个文件"
+    plan = ragbot._extract_query_plan(question)
+
+    expanded, trace = ragbot._expand_query_plan_from_corpus_index(
+        search_bundle,
+        question,
+        plan,
+        kb="工程",
+        allowed_sources=None,
+    )
+
+    assert trace["used"] is True
+    assert "*session_playbook.md*" in expanded.path_globs
+    assert expanded.symbols == []
+
+
+def test_corpus_query_expansion_keeps_broad_query_free_of_path_globs(search_bundle):
+    question = "boot sequence startup orchestration"
+    plan = ragbot._extract_query_plan(question)
+
+    expanded, trace = ragbot._expand_query_plan_from_corpus_index(
+        search_bundle,
+        question,
+        plan,
+        kb="工程",
+        allowed_sources=None,
+    )
+
+    assert trace["used"] is True
+    assert expanded.path_globs == []
+
+
+def test_hybrid_uses_vector_feedback_to_promote_symbol_hit(search_bundle):
+    result = ragbot.retrieve("用户会话初始化是哪个函数实现的", search_bundle, kb="工程", mode="hybrid")
+
+    assert result["hits"]
+    assert result["hits"][0].source == "工程/bootstrap_session.py"
+    assert any(
+        hit.source == "工程/bootstrap_session.py" and hit.match_kind == "ast"
+        for hit in result["hits"]
+    )
+    feedback_trace = result["search_trace"][0]["feedback_query_expansion"]
+    assert feedback_trace["used"] is True
+    assert "bootstrap_session" in result["search_trace"][0]["feedback_query_plan"]["symbols"]
+    assert "Startup" not in result["search_trace"][0]["feedback_query_plan"]["keywords"]
+
+
+def test_vector_feedback_keeps_broad_query_free_of_symbol_and_path_hints(search_bundle):
+    base_plan = ragbot.QueryPlan(
+        symbols=[],
+        keywords=[],
+        path_globs=[],
+        semantic_query="会话启动链路总览",
+        reason="test broad query",
+    )
+    vector_hits = [
+        ragbot.SearchHit(
+            source="工程/session_playbook.md",
+            match_kind="vector",
+            snippet="Use bootstrap_session() when preparing the concrete initialization steps.",
+            score=0.9,
+            metadata={"heading": "Session Playbook"},
+        ),
+        ragbot.SearchHit(
+            source="工程/bootstrap_session.py",
+            match_kind="vector",
+            snippet="def bootstrap_session(user_id: str) -> dict:",
+            score=0.8,
+        ),
+    ]
+
+    expanded, trace = ragbot._expand_query_plan_from_vector_feedback(
+        search_bundle,
+        "会话启动链路总览",
+        base_plan,
+        vector_hits,
+        kb="工程",
+        allowed_sources=None,
+    )
+
+    assert trace["used"] is False
+    assert expanded.symbols == []
+    assert expanded.path_globs == []
+    assert expanded.keywords == []
+
+
+def test_vector_feedback_generic_document_phrase_does_not_trigger_file_lookup(search_bundle):
+    base_plan = ragbot.QueryPlan(
+        symbols=[],
+        keywords=[],
+        path_globs=[],
+        semantic_query="这个文档里会话启动流程怎么走",
+        reason="test generic document phrase",
+    )
+    vector_hits = [
+        ragbot.SearchHit(
+            source="工程/startup.md",
+            match_kind="vector",
+            snippet="The startup workflow documents the boot sequence and startup orchestration.",
+            score=0.9,
+        ),
+        ragbot.SearchHit(
+            source="工程/session_playbook.md",
+            match_kind="vector",
+            snippet="Use `bootstrap_session()` when preparing the concrete initialization steps.",
+            score=0.8,
+        ),
+    ]
+
+    expanded, trace = ragbot._expand_query_plan_from_vector_feedback(
+        search_bundle,
+        "这个文档里会话启动流程怎么走",
+        base_plan,
+        vector_hits,
+        kb="工程",
+        allowed_sources=None,
+    )
+
+    assert trace["used"] is False
+    assert expanded.path_globs == []
+    assert expanded.keywords == []
+
+
+def test_hybrid_can_use_bm25_without_vector_or_scope_signals(search_bundle, monkeypatch):
+    monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "vector_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        ragbot,
+        "_expand_candidate_sources_detailed",
+        lambda *args, **kwargs: ragbot.GraphExpansionResult(
+            sources=set(),
+            seed_sources=[],
+            expanded_sources=[],
+            edge_reasons=[],
+            hops=0,
+            strategy="heuristic",
+        ),
+    )
+
+    result = ragbot.retrieve("boot sequence startup orchestration", search_bundle, kb="工程", mode="hybrid")
+
+    assert result["hits"]
+    assert result["hits"][0].source == "工程/startup.md"
+    assert result["hits"][0].match_kind == "bm25"
+    assert result["search_trace"][0]["retrievers"]["bm25"] > 0
+    assert "工程/startup.md" in result["search_trace"][0]["candidate_scope"]
+
+
 def test_wiki_first_uses_saved_query_note_to_seed_candidate_scope(search_bundle, monkeypatch):
     wiki.save_query_note(
         persist_path=search_bundle.persist_dir,
@@ -1440,6 +1784,7 @@ def test_run_search_step_preserves_hit_order_for_bounded_graph_expansion(search_
     monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: glob_hits)
     monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
     monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "bm25_search", lambda *args, **kwargs: [])
     monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
 
     def fake_expand(bundle, seed_sources, kb=None, allowed_sources=None, max_hops=1, max_extra_sources=12):
@@ -1703,6 +2048,7 @@ def test_hybrid_uses_document_graph_to_expand_vector_scope(search_bundle, monkey
         return original_vector(*args, **kwargs)
 
     monkeypatch.setattr(ragbot, "vector_search", tracked_vector)
+    monkeypatch.setattr(ragbot, "bm25_search", lambda *args, **kwargs: [])
 
     result = ragbot.retrieve("看一下 session_playbook.md 里提到的实现", search_bundle, kb="工程", mode="hybrid")
 
@@ -1712,6 +2058,141 @@ def test_hybrid_uses_document_graph_to_expand_vector_scope(search_bundle, monkey
         "工程/bootstrap_session.py" in trace["graph_expanded_sources"]
         or "工程/bootstrap_session.py" in trace["wiki_scope"]
     )
+
+
+def test_hybrid_broadens_vector_recall_when_narrow_scope_is_low_confidence(
+    search_bundle,
+    monkeypatch,
+):
+    query_plan = ragbot.QueryPlan(
+        symbols=[],
+        keywords=["session"],
+        path_globs=["*session*"],
+        semantic_query="startup orchestration flow",
+        reason="test fallback recall",
+    )
+    weak_glob_hit = ragbot.SearchHit(
+        source="工程/session_playbook.md",
+        match_kind="glob",
+        snippet="session playbook",
+        score=0.3,
+    )
+    vector_scopes: list[object] = []
+
+    monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: [weak_glob_hit])
+    monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "bm25_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        ragbot,
+        "_expand_candidate_sources_detailed",
+        lambda *args, **kwargs: ragbot.GraphExpansionResult(
+            sources={"工程/session_playbook.md"},
+            seed_sources=["工程/session_playbook.md"],
+            expanded_sources=[],
+            edge_reasons=[],
+            hops=0,
+            strategy="document_graph",
+        ),
+    )
+
+    def fake_vector_search(bundle, query, kb=None, top_k=8, candidate_sources=None):
+        vector_scopes.append(None if candidate_sources is None else frozenset(candidate_sources))
+        if candidate_sources:
+            return [
+                ragbot.SearchHit(
+                    source="工程/session_playbook.md",
+                    match_kind="vector",
+                    snippet="wrong scoped result",
+                    score=0.7,
+                )
+            ]
+        return [
+            ragbot.SearchHit(
+                source="工程/startup.md",
+                match_kind="vector",
+                snippet="The startup workflow documents the boot sequence and startup orchestration.",
+                score=0.9,
+            )
+        ]
+
+    monkeypatch.setattr(ragbot, "vector_search", fake_vector_search)
+
+    result = ragbot._run_search_step(
+        question="启动编排流程在哪里",
+        bundle=search_bundle,
+        query_plan=query_plan,
+        kb="工程",
+        top_k=4,
+        step_name="fallback-recall",
+    )
+
+    assert vector_scopes == [frozenset({"工程/session_playbook.md"}), None]
+    assert result.trace["vector_scope_narrowed"] is True
+    assert result.trace["vector_fallback_used"] is True
+    assert any(hit.source == "工程/startup.md" for hit in result.hits)
+
+
+def test_hybrid_keeps_narrow_vector_scope_for_exact_path_hits(search_bundle, monkeypatch):
+    query_plan = ragbot.QueryPlan(
+        symbols=[],
+        keywords=["settings"],
+        path_globs=["*settings.yaml*"],
+        semantic_query="settings yaml",
+        reason="test exact path",
+    )
+    exact_glob_hit = ragbot.SearchHit(
+        source="产品/settings.yaml",
+        match_kind="glob",
+        snippet="service.api_key = cortex-secret",
+        score=1.0,
+        metadata={"exact_path": True},
+    )
+    vector_scopes: list[object] = []
+
+    monkeypatch.setattr(ragbot, "_wiki_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "glob_search", lambda *args, **kwargs: [exact_glob_hit])
+    monkeypatch.setattr(ragbot, "grep_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ragbot, "ast_search", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        ragbot,
+        "_expand_candidate_sources_detailed",
+        lambda *args, **kwargs: ragbot.GraphExpansionResult(
+            sources={"产品/settings.yaml"},
+            seed_sources=["产品/settings.yaml"],
+            expanded_sources=[],
+            edge_reasons=[],
+            hops=0,
+            strategy="document_graph",
+        ),
+    )
+
+    def fake_vector_search(bundle, query, kb=None, top_k=8, candidate_sources=None):
+        vector_scopes.append(None if candidate_sources is None else frozenset(candidate_sources))
+        return [
+            ragbot.SearchHit(
+                source="产品/settings.yaml",
+                match_kind="vector",
+                snippet="service.api_key = cortex-secret",
+                score=0.9,
+            )
+        ]
+
+    monkeypatch.setattr(ragbot, "vector_search", fake_vector_search)
+
+    result = ragbot._run_search_step(
+        question="看一下 settings.yaml",
+        bundle=search_bundle,
+        query_plan=query_plan,
+        kb="产品",
+        top_k=4,
+        step_name="exact-path",
+    )
+
+    assert vector_scopes == [frozenset({"产品/settings.yaml"})]
+    assert result.trace["vector_scope_narrowed"] is True
+    assert result.trace["vector_fallback_used"] is False
 
 
 def test_document_graph_respects_kb_boundaries(search_bundle, monkeypatch):

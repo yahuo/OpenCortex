@@ -4,9 +4,11 @@ import ast
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import configparser
 import fnmatch
+import hashlib
 import json
 import os
 from queue import Empty, Queue
+import re
 import shutil
 import tempfile
 from threading import local
@@ -73,6 +75,212 @@ def _should_ignore_relative_path(rel_path: Path, extra_patterns: list[str]) -> b
         if fnmatch.fnmatch(posix_path, pattern) or fnmatch.fnmatch(rel_path.name, pattern):
             return True
     return False
+
+
+def current_build_snapshot(
+    source_dir: str,
+    *,
+    embed_base_url: str,
+    embed_model: str,
+    llm_api_key: str = "",
+    llm_model: str = "",
+    llm_base_url: str = "",
+) -> dict[str, Any]:
+    snapshot = current_build_config_snapshot(
+        source_dir,
+        embed_base_url=embed_base_url,
+        embed_model=embed_model,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
+    source_snapshot = current_source_snapshot(source_dir)
+    snapshot.update(
+        {
+            "file_count": int(source_snapshot.get("file_count") or 0),
+            "source_digest": str(source_snapshot.get("source_digest", "") or ""),
+        }
+    )
+    return snapshot
+
+
+def current_build_config_snapshot(
+    source_dir: str,
+    *,
+    embed_base_url: str,
+    embed_model: str,
+    llm_api_key: str = "",
+    llm_model: str = "",
+    llm_base_url: str = "",
+) -> dict[str, Any]:
+    core = _core()
+    root = Path(source_dir).expanduser()
+    semantic_enabled, semantic_reason = core._semantic_graph_enabled(
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
+    return {
+        "version": 1,
+        "source_dir": str(root),
+        "embed_model": embed_model.strip(),
+        "embed_base_url": embed_base_url.strip().rstrip("/"),
+        "llm_model": llm_model.strip(),
+        "llm_base_url": llm_base_url.strip().rstrip("/"),
+        "chunk_size": core._configured_chunk_size(),
+        "chunk_overlap_lines": core._configured_chunk_overlap_lines(),
+        "max_chunks_per_file": core._configured_max_chunks_per_file(),
+        "exclude_globs": sorted(core._load_extra_exclude_globs()),
+        "skip_graph": core._env_flag("SKIP_GRAPH"),
+        "skip_semantic": core._env_flag("SKIP_GRAPH") or core._env_flag("SKIP_SEMANTIC"),
+        "skip_wiki": core._env_flag("SKIP_WIKI"),
+        "semantic_graph_enabled": semantic_enabled,
+        "semantic_graph_reason": semantic_reason,
+    }
+
+
+def _source_snapshot_from_file_records(
+    source_dir: str,
+    file_records: Iterable[dict[str, int | str]],
+) -> dict[str, Any]:
+    core = _core()
+    root = Path(source_dir).expanduser()
+    digest = hashlib.sha256()
+    files: list[dict[str, Any]] = []
+    dir_paths: set[Path] = {Path(".")}
+
+    normalized_records: list[dict[str, Any]] = []
+    for record in file_records:
+        rel_path = core._normalize_source_path(str(record.get("path", "") or ""))
+        if not rel_path:
+            continue
+        try:
+            size = int(record.get("size", 0) or 0)
+            mtime_ns = int(record.get("mtime_ns", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        normalized_records.append(
+            {
+                "path": rel_path,
+                "size": size,
+                "mtime_ns": mtime_ns,
+            }
+        )
+
+    normalized_records.sort(key=lambda item: str(item["path"]))
+    for record in normalized_records:
+        rel_path = str(record["path"])
+        digest.update(rel_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["size"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["mtime_ns"]).encode("utf-8"))
+        digest.update(b"\0")
+        files.append(record)
+
+        parent = Path(rel_path).parent
+        while True:
+            normalized_parent = Path(".") if str(parent) in {"", "."} else parent
+            dir_paths.add(normalized_parent)
+            if normalized_parent == Path("."):
+                break
+            parent = normalized_parent.parent
+
+    dirs: list[dict[str, Any]] = []
+    for rel_dir in sorted(dir_paths, key=lambda path: path.as_posix()):
+        dir_path = root if rel_dir == Path(".") else root / rel_dir
+        try:
+            stat = dir_path.stat()
+        except OSError:
+            continue
+        rel_dir_text = "." if rel_dir == Path(".") else core._normalize_source_path(rel_dir.as_posix())
+        dirs.append(
+            {
+                "path": rel_dir_text,
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+
+    return {
+        "version": 1,
+        "file_count": len(files),
+        "source_digest": digest.hexdigest(),
+        "files": files,
+        "dirs": dirs,
+    }
+
+
+def current_source_snapshot(source_dir: str) -> dict[str, Any]:
+    core = _core()
+    root = Path(source_dir).expanduser()
+    file_records: list[dict[str, Any]] = []
+    for path in core._iter_supported_files(root):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        rel_path = core._normalize_source_path(path.relative_to(root).as_posix())
+        if not rel_path:
+            continue
+        file_records.append(
+            {
+                "path": rel_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return _source_snapshot_from_file_records(source_dir, file_records)
+
+
+def source_snapshot_from_indexed_files(
+    indexed_files: list[Any],
+    source_dir: str,
+) -> dict[str, Any]:
+    core = _core()
+    root = Path(source_dir).expanduser()
+    file_records: list[dict[str, Any]] = []
+    for indexed in indexed_files:
+        try:
+            stat = indexed.file_path.stat()
+        except OSError:
+            continue
+        try:
+            rel_path = indexed.file_path.relative_to(root).as_posix()
+        except ValueError:
+            rel_path = indexed.rel_path
+        normalized_rel_path = core._normalize_source_path(rel_path)
+        if not normalized_rel_path:
+            continue
+        file_records.append(
+            {
+                "path": normalized_rel_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return _source_snapshot_from_file_records(source_dir, file_records)
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _iter_supported_files(source_dir: Path) -> list[Path]:
@@ -170,6 +378,8 @@ def _chunk_markdown_by_heading(text: str) -> list[Any]:
                 line_start=current + 1,
                 line_end=next_index,
                 label=label,
+                section_path=(label,),
+                kind="section",
             )
         )
 
@@ -185,10 +395,391 @@ def _chunk_markdown_by_heading(text: str) -> list[Any]:
                     line_start=1,
                     line_end=preface_end,
                     label="preface",
+                    section_path=("preface",),
+                    kind="section",
                 ),
             )
 
     return core._ensure_chunk_size(chunks)
+
+
+_MARKDOWN_FENCE_RE = re.compile(r"^\s*([`~]{3,})")
+_MARKDOWN_LIST_ITEM_RE = re.compile(r"^\s{0,3}(?:[-+*]|\d+[.)])\s+")
+_MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$"
+)
+_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?")
+_MEETING_TIMESTAMP_RE = re.compile(
+    r"^\s*(?:\[\d{1,2}:\d{2}(?::\d{2})?\]|\d{1,2}:\d{2}(?::\d{2})?)\s+"
+    r"(?:(?:[\u4e00-\u9fffA-Za-z][^:：]{0,20})[:：]|[-–—])"
+)
+_MEETING_SPEAKER_RE = re.compile(
+    r"^\s*(?:[\u4e00-\u9fff]{2,12}|[A-Z][A-Za-z0-9_. -]{1,30})\s*[:：]\s+\S+"
+)
+_LOG_LEVEL_PREFIXES = {
+    "TRACE",
+    "DEBUG",
+    "INFO",
+    "WARN",
+    "WARNING",
+    "ERROR",
+    "FATAL",
+    "CRITICAL",
+}
+_METADATA_HEADER_KEYS = {
+    "title",
+    "author",
+    "version",
+    "date",
+    "time",
+    "created",
+    "updated",
+    "status",
+    "summary",
+    "description",
+    "subject",
+    "owner",
+    "category",
+    "tags",
+}
+
+
+def _looks_like_log_prefix(line: str) -> bool:
+    match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_]{1,20})\s*[:：]\s+\S+", line)
+    if not match:
+        return False
+    return match.group(1).upper() in _LOG_LEVEL_PREFIXES
+
+
+def _looks_like_metadata_header(line: str) -> bool:
+    match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_ -]{1,30})\s*[:：]\s+\S+", line)
+    if not match:
+        return False
+    normalized = re.sub(r"[\s_-]+", " ", match.group(1).strip().lower())
+    return normalized in _METADATA_HEADER_KEYS
+
+
+def _looks_like_meeting_boundary(line: str) -> bool:
+    if _looks_like_log_prefix(line) or _looks_like_metadata_header(line):
+        return False
+    return bool(_MEETING_TIMESTAMP_RE.match(line) or _MEETING_SPEAKER_RE.match(line))
+
+
+def _looks_like_meeting_notes(text: str) -> bool:
+    timestamp_matches = 0
+    speaker_matches = 0
+    scanned = 0
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        scanned += 1
+        if _MEETING_TIMESTAMP_RE.match(stripped):
+            timestamp_matches += 1
+        elif _MEETING_SPEAKER_RE.match(stripped) and not (
+            _looks_like_log_prefix(stripped) or _looks_like_metadata_header(stripped)
+        ):
+            speaker_matches += 1
+        if scanned >= 80:
+            break
+    return timestamp_matches >= 2 or speaker_matches >= 3
+
+
+def _classify_structured_line(line: str, *, markdown: bool) -> str:
+    if markdown and _MARKDOWN_TABLE_RE.match(line):
+        return "table"
+    if markdown and _BLOCKQUOTE_RE.match(line):
+        return "quote"
+    if markdown and _MARKDOWN_LIST_ITEM_RE.match(line):
+        return "list"
+    return "paragraph"
+
+
+def _structured_block_label(
+    kind: str,
+    *,
+    default_label: str,
+    first_line: str,
+) -> str:
+    stripped = first_line.strip()
+    if kind == "meeting":
+        return stripped[:48]
+    if kind == "code":
+        return "code block"
+    if kind == "table":
+        return "table"
+    if kind == "list":
+        return default_label or "list"
+    if kind == "quote":
+        return default_label or "quote"
+    return default_label
+
+
+def _emit_structured_block(
+    lines: list[str],
+    start_line: int | None,
+    *,
+    end_line: int | None,
+    label: str,
+    section_path: tuple[str, ...] = (),
+    kind: str = "",
+) -> Any:
+    core = _core()
+    if not lines or start_line is None or end_line is None:
+        return None
+    text = "\n".join(lines).strip()
+    if not text:
+        return None
+    return core.ChunkSpec(
+        text=text,
+        line_start=start_line,
+        line_end=end_line,
+        label=label,
+        section_path=section_path,
+        kind=kind,
+    )
+
+
+def _iter_structured_blocks_from_line_stream(
+    numbered_lines: Iterable[tuple[int, str]],
+    *,
+    markdown: bool = False,
+    detect_meeting: bool = False,
+    default_label: str = "chunk",
+    section_path: tuple[str, ...] = (),
+) -> Iterable[Any]:
+    current_lines: list[str] = []
+    current_start: int | None = None
+    current_end: int | None = None
+    current_kind = ""
+    current_label = default_label
+    in_code_fence = False
+    active_fence = ""
+
+    def flush() -> Iterable[Any]:
+        nonlocal current_lines, current_start, current_end, current_kind, current_label
+        block = _emit_structured_block(
+            current_lines,
+            current_start,
+            end_line=current_end,
+            label=current_label,
+            section_path=section_path,
+            kind=current_kind,
+        )
+        current_lines = []
+        current_start = None
+        current_end = None
+        current_kind = ""
+        current_label = default_label
+        if block is not None:
+            yield block
+
+    def begin_block(kind: str, line_no: int, line: str) -> None:
+        nonlocal current_lines, current_start, current_end, current_kind, current_label
+        current_lines = [line]
+        current_start = line_no
+        current_end = line_no
+        current_kind = kind
+        current_label = _structured_block_label(kind, default_label=default_label, first_line=line)
+
+    for line_no, line in numbered_lines:
+        stripped = line.strip()
+        fence_match = _MARKDOWN_FENCE_RE.match(line) if markdown else None
+
+        if in_code_fence:
+            current_lines.append(line)
+            current_end = line_no
+            if fence_match and fence_match.group(1)[0] == active_fence[0] and len(fence_match.group(1)) >= len(active_fence):
+                in_code_fence = False
+                active_fence = ""
+                yield from flush()
+            continue
+
+        if not stripped:
+            if current_lines:
+                yield from flush()
+            continue
+
+        if markdown and fence_match:
+            if current_lines:
+                yield from flush()
+            begin_block("code", line_no, line)
+            in_code_fence = True
+            active_fence = fence_match.group(1)
+            continue
+
+        if detect_meeting and _looks_like_meeting_boundary(stripped):
+            if current_lines:
+                yield from flush()
+            begin_block("meeting", line_no, line)
+            continue
+
+        line_kind = _classify_structured_line(line, markdown=markdown)
+        if not current_lines:
+            begin_block(line_kind, line_no, line)
+            continue
+
+        should_continue = False
+        if current_kind == "meeting":
+            should_continue = True
+        elif current_kind == "paragraph":
+            should_continue = line_kind == "paragraph"
+        elif current_kind == "list":
+            should_continue = line_kind == "list" or line.startswith((" ", "\t"))
+        elif current_kind == "table":
+            should_continue = line_kind == "table" or _MARKDOWN_TABLE_SEPARATOR_RE.match(line) is not None
+        elif current_kind == "quote":
+            should_continue = line_kind == "quote"
+
+        if should_continue:
+            current_lines.append(line)
+            current_end = line_no
+            continue
+
+        yield from flush()
+        begin_block(line_kind, line_no, line)
+
+    if current_lines:
+        yield from flush()
+
+
+def _pack_structured_blocks(
+    blocks: Iterable[Any],
+    *,
+    chunk_size: int | None = None,
+    overlap_lines: int | None = None,
+    default_label: str = "chunk",
+    section_path: tuple[str, ...] = (),
+) -> list[Any]:
+    core = _core()
+    chunk_size = core._configured_chunk_size() if chunk_size is None else max(1, chunk_size)
+    overlap_lines = (
+        core._configured_chunk_overlap_lines()
+        if overlap_lines is None
+        else max(0, overlap_lines)
+    )
+    results: list[Any] = []
+    current_blocks: list[Any] = []
+    current_len = 0
+    chunk_index = 0
+
+    def block_line_count(block: Any) -> int:
+        line_start = getattr(block, "line_start", None)
+        line_end = getattr(block, "line_end", None)
+        if line_start is None or line_end is None:
+            return max(1, len(str(getattr(block, "text", "") or "").splitlines()))
+        return max(1, int(line_end) - int(line_start) + 1)
+
+    def oversized_block(block: Any) -> list[Any]:
+        return core._split_lines_into_chunks(
+            str(getattr(block, "text", "") or "").splitlines(),
+            start_line=int(getattr(block, "line_start", 1) or 1),
+            chunk_size=chunk_size,
+            overlap_lines=overlap_lines,
+            label=str(getattr(block, "label", "") or default_label),
+            section_path=getattr(block, "section_path", ()) or section_path,
+            kind=str(getattr(block, "kind", "") or ""),
+        )
+
+    def emit_current() -> None:
+        nonlocal current_blocks, current_len, chunk_index
+        if not current_blocks:
+            return
+        chunk_index += 1
+        text = "\n\n".join(str(block.text).strip() for block in current_blocks if str(block.text).strip()).strip()
+        if not text:
+            current_blocks = []
+            current_len = 0
+            return
+        effective_section_path = section_path or (current_blocks[0].section_path if current_blocks else ())
+        specific_label = next(
+            (
+                str(block.label).strip()
+                for block in current_blocks
+                if str(block.label).strip() and str(block.label).strip() not in {"chunk", "preface"}
+            ),
+            "",
+        )
+        if default_label and default_label != "chunk":
+            label = default_label
+        else:
+            label = specific_label or (effective_section_path[-1] if effective_section_path else f"chunk {chunk_index}")
+        first_kind = current_blocks[0].kind if current_blocks else ""
+        chunk_kind = first_kind if all(block.kind == first_kind for block in current_blocks) else "mixed"
+        results.append(
+            core.ChunkSpec(
+                text=text,
+                line_start=current_blocks[0].line_start,
+                line_end=current_blocks[-1].line_end,
+                label=label,
+                section_path=effective_section_path,
+                kind=chunk_kind,
+            )
+        )
+        if overlap_lines > 0:
+            retained: list[Any] = []
+            retained_lines = 0
+            for block in reversed(current_blocks):
+                retained.insert(0, block)
+                retained_lines += block_line_count(block)
+                if retained_lines >= overlap_lines:
+                    break
+            current_blocks = retained
+            current_len = sum(len(str(block.text)) + 2 for block in current_blocks)
+        else:
+            current_blocks = []
+            current_len = 0
+
+    for block in blocks:
+        block_text = str(getattr(block, "text", "") or "")
+        if not block_text.strip():
+            continue
+        if len(block_text) > chunk_size:
+            emit_current()
+            split_blocks = oversized_block(block)
+            if split_blocks:
+                results.extend(split_blocks)
+            current_blocks = []
+            current_len = 0
+            continue
+
+        block_len = len(block_text) + 2
+        if current_blocks and current_len + block_len > chunk_size:
+            emit_current()
+        current_blocks.append(block)
+        current_len += block_len
+
+    emit_current()
+    return results
+
+
+def _chunk_markdown_by_structure(text: str, default_label: str = "preface") -> list[Any]:
+    lines = text.splitlines()
+    return _pack_structured_blocks(
+        _iter_structured_blocks_from_line_stream(
+            enumerate(lines, start=1),
+            markdown=True,
+            default_label=default_label,
+            section_path=(default_label,) if default_label and default_label != "chunk" else (),
+        ),
+        default_label=default_label,
+        section_path=(default_label,) if default_label and default_label != "chunk" else (),
+    )
+
+
+def _chunk_plain_text_by_structure(text: str, default_label: str = "chunk") -> list[Any]:
+    detect_meeting = _looks_like_meeting_notes(text)
+    lines = text.splitlines()
+    return _pack_structured_blocks(
+        _iter_structured_blocks_from_line_stream(
+            enumerate(lines, start=1),
+            markdown=False,
+            detect_meeting=detect_meeting,
+            default_label=default_label,
+        ),
+        default_label=default_label,
+    )
 
 
 def _iter_text_file_lines(path: Path) -> Iterable[str]:
@@ -204,6 +795,8 @@ def _emit_line_chunk(
     lines: list[str],
     start_line: int | None,
     label: str = "",
+    section_path: tuple[str, ...] = (),
+    kind: str = "",
 ) -> Any:
     core = _core()
     if not lines or start_line is None:
@@ -216,6 +809,8 @@ def _emit_line_chunk(
         line_start=start_line,
         line_end=start_line + len(lines) - 1,
         label=label,
+        section_path=section_path,
+        kind=kind,
     )
 
 
@@ -268,6 +863,7 @@ def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[Any]:
     segment_lines: list[str] = []
     segment_start_line: int | None = None
     segment_label = "preface"
+    segment_section_path: tuple[str, ...] = ("preface",)
     current_len = 0
     saw_heading = False
 
@@ -275,7 +871,13 @@ def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[Any]:
         nonlocal segment_lines, segment_start_line, current_len
         line_len = len(line) + 1
         if segment_lines and current_len + line_len > chunk_size:
-            chunk = _emit_line_chunk(segment_lines, segment_start_line, label=segment_label)
+            chunk = _emit_line_chunk(
+                segment_lines,
+                segment_start_line,
+                label=segment_label,
+                section_path=segment_section_path,
+                kind="section",
+            )
             if chunk is not None:
                 yield chunk
             if overlap_lines > 0:
@@ -293,7 +895,13 @@ def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[Any]:
 
     def flush_segment() -> Iterable[Any]:
         nonlocal segment_lines, segment_start_line, current_len
-        chunk = _emit_line_chunk(segment_lines, segment_start_line, label=segment_label)
+        chunk = _emit_line_chunk(
+            segment_lines,
+            segment_start_line,
+            label=segment_label,
+            section_path=segment_section_path,
+            kind="section",
+        )
         if chunk is not None:
             yield chunk
         segment_lines = []
@@ -306,11 +914,13 @@ def _iter_markdown_heading_chunks_from_file(path: Path) -> Iterable[Any]:
                 yield from flush_segment()
             saw_heading = True
             segment_label = line.strip().lstrip("#").strip() or "section"
+            segment_section_path = (segment_label,)
             yield from push_line(line_no, line)
             continue
 
         if not saw_heading:
             segment_label = "preface"
+            segment_section_path = ("preface",)
         yield from push_line(line_no, line)
 
     if segment_lines:
@@ -436,6 +1046,35 @@ def _iter_chunks_from_cached_file(
             core._iter_markdown_heading_chunks_from_file(path),
             chunk_strategy=chunk_strategy,
         )
+    if chunk_strategy == "markdown_structure":
+        return iter(
+            core._limit_chunk_specs(
+                _pack_structured_blocks(
+                    _iter_structured_blocks_from_line_stream(
+                        enumerate(core._iter_text_file_lines(path), start=1),
+                        markdown=True,
+                        default_label="preface",
+                        section_path=("preface",),
+                    ),
+                    default_label="preface",
+                    section_path=("preface",),
+                ),
+                chunk_strategy=chunk_strategy,
+            )
+        )
+    if chunk_strategy in {"meeting_notes", "plain_text_structure"}:
+        return iter(
+            core._limit_chunk_specs(
+                _pack_structured_blocks(
+                    _iter_structured_blocks_from_line_stream(
+                        enumerate(core._iter_text_file_lines(path), start=1),
+                        markdown=False,
+                        detect_meeting=chunk_strategy == "meeting_notes",
+                    ),
+                ),
+                chunk_strategy=chunk_strategy,
+            )
+        )
     if chunk_strategy in {"structured", "generic"}:
         return core._iter_limited_chunks(
             core._iter_chunk_specs_from_line_stream(
@@ -470,7 +1109,13 @@ def _chunk_python_code(text: str) -> list[Any]:
     preface_end = body_nodes[0].lineno - 1
     if preface_end > 0:
         chunks.extend(
-            core._split_lines_into_chunks(lines[:preface_end], start_line=1, label="module prelude")
+            core._split_lines_into_chunks(
+                lines[:preface_end],
+                start_line=1,
+                label="module prelude",
+                section_path=("module prelude",),
+                kind="code",
+            )
         )
 
     for node in body_nodes:
@@ -490,6 +1135,8 @@ def _chunk_python_code(text: str) -> list[Any]:
                 line_start=start,
                 line_end=end,
                 label=label,
+                section_path=(label,),
+                kind="code",
             )
         )
 
@@ -654,7 +1301,8 @@ def _prepare_indexed_content(
                 chunk_strategy = "markdown_heading"
                 chunks = core._chunk_markdown_by_heading(normalized_raw)
             else:
-                chunks = core._split_lines_into_chunks(normalized_raw.splitlines())
+                chunk_strategy = "markdown_structure"
+                chunks = _chunk_markdown_by_structure(normalized_raw)
         normalized_text = normalized_raw
     elif suffix in core.STRUCTURED_SUFFIXES:
         chunk_strategy = "structured"
@@ -667,7 +1315,11 @@ def _prepare_indexed_content(
         symbols = core._extract_python_symbols(normalized_raw, rel_path)
     else:
         normalized_text = normalized_raw
-        chunks = core._split_lines_into_chunks(normalized_text.splitlines())
+        if _looks_like_meeting_notes(normalized_text):
+            chunk_strategy = "meeting_notes"
+        else:
+            chunk_strategy = "plain_text_structure"
+        chunks = _chunk_plain_text_by_structure(normalized_text)
 
     if not chunks:
         chunks = core._split_lines_into_chunks(normalized_text.splitlines())
@@ -720,13 +1372,20 @@ def _chunks_for_indexed_text(
                 )
             chunks = core._ensure_chunk_size(chunk_specs)
         else:
-            chunks = core._chunk_markdown_by_heading(normalized_text)
+            if any(core.re.match(r"^\s{0,3}#{1,6}\s+", line) for line in normalized_text.splitlines()):
+                chunks = core._chunk_markdown_by_heading(normalized_text)
+            else:
+                chunks = _chunk_markdown_by_structure(normalized_text)
     elif strategy == "markdown_heading":
         chunks = core._chunk_markdown_by_heading(normalized_text)
+    elif strategy == "markdown_structure":
+        chunks = _chunk_markdown_by_structure(normalized_text)
     elif strategy == "structured" or suffix in core.STRUCTURED_SUFFIXES:
         chunks = core._chunk_structured_text(normalized_text)
     elif strategy == "python" or suffix in core.PYTHON_SUFFIXES:
         chunks = core._chunk_python_code(normalized_text)
+    elif strategy in {"meeting_notes", "plain_text_structure"}:
+        chunks = _chunk_plain_text_by_structure(normalized_text)
     else:
         chunks = core._split_lines_into_chunks(normalized_text.splitlines())
     if chunks:
@@ -851,6 +1510,9 @@ def _build_documents(source_dir: str) -> tuple[list[Document], list[IndexedFile]
                         "time_range": core._chunk_location_label(chunk, f"chunk {idx + 1}"),
                         "line_start": chunk.line_start,
                         "line_end": chunk.line_end,
+                        "heading": chunk.section_path[-1] if chunk.section_path else "",
+                        "section_path": list(chunk.section_path),
+                        "chunk_kind": chunk.kind,
                     },
                 )
             )
@@ -890,6 +1552,9 @@ def _iter_documents_for_indexed_files(indexed_files: Iterable[IndexedFile]) -> I
                     "time_range": core._chunk_location_label(chunk, f"chunk {idx + 1}"),
                     "line_start": chunk.line_start,
                     "line_end": chunk.line_end,
+                    "heading": chunk.section_path[-1] if chunk.section_path else "",
+                    "section_path": list(chunk.section_path),
+                    "chunk_kind": chunk.kind,
                 },
             )
 
@@ -1012,6 +1677,7 @@ def _write_index_artifacts(
     persist_path: Path,
     indexed_files: list[IndexedFile],
     embed_model: str,
+    embed_base_url: str,
     source_dir: str,
     total_chunks: int,
     staged_normalized_dir: Path | None = None,
@@ -1036,6 +1702,14 @@ def _write_index_artifacts(
     skip_graph = core._env_flag("SKIP_GRAPH")
     skip_semantic = skip_graph or core._env_flag("SKIP_SEMANTIC")
     skip_wiki = core._env_flag("SKIP_WIKI")
+    build_snapshot = core.current_build_config_snapshot(
+        source_dir,
+        embed_base_url=embed_base_url,
+        embed_model=embed_model,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+    )
     manifest = {
         "build_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "embed_model": embed_model,
@@ -1044,6 +1718,7 @@ def _write_index_artifacts(
         "source_dir": str(Path(source_dir).expanduser()),
         "normalized_text_dir": core.NORMALIZED_TEXT_DIRNAME,
         "symbol_index_file": core.SYMBOL_INDEX_FILENAME,
+        "fulltext_index_file": core.FULLTEXT_INDEX_FILENAME,
         "document_graph_file": core.DOCUMENT_GRAPH_FILENAME,
         "entity_graph_file": core.ENTITY_GRAPH_FILENAME,
         "semantic_extract_cache_file": core.SEMANTIC_EXTRACT_CACHE_FILENAME,
@@ -1052,6 +1727,7 @@ def _write_index_artifacts(
         "lint_report_file": core.LINT_REPORT_FILENAME,
         "search_mode_default": os.getenv("SEARCH_MODE", core.DEFAULT_SEARCH_MODE).strip() or core.DEFAULT_SEARCH_MODE,
         "semantic_graph_stats": {},
+        "build_snapshot": build_snapshot,
         "build_flags": {
             "skip_graph": skip_graph,
             "skip_semantic": skip_semantic,
@@ -1063,6 +1739,7 @@ def _write_index_artifacts(
     symbol_index_path = persist_path / core.SYMBOL_INDEX_FILENAME
     symbol_handle = None
     wrote_symbols = False
+    source_file_records: list[dict[str, Any]] = []
     for indexed in indexed_files:
         normalized_rel = f"{indexed.rel_path}.txt"
         cache_path = normalized_dir / normalized_rel
@@ -1071,6 +1748,13 @@ def _write_index_artifacts(
             indexed.write_normalized_text(cache_path)
 
         stat = indexed.file_path.stat()
+        source_file_records.append(
+            {
+                "path": indexed.rel_path,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
         manifest["files"].append(
             {
                 "name": indexed.rel_path,
@@ -1096,6 +1780,17 @@ def _write_index_artifacts(
         symbol_handle.close()
     if not wrote_symbols and symbol_index_path.exists():
         symbol_index_path.unlink()
+    manifest["source_snapshot"] = _source_snapshot_from_file_records(
+        source_dir,
+        source_file_records,
+    )
+
+    fulltext_index_path = persist_path / core.FULLTEXT_INDEX_FILENAME
+    fulltext_index = core._build_fulltext_index(indexed_files)
+    _atomic_write_text(
+        fulltext_index_path,
+        json.dumps(fulltext_index, ensure_ascii=False, separators=(",", ":")),
+    )
 
     file_sources = [core._normalize_source_path(indexed.rel_path) for indexed in indexed_files]
     if skip_graph:
@@ -1425,6 +2120,7 @@ def _build_vectorstore_from_document_stream(
         persist_path=persist_path,
         indexed_files=indexed_files,
         embed_model=embed_model,
+        embed_base_url=embed_base_url,
         source_dir=md_dir,
         total_chunks=total_chunks,
         staged_normalized_dir=staged_normalized_dir,

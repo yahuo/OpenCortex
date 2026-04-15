@@ -58,7 +58,11 @@ from ragbot_build import (
     _read_source_text,
     _should_ignore_relative_path,
     _write_index_artifacts,
+    current_build_config_snapshot,
+    current_source_snapshot,
+    source_snapshot_from_indexed_files,
     build_vectorstore,
+    current_build_snapshot,
 )
 from ragbot_graph import (
     _build_community_index,
@@ -67,10 +71,14 @@ from ragbot_graph import (
     _render_graph_report,
 )
 from ragbot_local_search import (
+    _build_query_expansion_index,
+    _build_fulltext_index,
     _bundle_sources,
     _extract_query_plan,
     _finalize_hits,
     _first_non_empty_lines,
+    _fulltext_query_terms,
+    _fulltext_terms,
     _grep_search_python,
     _grep_search_with_rg,
     _has_supported_file_suffix,
@@ -84,6 +92,7 @@ from ragbot_local_search import (
     _search_mode,
     _symbol_match_score,
     ast_search,
+    bm25_search,
     glob_search,
     grep_search,
 )
@@ -109,6 +118,8 @@ from ragbot_retrieval import (
     _collect_bridge_entities,
     _collect_wiki_trace,
     _document_graph_expand_candidate_sources,
+    _expand_query_plan_from_corpus_index,
+    _expand_query_plan_from_vector_feedback,
     _entity_graph_expand_candidate_sources,
     _expand_candidate_sources,
     _expand_candidate_sources_detailed,
@@ -189,6 +200,7 @@ PLANNER_TIMEOUT_SECONDS = 15
 RRF_K = 60
 RRF_WEIGHTS = {
     "ast": 1.0,
+    "bm25": 0.85,
     "grep": 0.9,
     "glob": 0.6,
     "vector": 0.5,
@@ -225,6 +237,9 @@ COMMUNITY_TOP_SYMBOLS = 5
 COMMUNITY_TOP_QUERY_NOTES = 3
 COMMUNITY_TOP_GOD_NODES = 8
 COMMUNITY_TOP_BRIDGES = 20
+FULLTEXT_INDEX_FILENAME = "fulltext_index.json"
+FULLTEXT_BM25_K1 = 1.5
+FULLTEXT_BM25_B = 0.75
 SEMANTIC_PROMPT_VERSION = "phase2b-v1"
 SEMANTIC_SECTION_MAX_CHARS = 2500
 SEMANTIC_GRAPH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -321,6 +336,8 @@ WORD_CHARS_RE = re.compile(r"^[A-Za-z0-9_]+$")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 HTML_HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.I)
 CODE_SPAN_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
+FULLTEXT_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}")
+FULLTEXT_CJK_RUN_RE = re.compile(r"[\u3400-\u9fff]{2,}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -332,6 +349,8 @@ class ChunkSpec:
     line_start: int | None = None
     line_end: int | None = None
     label: str = ""
+    section_path: tuple[str, ...] = field(default_factory=tuple)
+    kind: str = ""
 
 
 @dataclass(slots=True)
@@ -591,6 +610,8 @@ def _split_lines_into_chunks(
     chunk_size: int | None = None,
     overlap_lines: int | None = None,
     label: str = "",
+    section_path: tuple[str, ...] = (),
+    kind: str = "",
 ) -> list[ChunkSpec]:
     if not lines:
         return []
@@ -618,6 +639,8 @@ def _split_lines_into_chunks(
                     line_start=start_line + index,
                     line_end=start_line + end - 1,
                     label=chunk_label,
+                    section_path=section_path,
+                    kind=kind,
                 )
             )
         if end >= total:
@@ -684,6 +707,8 @@ def _ensure_chunk_size(
                 chunk_size=chunk_size,
                 overlap_lines=overlap_lines,
                 label=chunk.label,
+                section_path=chunk.section_path,
+                kind=chunk.kind,
             )
         )
     return results
