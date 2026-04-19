@@ -5,9 +5,16 @@ from pathlib import Path
 import threading
 import time
 
+import pytest
+
 import ragbot
 import ragbot_semantic
 import wiki
+
+
+@pytest.fixture(autouse=True)
+def _enable_semantic_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEMANTIC_GRAPH_ENABLED", "1")
 
 
 class FakeEmbeddings:

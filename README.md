@@ -86,7 +86,7 @@ In addition to the FAISS index, OpenCortex now writes a small set of offline art
 
 These artifacts are secondary knowledge, not the primary source of truth. Runtime answers should still be grounded in raw source citations first; query notes and wiki pages are there to help navigation, curation, and reuse.
 
-When `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` are available during rebuild, the compiler also runs a bounded semantic-extraction pass over sections and records cache hits, API calls, token usage, and duration in `index_manifest.json` / `community_index.json`.
+Build-time semantic extraction (LLM-assisted concept/decision nodes + `semantically_related` edges) is **opt-in**. By default the build does not call any LLM, so token cost stays at zero regardless of corpus size. Set `SEMANTIC_GRAPH_ENABLED=1` (and ensure `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` are configured) to turn it on; cache hits, API calls, token usage, and duration are then recorded in `index_manifest.json` / `community_index.json`. Without it, the entity graph still contains structural nodes (`file`, `section`, `symbol`) and retrieval automatically falls back to the document graph for cross-file expansion.
 
 ### Request Flow
 

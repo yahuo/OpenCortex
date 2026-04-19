@@ -8,6 +8,11 @@ import pytest
 import ragbot
 
 
+@pytest.fixture(autouse=True)
+def _enable_semantic_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SEMANTIC_GRAPH_ENABLED", "1")
+
+
 class FakeEmbeddings:
     def __init__(self, *_args, **_kwargs):
         self.dim = 48

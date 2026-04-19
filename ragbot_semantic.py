@@ -159,17 +159,16 @@ def _semantic_graph_enabled(
     llm_base_url: str,
 ) -> tuple[bool, str]:
     core = _core()
-    raw = os.getenv("SEMANTIC_GRAPH_ENABLED", "auto").strip().lower()
-    enabled = bool(llm_api_key.strip() and llm_model.strip() and llm_base_url.strip())
+    raw = os.getenv("SEMANTIC_GRAPH_ENABLED", "").strip().lower()
+    if not raw:
+        return False, "default_disabled"
     if raw in core.SEMANTIC_GRAPH_DISABLED_VALUES:
         return False, "disabled_by_env"
-    if raw in core.SEMANTIC_GRAPH_ENABLED_VALUES:
-        if enabled:
+    if raw in core.SEMANTIC_GRAPH_ENABLED_VALUES or raw == "auto":
+        if llm_api_key.strip() and llm_model.strip() and llm_base_url.strip():
             return True, ""
         return False, "missing_llm_config"
-    if enabled:
-        return True, ""
-    return False, "missing_llm_config"
+    return False, f"unknown_value:{raw}"
 
 
 def _semantic_section_fingerprint(
