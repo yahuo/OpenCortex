@@ -1391,16 +1391,21 @@ def retrieve(
     base_plan = core._extract_query_plan(question)
     trace: list[dict[str, Any]] = []
 
-    if search_mode == "vector":
-        vector_hits = core.vector_search(search_bundle, question, kb=kb, top_k=top_k)
-        vector_hits, rerank_trace = core.llm_rerank(
+    pool_size = max(top_k, core._rerank_top_n()) if core._rerank_enabled() else top_k
+
+    def apply_rerank(hits: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+        return core.llm_rerank(
             question,
-            vector_hits,
+            hits,
             llm_api_key=llm_api_key,
             llm_model=llm_model,
             llm_base_url=llm_base_url,
             keep=top_k,
         )
+
+    if search_mode == "vector":
+        vector_hits = core.vector_search(search_bundle, question, kb=kb, top_k=pool_size)
+        vector_hits, rerank_trace = apply_rerank(vector_hits)
         context, sources = _build_context_and_sources(vector_hits)
         trace.append(
             {
@@ -1436,7 +1441,7 @@ def retrieve(
         bundle=search_bundle,
         query_plan=base_plan,
         kb=kb,
-        top_k=top_k,
+        top_k=pool_size,
         allowed_sources=None,
         step_name="step1",
     )
@@ -1467,7 +1472,7 @@ def retrieve(
             bundle=search_bundle,
             query_plan=merged_plan,
             kb=kb,
-            top_k=top_k,
+            top_k=pool_size,
             allowed_sources=prefilter_expansion.sources or None,
             step_name="step2",
             graph_max_hops=2,
@@ -1485,17 +1490,10 @@ def retrieve(
         trace.append(step2_result.trace)
         final_hits = core._finalize_hits(
             core._merge_grouped_hits(step1_result.grouped_hits, step2_result.grouped_hits),
-            top_k=top_k,
+            top_k=pool_size,
         )
 
-    final_hits, rerank_trace = core.llm_rerank(
-        question,
-        final_hits,
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_base_url=llm_base_url,
-        keep=top_k,
-    )
+    final_hits, rerank_trace = apply_rerank(final_hits)
     if trace:
         trace[-1]["rerank"] = rerank_trace
 

@@ -261,7 +261,6 @@ SEMANTIC_SECTION_MAX_CHARS = 2500
 SEMANTIC_GRAPH_DISABLED_VALUES = {"0", "false", "no", "off"}
 SEMANTIC_GRAPH_ENABLED_VALUES = {"1", "true", "yes", "on"}
 RERANK_TOP_N_DEFAULT = 30
-RERANK_TIMEOUT_SECONDS = 20
 RERANK_SNIPPET_MAX_CHARS = 600
 GRAPH_STOPWORDS = {
     "this",
@@ -908,26 +907,6 @@ def _chunk_by_time_window(
     return _merge_small_wechat_chunks(chunks)
 
 
-def _wechat_chunk_char_count(chunk: list[dict[str, Any]]) -> int:
-    return sum(len(str(msg.get("content", ""))) for msg in chunk)
-
-
-def _wechat_chunk_last_timestamp(chunk: list[dict[str, Any]]) -> datetime | None:
-    for msg in reversed(chunk):
-        ts = msg.get("timestamp")
-        if ts is not None:
-            return ts
-    return None
-
-
-def _wechat_chunk_first_timestamp(chunk: list[dict[str, Any]]) -> datetime | None:
-    for msg in chunk:
-        ts = msg.get("timestamp")
-        if ts is not None:
-            return ts
-    return None
-
-
 def _can_merge_wechat_chunks(
     prev: list[dict[str, Any]],
     cur: list[dict[str, Any]],
@@ -935,14 +914,14 @@ def _can_merge_wechat_chunks(
     max_chars: int,
     quiet_gap_minutes: int,
 ) -> bool:
-    prev_chars = _wechat_chunk_char_count(prev)
-    cur_chars = _wechat_chunk_char_count(cur)
+    prev_chars = sum(len(str(msg.get("content", ""))) for msg in prev)
+    cur_chars = sum(len(str(msg.get("content", ""))) for msg in cur)
     if prev_chars + cur_chars > max_chars:
         return False
     if prev_chars >= min_chars and cur_chars >= min_chars:
         return False
-    prev_last = _wechat_chunk_last_timestamp(prev)
-    cur_first = _wechat_chunk_first_timestamp(cur)
+    prev_last = next((msg["timestamp"] for msg in reversed(prev) if msg.get("timestamp")), None)
+    cur_first = next((msg["timestamp"] for msg in cur if msg.get("timestamp")), None)
     if prev_last is not None and cur_first is not None:
         if cur_first - prev_last > timedelta(minutes=quiet_gap_minutes):
             return False

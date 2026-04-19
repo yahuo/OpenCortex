@@ -1,14 +1,5 @@
-"""LLM-based reranker for retrieved hits.
-
-Runs after RRF fusion to reorder the top candidates by relevance using the
-configured cloud LLM. Falls back to the original ordering on any failure so the
-pipeline never breaks because of a rerank issue.
-"""
-
 from __future__ import annotations
 
-import json
-import re
 import time
 from typing import Any
 
@@ -17,6 +8,13 @@ def _core():
     import ragbot
 
     return ragbot
+
+
+RERANK_STATUS_OK = "ok"
+RERANK_STATUS_DISABLED = "disabled"
+RERANK_STATUS_NO_CREDENTIALS = "no_credentials"
+RERANK_STATUS_NO_HITS = "no_hits"
+RERANK_STATUS_FALLBACK = "fallback"
 
 
 _RERANK_PROMPT_HEADER = (
@@ -43,24 +41,13 @@ def _build_prompt(question: str, hits: list[Any], max_chars: int) -> str:
         snippet = _truncate_snippet(hit.snippet, max_chars)
         lines.append(f"[{index}] ({label}) {snippet}")
     lines.append("")
-    lines.append('请按上述格式返回 JSON。')
+    lines.append("请按上述格式返回 JSON。")
     return "\n".join(lines)
 
 
 def _parse_rerank_payload(text: str, hit_count: int) -> list[dict[str, Any]]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if "\n" in stripped:
-            stripped = stripped.split("\n", 1)[1]
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-    match = re.search(r"\{.*\}", stripped, re.S)
-    if not match:
-        raise ValueError("rerank output missing JSON object")
-    data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("rerank output is not an object")
+    core = _core()
+    data = core._extract_json_blob(text)
     rankings = data.get("rankings")
     if not isinstance(rankings, list):
         raise ValueError("rerank payload missing 'rankings' list")
@@ -97,37 +84,36 @@ def llm_rerank(
     top_n: int | None = None,
     keep: int | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Rerank `hits` using the configured cloud LLM.
-
-    Returns `(reranked_hits, trace)`. `trace["status"]` is one of
-    `"ok" | "disabled" | "no_credentials" | "no_hits" | "fallback"`.
-    """
     core = _core()
+    keep_count = keep if keep is not None else len(hits)
     trace: dict[str, Any] = {
-        "status": "ok",
+        "status": RERANK_STATUS_OK,
         "model": llm_model,
-        "candidates_in": len(hits),
-        "kept": min(len(hits), keep) if keep is not None else len(hits),
+        "candidates_in": 0,
+        "kept": 0,
         "scores": [],
         "latency_ms": 0,
     }
 
     if not hits:
-        trace["status"] = "no_hits"
+        trace["status"] = RERANK_STATUS_NO_HITS
         return hits, trace
 
     if not core._rerank_enabled():
-        trace["status"] = "disabled"
-        return hits[: keep or len(hits)], trace
+        trace["status"] = RERANK_STATUS_DISABLED
+        out = hits[:keep_count]
+        trace["kept"] = len(out)
+        return out, trace
 
     if not llm_api_key.strip() or not llm_base_url.strip():
-        trace["status"] = "no_credentials"
-        return hits[: keep or len(hits)], trace
+        trace["status"] = RERANK_STATUS_NO_CREDENTIALS
+        out = hits[:keep_count]
+        trace["kept"] = len(out)
+        return out, trace
 
     effective_top_n = top_n or core._rerank_top_n()
     candidates = list(hits[:effective_top_n])
     tail = list(hits[effective_top_n:])
-    keep_count = keep if keep is not None else len(hits)
     model = core._rerank_model(llm_model)
     trace["model"] = model
     trace["candidates_in"] = len(candidates)
@@ -142,61 +128,51 @@ def llm_rerank(
             temperature=0.0,
         )
         response = llm.invoke(prompt)
-        content = getattr(response, "content", "") or ""
-        rankings = _parse_rerank_payload(str(content), len(candidates))
-    except Exception as exc:  # noqa: BLE001 — fallback is the whole point
-        trace["status"] = "fallback"
+        content = core._chunk_to_text(response)
+        rankings = _parse_rerank_payload(content, len(candidates))
+    except Exception as exc:  # noqa: BLE001
+        trace["status"] = RERANK_STATUS_FALLBACK
         trace["error"] = f"{type(exc).__name__}: {exc}"
         trace["latency_ms"] = int((time.perf_counter() - started) * 1000)
-        trace["kept"] = min(len(hits), keep_count)
-        return hits[:keep_count], trace
+        out = hits[:keep_count]
+        trace["kept"] = len(out)
+        return out, trace
 
     trace["latency_ms"] = int((time.perf_counter() - started) * 1000)
 
     if not rankings:
-        trace["status"] = "fallback"
+        trace["status"] = RERANK_STATUS_FALLBACK
         trace["error"] = "empty rerank rankings"
-        trace["kept"] = min(len(hits), keep_count)
-        return hits[:keep_count], trace
+        out = hits[:keep_count]
+        trace["kept"] = len(out)
+        return out, trace
 
     relevant_entries: list[tuple[int, float]] = []
     irrelevant_indexes: list[int] = []
-    seen_relevant: set[int] = set()
-    seen_irrelevant: set[int] = set()
+    seen: set[int] = set()
     for entry in sorted(rankings, key=lambda item: item["score"], reverse=True):
         index = entry["index"]
+        if index in seen:
+            continue
+        seen.add(index)
         if entry["relevant"]:
-            if index in seen_relevant:
-                continue
-            seen_relevant.add(index)
             relevant_entries.append((index, entry["score"]))
         else:
-            if index in seen_irrelevant or index in seen_relevant:
-                continue
-            seen_irrelevant.add(index)
             irrelevant_indexes.append(index)
 
     ordered: list[Any] = [candidates[index] for index, _ in relevant_entries]
-    seen_indexes: set[int] = set(seen_relevant)
     for index, candidate in enumerate(candidates):
-        if index in seen_indexes:
-            continue
-        if index in seen_irrelevant:
+        if index in seen:
             continue
         ordered.append(candidate)
-        seen_indexes.add(index)
     for index in irrelevant_indexes:
-        if index in seen_indexes:
-            continue
         ordered.append(candidates[index])
-        seen_indexes.add(index)
 
     ordered.extend(tail)
-    scored_indexes = relevant_entries
 
     trace["scores"] = [
         {"index": idx, "score": score, "source": candidates[idx].source}
-        for idx, score in scored_indexes[:keep_count]
+        for idx, score in relevant_entries[:keep_count]
     ]
     final = ordered[:keep_count]
     trace["kept"] = len(final)
