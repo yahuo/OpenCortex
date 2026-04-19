@@ -24,6 +24,7 @@ from ragbot import (
     REPORTS_DIRNAME,
     SEARCH_MODES,
     WIKI_DIRNAME,
+    _configured_top_k,
     _bundle_artifacts_summary,
     ask_stream as rag_ask_stream,
     list_kbs,
@@ -35,7 +36,7 @@ from wiki import is_wiki_write_in_progress, save_query_note
 load_dotenv()
 
 
-def _read_config() -> dict[str, str]:
+def _read_config() -> dict[str, Any]:
     return {
         "persist_dir": str(
             Path(os.getenv("CHROMA_PERSIST_DIR", "~/wechat_rag_db")).expanduser()
@@ -52,6 +53,7 @@ def _read_config() -> dict[str, str]:
         ).strip(),
         "llm_model": os.getenv("LLM_MODEL", "gemini-2.0-flash").strip(),
         "search_mode": os.getenv("SEARCH_MODE", "hybrid").strip().lower() or "hybrid",
+        "search_top_k": _configured_top_k(),
     }
 
 
@@ -165,6 +167,7 @@ class AskRequest(BaseModel):
     stream: bool = False
     kb: str | None = None
     search_mode: str | None = None
+    top_k: int | None = None
     debug: bool = False
 
 
@@ -290,12 +293,16 @@ def ask(req: AskRequest):
             )
 
     search_bundle = _refresh_search_bundle_if_needed()
+    top_k = req.top_k if req.top_k is not None else int(_cfg.get("search_top_k", _configured_top_k()))
+    if top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k 必须大于等于 1")
     result = rag_ask_stream(
         question=req.question,
         search_bundle=search_bundle,
         llm_api_key=_cfg["llm_api_key"],
         llm_model=_cfg["llm_model"],
         llm_base_url=_cfg["llm_base_url"],
+        top_k=top_k,
         kb=req.kb,
         search_mode=search_mode,
         debug=req.debug,

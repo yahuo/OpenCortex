@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -179,3 +180,94 @@ def test_llm_rerank_no_hits_returns_empty():
     )
     assert out == []
     assert trace["status"] == "no_hits"
+
+
+def test_retrieve_missing_rerank_credentials_matches_disabled_behavior(monkeypatch: pytest.MonkeyPatch):
+    bundle = SimpleNamespace()
+
+    def fake_vector_search(_bundle, _query, kb=None, top_k=6, candidate_sources=None):
+        return [_hit(f"doc-topk-{top_k}-{i}.md", f"snip {top_k}-{i}") for i in range(top_k)]
+
+    monkeypatch.setattr(ragbot, "vector_search", fake_vector_search)
+    monkeypatch.setenv("RERANK_TOP_N", "30")
+
+    monkeypatch.setenv("RERANK_ENABLED", "0")
+    disabled = ragbot.retrieve(
+        "q", bundle, mode="vector", top_k=3, llm_api_key="", llm_model="m", llm_base_url=""
+    )
+
+    monkeypatch.setenv("RERANK_ENABLED", "1")
+    no_credentials = ragbot.retrieve(
+        "q", bundle, mode="vector", top_k=3, llm_api_key="", llm_model="m", llm_base_url=""
+    )
+
+    assert [hit.source for hit in disabled["hits"]] == [hit.source for hit in no_credentials["hits"]]
+    assert disabled["search_trace"][0]["rerank"]["status"] == "disabled"
+    assert no_credentials["search_trace"][0]["rerank"]["status"] == "no_credentials"
+
+
+def test_retrieve_refreshes_trace_top_sources_after_rerank(monkeypatch: pytest.MonkeyPatch):
+    bundle = SimpleNamespace()
+    initial_hits = [
+        _hit("a.md", "first"),
+        _hit("b.md", "second"),
+        _hit("c.md", "third"),
+    ]
+
+    def fake_run_search_step(
+        question,
+        bundle,
+        query_plan,
+        kb,
+        top_k,
+        allowed_sources=None,
+        step_name="step1",
+        graph_max_hops=1,
+        graph_max_extra_sources=12,
+    ):
+        return ragbot.SearchStepResult(
+            grouped_hits={name: [] for name in ragbot.RRF_WEIGHTS},
+            hits=list(initial_hits),
+            trace={
+                "step": step_name,
+                "top_sources": [hit.source for hit in initial_hits[:3]],
+                "graph_bridge_entities": [],
+            },
+        )
+
+    def fake_rerank(question, hits, **kwargs):
+        return [hits[2], hits[1], hits[0]], {"status": "ok", "kept": 3, "scores": []}
+
+    monkeypatch.setattr(ragbot, "_run_search_step", fake_run_search_step)
+    monkeypatch.setattr(ragbot, "llm_rerank", fake_rerank)
+    monkeypatch.setenv("RERANK_ENABLED", "1")
+
+    result = ragbot.retrieve(
+        "q", bundle, mode="hybrid", top_k=3, llm_api_key="k", llm_model="m", llm_base_url="https://x"
+    )
+
+    assert [hit.source for hit in result["hits"]] == ["c.md", "b.md", "a.md"]
+    assert result["search_trace"][-1]["top_sources"] == ["c.md", "b.md", "a.md"]
+    assert result["search_trace"][-1]["rerank"]["status"] == "ok"
+
+
+def test_retrieve_uses_env_top_k_when_omitted(monkeypatch: pytest.MonkeyPatch):
+    bundle = SimpleNamespace()
+
+    def fake_vector_search(_bundle, _query, kb=None, top_k=6, candidate_sources=None):
+        return [_hit(f"doc-topk-{top_k}-{i}.md", f"snip {top_k}-{i}") for i in range(top_k)]
+
+    monkeypatch.setattr(ragbot, "vector_search", fake_vector_search)
+    monkeypatch.setenv("SEARCH_TOP_K", "4")
+    monkeypatch.setenv("RERANK_ENABLED", "0")
+
+    result = ragbot.retrieve(
+        "q", bundle, mode="vector", llm_api_key="", llm_model="m", llm_base_url=""
+    )
+
+    assert [hit.source for hit in result["hits"]] == [
+        "doc-topk-4-0.md",
+        "doc-topk-4-1.md",
+        "doc-topk-4-2.md",
+        "doc-topk-4-3.md",
+    ]

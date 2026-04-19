@@ -9,6 +9,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from ragbot import ask_stream as rag_ask_stream
+from ragbot import _configured_top_k
 from ragbot import load_search_bundle
 from ragbot import search_bundle_artifact_signature
 from wiki import is_wiki_write_in_progress, save_query_note
@@ -303,7 +304,7 @@ def _get_artifact_signature_tracker() -> dict:
     return {"last_signature": None}
 
 
-def read_runtime_config() -> dict[str, str]:
+def read_runtime_config() -> dict[str, Any]:
     return {
         "persist_dir": str(
             Path(os.getenv("CHROMA_PERSIST_DIR", "~/wechat_rag_db")).expanduser()
@@ -320,6 +321,7 @@ def read_runtime_config() -> dict[str, str]:
         ).strip(),
         "llm_model": os.getenv("LLM_MODEL", "gemini-2.0-flash").strip(),
         "search_mode": os.getenv("SEARCH_MODE", "hybrid").strip().lower() or "hybrid",
+        "search_top_k": _configured_top_k(),
         "search_debug": os.getenv("SEARCH_DEBUG", "").strip().lower(),
     }
 
@@ -756,6 +758,7 @@ if submitted and question.strip():
                 llm_api_key=cfg["llm_api_key"],
                 llm_model=cfg["llm_model"],
                 llm_base_url=cfg["llm_base_url"],
+                top_k=int(cfg["search_top_k"]),
                 search_mode=cfg["search_mode"],
                 debug=cfg["search_debug"] in {"1", "true", "yes", "on"},
             )

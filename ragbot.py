@@ -551,6 +551,14 @@ def _rerank_enabled() -> bool:
     return _env_flag("RERANK_ENABLED", default=True)
 
 
+def _rerank_has_credentials(llm_api_key: str, llm_base_url: str) -> bool:
+    return bool(llm_api_key.strip() and llm_base_url.strip())
+
+
+def _rerank_can_run(llm_api_key: str, llm_base_url: str) -> bool:
+    return _rerank_enabled() and _rerank_has_credentials(llm_api_key, llm_base_url)
+
+
 def _rerank_top_n() -> int:
     return max(1, _env_int("RERANK_TOP_N", RERANK_TOP_N_DEFAULT))
 
@@ -561,6 +569,10 @@ def _rerank_model(default_model: str) -> str:
         return default_model
     value = raw.strip()
     return value if value else default_model
+
+
+def _configured_top_k() -> int:
+    return max(1, _env_int("SEARCH_TOP_K", DEFAULT_TOP_K))
 
 
 def _limit_prefers_tail(chunk_strategy: str) -> bool:

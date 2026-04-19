@@ -105,7 +105,7 @@ def llm_rerank(
         trace["kept"] = len(out)
         return out, trace
 
-    if not llm_api_key.strip() or not llm_base_url.strip():
+    if not core._rerank_has_credentials(llm_api_key, llm_base_url):
         trace["status"] = RERANK_STATUS_NO_CREDENTIALS
         out = hits[:keep_count]
         trace["kept"] = len(out)

@@ -1381,17 +1381,19 @@ def retrieve(
     search_bundle: SearchBundle,
     kb: str | None = None,
     mode: str | None = None,
-    top_k: int = 6,
+    top_k: int | None = None,
     llm_api_key: str = "",
     llm_model: str = "",
     llm_base_url: str = "",
 ) -> dict[str, Any]:
     core = _core()
+    top_k = core._configured_top_k() if top_k is None else max(1, int(top_k))
     search_mode = core._search_mode(mode)
     base_plan = core._extract_query_plan(question)
     trace: list[dict[str, Any]] = []
 
-    pool_size = max(top_k, core._rerank_top_n()) if core._rerank_enabled() else top_k
+    rerank_ready = core._rerank_can_run(llm_api_key, llm_base_url)
+    pool_size = max(top_k, core._rerank_top_n()) if rerank_ready else top_k
 
     def apply_rerank(hits: list[Any]) -> tuple[list[Any], dict[str, Any]]:
         return core.llm_rerank(
@@ -1496,6 +1498,7 @@ def retrieve(
     final_hits, rerank_trace = apply_rerank(final_hits)
     if trace:
         trace[-1]["rerank"] = rerank_trace
+        trace[-1]["top_sources"] = [hit.source for hit in final_hits[:3]]
 
     context, sources = _build_context_and_sources(final_hits)
     bridge_entities = core._collect_bridge_entities(trace)
@@ -1515,7 +1518,7 @@ def ask_stream(
     llm_api_key: str,
     llm_model: str,
     llm_base_url: str,
-    top_k: int = 6,
+    top_k: int | None = None,
     kb: str | None = None,
     search_mode: str | None = None,
     debug: bool = False,

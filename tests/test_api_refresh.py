@@ -85,6 +85,41 @@ def test_ask_refreshes_bundle_when_artifacts_change(monkeypatch) -> None:
     assert api._search_bundle_signature == refreshed_signature
 
 
+def test_api_ask_uses_configured_top_k_and_request_override(monkeypatch) -> None:
+    bundle = _minimal_bundle("/tmp/fake-index")
+    signature = (("entity_graph.json", True, 1, 64),)
+    captured: list[int] = []
+
+    api._cfg = {
+        "persist_dir": "/tmp/fake-index",
+        "embed_api_key": "fake-embed-key",
+        "embed_base_url": "https://example.com/embed",
+        "embed_model": "fake-embed-model",
+        "llm_api_key": "fake-llm-key",
+        "llm_base_url": "https://example.com/llm",
+        "llm_model": "fake-llm-model",
+        "search_mode": "hybrid",
+        "search_top_k": 8,
+    }
+    api._search_bundle = bundle
+    api._search_bundle_signature = signature
+
+    monkeypatch.setattr(api, "_search_artifact_signature", lambda _persist_dir: signature)
+
+    def fake_ask_stream(*, top_k, **_kwargs):
+        captured.append(top_k)
+        return {"answer_stream": iter(["ok"]), "sources": []}
+
+    monkeypatch.setattr(api, "rag_ask_stream", fake_ask_stream)
+
+    response = api.ask(api.AskRequest(question="默认 top_k 生效吗？", stream=False))
+    assert response == {"answer": "ok", "sources": []}
+
+    response = api.ask(api.AskRequest(question="单次覆盖 top_k", stream=False, top_k=3))
+    assert response == {"answer": "ok", "sources": []}
+    assert captured == [8, 3]
+
+
 def test_api_debug_response_exposes_wiki_trace(monkeypatch) -> None:
     bundle = _fake_bundle(Path("/tmp/fake-index"))
     signature = (("entity_graph.json", True, 1, 64),)
