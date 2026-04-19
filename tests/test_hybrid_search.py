@@ -672,6 +672,7 @@ def test_iter_chunks_from_cached_file_respects_max_chunks_per_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    monkeypatch.setenv("WECHAT_MIN_CHUNK_CHARS", "0")
     path = tmp_path / "wechat.md"
     path.write_text(
         """
@@ -737,6 +738,7 @@ def test_build_vectorstore_records_truncated_files_in_manifest(
 
     monkeypatch.setattr(ragbot, "make_embeddings", lambda *args, **kwargs: FakeEmbeddings())
     monkeypatch.setenv("MAX_CHUNKS_PER_FILE", "2")
+    monkeypatch.setenv("WECHAT_MIN_CHUNK_CHARS", "0")
     monkeypatch.setenv("SKIP_GRAPH", "1")
     monkeypatch.setenv("SKIP_SEMANTIC", "1")
     monkeypatch.setenv("SKIP_WIKI", "1")

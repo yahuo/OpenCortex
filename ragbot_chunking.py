@@ -621,8 +621,12 @@ def _iter_wechat_markdown_chunks_from_file(
     current_start_line: int | None = None
     current_end_line: int | None = None
     current_chunk: list[dict[str, Any]] = []
+    pending_chunk: list[dict[str, Any]] = []
     window_start = None
     chunk_index = 0
+    min_chars = core._configured_wechat_min_chunk_chars()
+    max_chars = core._configured_wechat_max_chunk_chars()
+    quiet_gap = core._configured_wechat_quiet_gap_minutes()
 
     def flush_message() -> dict[str, Any] | None:
         return core._build_wechat_message(
@@ -656,6 +660,21 @@ def _iter_wechat_markdown_chunks_from_file(
             label=label,
         )
 
+    def stage_window(window_messages: list[dict[str, Any]]) -> Iterable[Any]:
+        nonlocal pending_chunk
+        if not window_messages:
+            return
+        if pending_chunk and core._can_merge_wechat_chunks(
+            pending_chunk, window_messages, min_chars, max_chars, quiet_gap
+        ):
+            pending_chunk.extend(window_messages)
+            return
+        if pending_chunk:
+            chunk_spec = emit_chunk(pending_chunk)
+            if chunk_spec is not None:
+                yield from core._ensure_chunk_size([chunk_spec])
+        pending_chunk = list(window_messages)
+
     for lineno, line in enumerate(core._iter_text_file_lines(path), start=1):
         match = core._HEADER_RE.match(line)
         if match:
@@ -670,9 +689,7 @@ def _iter_wechat_markdown_chunks_from_file(
                     if ts - window_start <= core.timedelta(minutes=window_minutes):
                         current_chunk.append(message)
                     else:
-                        chunk = emit_chunk(current_chunk)
-                        if chunk is not None:
-                            yield from core._ensure_chunk_size([chunk])
+                        yield from stage_window(current_chunk)
                         current_chunk = [message]
                         window_start = ts
             current_sender = match.group(1).strip()
@@ -702,15 +719,15 @@ def _iter_wechat_markdown_chunks_from_file(
             if window_start is None or ts - window_start <= core.timedelta(minutes=window_minutes):
                 current_chunk.append(message)
             else:
-                chunk = emit_chunk(current_chunk)
-                if chunk is not None:
-                    yield from core._ensure_chunk_size([chunk])
+                yield from stage_window(current_chunk)
                 current_chunk = [message]
                 window_start = ts
 
-    chunk = emit_chunk(current_chunk)
-    if chunk is not None:
-        yield from core._ensure_chunk_size([chunk])
+    yield from stage_window(current_chunk)
+    if pending_chunk:
+        final_spec = emit_chunk(pending_chunk)
+        if final_spec is not None:
+            yield from core._ensure_chunk_size([final_spec])
 
 
 def _iter_chunks_from_cached_file(

@@ -188,6 +188,9 @@ from ragbot_runtime import (
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 TIME_WINDOW_MINUTES = 30
+WECHAT_MIN_CHUNK_CHARS = 800
+WECHAT_MAX_CHUNK_CHARS = 3000
+WECHAT_QUIET_GAP_MINUTES = 120
 DEFAULT_FAISS_DIR = str(Path.home() / "wechat_rag_db")
 DEFAULT_TOP_K = 6
 GENERIC_CHUNK_SIZE = 1200
@@ -527,6 +530,18 @@ def _configured_max_chunks_per_file() -> int | None:
     if value <= 0:
         return None
     return value
+
+
+def _configured_wechat_min_chunk_chars() -> int:
+    return max(0, _env_int("WECHAT_MIN_CHUNK_CHARS", WECHAT_MIN_CHUNK_CHARS))
+
+
+def _configured_wechat_max_chunk_chars() -> int:
+    return max(1, _env_int("WECHAT_MAX_CHUNK_CHARS", WECHAT_MAX_CHUNK_CHARS))
+
+
+def _configured_wechat_quiet_gap_minutes() -> int:
+    return max(0, _env_int("WECHAT_QUIET_GAP_MINUTES", WECHAT_QUIET_GAP_MINUTES))
 
 
 def _limit_prefers_tail(chunk_strategy: str) -> bool:
@@ -870,7 +885,74 @@ def _chunk_by_time_window(
 
     if current_chunk:
         chunks.append(current_chunk)
-    return chunks
+    return _merge_small_wechat_chunks(chunks)
+
+
+def _wechat_chunk_char_count(chunk: list[dict[str, Any]]) -> int:
+    return sum(len(str(msg.get("content", ""))) for msg in chunk)
+
+
+def _wechat_chunk_last_timestamp(chunk: list[dict[str, Any]]) -> datetime | None:
+    for msg in reversed(chunk):
+        ts = msg.get("timestamp")
+        if ts is not None:
+            return ts
+    return None
+
+
+def _wechat_chunk_first_timestamp(chunk: list[dict[str, Any]]) -> datetime | None:
+    for msg in chunk:
+        ts = msg.get("timestamp")
+        if ts is not None:
+            return ts
+    return None
+
+
+def _can_merge_wechat_chunks(
+    prev: list[dict[str, Any]],
+    cur: list[dict[str, Any]],
+    min_chars: int,
+    max_chars: int,
+    quiet_gap_minutes: int,
+) -> bool:
+    prev_chars = _wechat_chunk_char_count(prev)
+    cur_chars = _wechat_chunk_char_count(cur)
+    if prev_chars + cur_chars > max_chars:
+        return False
+    if prev_chars >= min_chars and cur_chars >= min_chars:
+        return False
+    prev_last = _wechat_chunk_last_timestamp(prev)
+    cur_first = _wechat_chunk_first_timestamp(cur)
+    if prev_last is not None and cur_first is not None:
+        if cur_first - prev_last > timedelta(minutes=quiet_gap_minutes):
+            return False
+    return True
+
+
+def _merge_small_wechat_chunks(
+    chunks: list[list[dict[str, Any]]],
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+    quiet_gap_minutes: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    if len(chunks) <= 1:
+        return chunks
+    min_c = _configured_wechat_min_chunk_chars() if min_chars is None else min_chars
+    max_c = _configured_wechat_max_chunk_chars() if max_chars is None else max_chars
+    gap = _configured_wechat_quiet_gap_minutes() if quiet_gap_minutes is None else quiet_gap_minutes
+    if min_c <= 0 or max_c <= 0:
+        return chunks
+    merged: list[list[dict[str, Any]]] = []
+    for chunk in chunks:
+        if not merged:
+            merged.append(list(chunk))
+            continue
+        prev = merged[-1]
+        if _can_merge_wechat_chunks(prev, chunk, min_c, max_c, gap):
+            prev.extend(chunk)
+        else:
+            merged.append(list(chunk))
+    return merged
 
 
 # ─────────────────────────────────────────────────────────
