@@ -181,6 +181,7 @@ from ragbot_runtime import (
     load_vectorstore,
     search_bundle_artifact_signature,
 )
+from ragbot_rerank import llm_rerank
 
 # ─────────────────────────────────────────────────────────
 # 常量
@@ -259,6 +260,9 @@ SEMANTIC_PROMPT_VERSION = "phase2b-v1"
 SEMANTIC_SECTION_MAX_CHARS = 2500
 SEMANTIC_GRAPH_DISABLED_VALUES = {"0", "false", "no", "off"}
 SEMANTIC_GRAPH_ENABLED_VALUES = {"1", "true", "yes", "on"}
+RERANK_TOP_N_DEFAULT = 30
+RERANK_TIMEOUT_SECONDS = 20
+RERANK_SNIPPET_MAX_CHARS = 600
 GRAPH_STOPWORDS = {
     "this",
     "that",
@@ -542,6 +546,22 @@ def _configured_wechat_max_chunk_chars() -> int:
 
 def _configured_wechat_quiet_gap_minutes() -> int:
     return max(0, _env_int("WECHAT_QUIET_GAP_MINUTES", WECHAT_QUIET_GAP_MINUTES))
+
+
+def _rerank_enabled() -> bool:
+    return _env_flag("RERANK_ENABLED", default=True)
+
+
+def _rerank_top_n() -> int:
+    return max(1, _env_int("RERANK_TOP_N", RERANK_TOP_N_DEFAULT))
+
+
+def _rerank_model(default_model: str) -> str:
+    raw = os.getenv("RERANK_MODEL")
+    if raw is None:
+        return default_model
+    value = raw.strip()
+    return value if value else default_model
 
 
 def _limit_prefers_tail(chunk_strategy: str) -> bool:

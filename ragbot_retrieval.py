@@ -1393,6 +1393,14 @@ def retrieve(
 
     if search_mode == "vector":
         vector_hits = core.vector_search(search_bundle, question, kb=kb, top_k=top_k)
+        vector_hits, rerank_trace = core.llm_rerank(
+            question,
+            vector_hits,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_base_url=llm_base_url,
+            keep=top_k,
+        )
         context, sources = _build_context_and_sources(vector_hits)
         trace.append(
             {
@@ -1409,6 +1417,7 @@ def retrieve(
                 "top_sources": [hit.source for hit in vector_hits[:3]],
                 "graph_strategy": "disabled",
                 "graph_bridge_entities": [],
+                "rerank": rerank_trace,
                 "stopped": True,
                 "stop_reason": "vector_mode",
             }
@@ -1478,6 +1487,17 @@ def retrieve(
             core._merge_grouped_hits(step1_result.grouped_hits, step2_result.grouped_hits),
             top_k=top_k,
         )
+
+    final_hits, rerank_trace = core.llm_rerank(
+        question,
+        final_hits,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        llm_base_url=llm_base_url,
+        keep=top_k,
+    )
+    if trace:
+        trace[-1]["rerank"] = rerank_trace
 
     context, sources = _build_context_and_sources(final_hits)
     bridge_entities = core._collect_bridge_entities(trace)
